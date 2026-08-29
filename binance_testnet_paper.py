@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 REPO = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO)
 
-BASE = "https://testnet.binance.vision/api"
+BASE = "https://testnet.binance.vision"  # endpoints 自帶 /api/v3/...
 SYMBOL = "BTCUSDT"
 LOG_PATH = os.path.expanduser("~/.hermes/reports/btc_testnet_orders.json")
 ENV_PATH = os.path.expanduser("~/.hermes/secrets/binance_testnet.env")
