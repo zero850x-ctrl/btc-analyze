@@ -20,6 +20,8 @@ HISTORY = os.path.expanduser("~/.hermes/reports/btc_testnet_closed_trades.json")
 
 
 def sh(cmd):
+    # 用同一個 interpreter (cron 環境 python3 可能冇 numpy/yfinance)
+    cmd = cmd.replace("python3 ", f'"{sys.executable}" ', 1)
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=REPO, timeout=280)
     return (r.stdout + r.stderr).strip()
 
