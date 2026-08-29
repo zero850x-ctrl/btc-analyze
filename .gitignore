@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+btc_last_analysis.json
+btc_backtest_results.json
+.DS_Store
