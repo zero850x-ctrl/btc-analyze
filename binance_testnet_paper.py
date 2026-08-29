@@ -178,9 +178,20 @@ def place_signal_order(setup, key, secret):
                 }, key, secret)
             rec["oco_id"] = oco["orderListId"]
             rec["status"] = "OCO_PLACED"
+            rec["oco_leg_ids"] = [o["orderId"] for o in oco.get("orders", [])]
         except urllib.error.HTTPError as e:
             rec["status"] = "OCO_FAILED"
             rec["oco_error"] = e.read().decode()[:200]
+            # 安全網: OCO 掛唔上 → 立刻 market 平返 (冇裸倉過夜)
+            try:
+                _signed_request("POST", "/api/v3/order", {
+                    "symbol": SYMBOL, "side": exit_side, "type": "MARKET",
+                    "quantity": f"{exit_qty:.5f}",
+                }, key, secret)
+                rec["status"] = "FLATTENED_OCO_FAILED"
+                rec["flatten_note"] = "OCO rejected → emergency market close"
+            except urllib.error.HTTPError as e2:
+                rec["flatten_error"] = e2.read().decode()[:200]
 
     log = load_log()
     log["orders"].append(rec)
@@ -260,13 +271,25 @@ def main():
         print("⏳ 冇 verified setups")
         return
     log = load_log()
-    # 同 pattern dedup
-    seen = {o["pattern"] for o in log["orders"] if o.get("status") in ("FILLED_ENTRY", "OCO_PLACED")}
-    todo = [s for s in setups if s.get("pattern") not in seen]
+    # 同 pattern dedup (即時更新: 落一單入一單, 5min cron 唔會重複)
+    def _live_patterns():
+        return {o["pattern"] for o in load_log()["orders"] if o.get("status") in ("FILLED_ENTRY", "OCO_PLACED", "OCO_FAILED")}
+
+    todo = [s for s in setups if s.get("pattern") not in _live_patterns()]
     if not todo:
         print("⏳ 全部 setups 已落單")
         return
+    # 風控: 同方向最多 2 單 live + 相反方向鎖
     for s in todo:
+        live = [o for o in load_log()["orders"] if o.get("status") in ("FILLED_ENTRY", "OCO_PLACED")]
+        same_side = [o for o in live if o.get("side") == s["btc_side"]]
+        opp_side = [o for o in live if o.get("side") != s["btc_side"]]
+        if opp_side:
+            print(f"🚫 {s.get('pattern','?')} skip — 有一邊向 {opp_side[0]['side']} live 倉, 唔開反向")
+            continue
+        if len(same_side) >= 2:
+            print(f"🚫 {s.get('pattern','?')} skip — 同向 live 已 2 單 (cap)")
+            continue
         if args.dry_run:
             print(f"[DRY] {s['btc_side']} {s.get('pattern','?')} entry={s['btc_entry']} SL={s['btc_stop']} TP1={s.get('btc_tp1')}")
             continue
