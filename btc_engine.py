@@ -41,6 +41,8 @@ COINBASE_TICKER_URL = "https://api.exchange.coinbase.com/products/BTC-USD/ticker
 BTC_RISK_PCT = 0.5          # 每筆風險 = 帳戶 0.5% (24/7 + 高波動 → 比 XAUUSD 保守)
 BTC_EXCHANGE_DIFF_PCT = 0.8  # Coinbase vs 主源價差 >0.8% → UNVERIFIED (黃金 basis $40 之 BTC 版)
 SL_FLOOR_ATR_MULT = 0.8     # 同 XAUUSD — SL 至少 0.8×ATR
+MIN_RR = 1.0                # RR gate: TP1/risk >= 1.0 (RR<1 單贏都贏唔起 — live 9 筆實證)
+ALLOWED_PATTERNS = ("Flag",)  # Pattern gate: 只做 Bull/Bear Flag (backtest +0.59/+0.66R; AT/雙頂負 EV)
 BTC_MIN_BARS_M30 = 240      # M30 最少 5 日數據
 BTC_MIN_BARS_H1 = 240
 BTC_MIN_BARS_DAY = 120
@@ -140,12 +142,22 @@ def _parse_setup_level(val):
 
 
 def btc_filter_setups(setups, atr, px, diff_check):
-    """套用 BTC 校準: SL floor、risk sizing、UNVERIFIED 標記. 回傳過濾後 setups.
+    """套用 BTC 校準: SL floor、RR 篩選、pattern gate、risk sizing、UNVERIFIED 標記.
+
     引擎 setup 欄位: direction/pattern/entry_zone/stop_loss/tp1/tp2/tp3/risk_amount (字串格式).
+    Gate (backtest 68 樣本 + testnet 9 筆實證 2026-08-30):
+      - RR >= 1.0: TP(pattern 高度) 細過 SL floor 嘅單贏都贏唔起 (AT/fib live RR 0.1-0.4)
+      - Pattern: 只做 Bull/Bear Flag (+0.59/+0.66R); AT 33.3% -0.25R、雙頂負 EV 全 live 實證
     """
     out = []
     for s in setups:
         side = "SELL" if "SELL" in str(s.get("direction", "")) else "BUY"
+        pattern = str(s.get("pattern", "?"))
+        # Pattern gate: 負 EV pattern 直接 skip (保留 setup 字串方便 debug)
+        if ALLOWED_PATTERNS is not None:
+            if not any(k in pattern for k in ALLOWED_PATTERNS):
+                s["_gate_skip"] = "pattern_not_allowed"
+                continue
         entry = _parse_setup_level(s.get("entry_zone"))
         if entry is None:
             entry = _parse_setup_level(s.get("entry_trigger"))
@@ -174,15 +186,19 @@ def btc_filter_setups(setups, atr, px, diff_check):
         s["btc_tp2"] = round(tp2, 2) if tp2 else None
         s["btc_risk_pct"] = BTC_RISK_PCT
         s["btc_position_size_usd"] = round(10000 * BTC_RISK_PCT / 100 / risk * entry, 2)
+        # RR gate: TP 細過 risk → 贏都贏唔起, skip (live 實證: RR<1 單贏 +0.09R 但輸 −1.08R)
+        if tp1:
+            rr = abs(tp1 - entry) / risk
+            s["rr_tp1"] = round(rr, 2)
+            if rr < MIN_RR:
+                s["_gate_skip"] = f"rr_{s['rr_tp1']}_lt_{MIN_RR}"
+                continue
         # UNVERIFIED 標記
         if diff_check["status"] != "OK":
             s["verified"] = False
             s["unverified_reason"] = diff_check["status"]
         else:
             s["verified"] = True
-        # RR 重算 (原版 rr_tp1 已有, 但 SL floor 後重算)
-        if tp1:
-            s["rr_tp1"] = round(abs(tp1 - entry) / risk, 2)
         out.append(s)
     return out
 

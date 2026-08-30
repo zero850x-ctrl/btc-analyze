@@ -288,19 +288,32 @@ def main():
         return {o["pattern"] for o in load_log()["orders"] if o.get("status") in ("FILLED_ENTRY", "OCO_PLACED", "OCO_FAILED")}
 
     todo = [s for s in setups if s.get("pattern") not in _live_patterns()]
-    # Preflight skip 記憶: 同 pattern 30 分鐘內已因 TP/SL 錯邊被擋 → 靜默跳過 (唔重複 ❌)
+    # C: 平倉/flatten 後同 pattern 60 分鐘冷靜期 — 防 churn (平完即刻重入, 每次俾費用)
     now = datetime.now(timezone.utc)
-    skipped_before = set()
-    for o in log["orders"]:
-        if o.get("status") != "SKIP_PREFLIGHT":
-            continue
-        try:
-            age = (now - datetime.strptime(o["seeded_time"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).total_seconds()
-        except Exception:
-            continue
-        if age < 1800:
-            skipped_before.add(o["pattern"])
-    todo = [s for s in todo if s.get("pattern") not in skipped_before]
+    cooled_out = []
+    for s in todo:
+        blocked = False
+        for o in log["orders"]:
+            if o.get("pattern") != s.get("pattern"):
+                continue
+            ts_raw = o.get("closed_time") or o.get("seeded_time") or ""
+            if o.get("status") in ("SKIP_PREFLIGHT",) and o.get("closed_time") is None:
+                continue  # skip 記憶由 preflight block 處理, 呢度只管平倉/失敗
+            if o.get("status") not in ("CLOSED", "FLATTENED_OCO_FAILED", "OCO_FAILED", "SKIP_PREFLIGHT"):
+                continue
+            try:
+                ts = datetime.strptime(ts_raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            age_min = (now - ts).total_seconds() / 60
+            if age_min < 60:
+                blocked = True
+                break
+        if blocked:
+            print(f"🧊 {s.get('pattern','?')} skip — 平倉/失敗後冷靜期 (60 分鐘)")
+        else:
+            cooled_out.append(s)
+    todo = cooled_out
     if not todo:
         print("⏳ 全部 setups 已落單")
         return
