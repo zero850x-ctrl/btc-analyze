@@ -288,6 +288,19 @@ def main():
         return {o["pattern"] for o in load_log()["orders"] if o.get("status") in ("FILLED_ENTRY", "OCO_PLACED", "OCO_FAILED")}
 
     todo = [s for s in setups if s.get("pattern") not in _live_patterns()]
+    # Preflight skip 記憶: 同 pattern 30 分鐘內已因 TP/SL 錯邊被擋 → 靜默跳過 (唔重複 ❌)
+    now = datetime.now(timezone.utc)
+    skipped_before = set()
+    for o in log["orders"]:
+        if o.get("status") != "SKIP_PREFLIGHT":
+            continue
+        try:
+            age = (now - datetime.strptime(o["seeded_time"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).total_seconds()
+        except Exception:
+            continue
+        if age < 1800:
+            skipped_before.add(o["pattern"])
+    todo = [s for s in todo if s.get("pattern") not in skipped_before]
     if not todo:
         print("⏳ 全部 setups 已落單")
         return
@@ -329,6 +342,14 @@ def main():
             continue
         rec, err = place_signal_order(s, key, secret)
         if err:
+            # 記入 log (SKIP_PREFLIGHT) — 下次 tick 見到同 pattern 已 skip 就靜默, 唔會重複 ❌
+            log2 = load_log()
+            log2["orders"].append({
+                "pattern": s.get("pattern", "?"), "side": s.get("btc_side"),
+                "status": "SKIP_PREFLIGHT", "skip_reason": err,
+                "seeded_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            })
+            save_log(log2)
             print(f"❌ {s.get('pattern','?')}: {err}")
         else:
             print(f"✅ {rec['side']} {rec['pattern']} fill={rec['entry_fill']} qty={rec['qty']} status={rec['status']} oco={rec.get('oco_id','-')}")
