@@ -106,7 +106,7 @@ try:
     log = ptb.load_log()
     closed_trade = dict(fake_trade)
     closed_trade.update({"status": "CLOSED", "result": "SL", "pnl_r": -2.5,
-                         "closed_time": "2026-08-29T08:30:00Z"})
+                         "closed_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
     log["history"].append(closed_trade)
     ptb.save_log(log)
     with mock.patch.object(ptb, "_coinbase_spot", return_value=77400.0):
