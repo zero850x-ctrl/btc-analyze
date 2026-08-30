@@ -129,6 +129,17 @@ def place_signal_order(setup, key, secret):
     px = current_price()
     lot_step, lot_min, min_notional = exchange_filters(key, secret)
 
+    # Pre-flight level 驗證 — OCO 拒單係因為 TP 喺市價錯邊 (下單必敗, 先擋慳手續費)
+    if tp1:
+        if side == "BUY" and tp1 <= px * 1.0005:
+            return None, f"TP1 {tp1} 喺市價 {px:.0f} 下面 — BUY OCO 必拒, skip"
+        if side == "SELL" and tp1 >= px * 0.9995:
+            return None, f"TP1 {tp1} 喺市價 {px:.0f} 上面 — SELL OCO 必拒, skip"
+        if side == "BUY" and stop >= px * 0.9995:
+            return None, f"SL {stop} 喺市價 {px:.0f} 上面 — BUY OCO 必拒, skip"
+        if side == "SELL" and stop <= px * 1.0005:
+            return None, f"SL {stop} 喺市價 {px:.0f} 下面 — SELL OCO 必拒, skip"
+
     # qty: USD 200 notional / entry (paper 額度), round 落 step
     notional = 200.0
     qty = round_step(notional / entry, lot_step)
@@ -192,6 +203,7 @@ def place_signal_order(setup, key, secret):
                 rec["flatten_note"] = "OCO rejected → emergency market close"
             except urllib.error.HTTPError as e2:
                 rec["flatten_error"] = e2.read().decode()[:200]
+            rec["flatten_ts"] = time.time()
 
     log = load_log()
     log["orders"].append(rec)
@@ -278,6 +290,28 @@ def main():
     todo = [s for s in setups if s.get("pattern") not in _live_patterns()]
     if not todo:
         print("⏳ 全部 setups 已落單")
+        return
+
+    # Flatten 冷靜期: 同 pattern 15 分鐘內 OCO 失敗過 → 冇意義即刻再入 (條件冇變)
+    now = time.time()
+    cooled = []
+    for s in todo:
+        recent_fail = False
+        for o in log["orders"]:
+            if o.get("status") not in ("FLATTENED_OCO_FAILED", "OCO_FAILED"):
+                continue
+            if o.get("pattern") != s.get("pattern"):
+                continue
+            ts = o.get("flatten_ts")
+            if isinstance(ts, (int, float)) and now - ts < 900:
+                recent_fail = True
+                break
+        if recent_fail:
+            print(f"🧊 {s.get('pattern','?')} skip — OCO 失敗冷靜期 (15 分鐘)")
+        else:
+            cooled.append(s)
+    todo = cooled
+    if not todo:
         return
     # 風控: 同方向最多 2 單 live + 相反方向鎖
     for s in todo:
