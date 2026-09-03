@@ -208,7 +208,8 @@ def tick(key, secret, dry=False):
                            "state": "OPEN", "target_usd": WIN_TARGET_USD, "opened": now}
             out.append(f"🔵 馬丁 OPEN {side} {o['qty']:.5f}@{o['fill_px']:.0f} (SMA50={m:.0f})")
 
-    save_state(s)
+    if not dry:
+        save_state(s)
     print("\n".join(out))
 
 
