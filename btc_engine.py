@@ -41,7 +41,7 @@ COINBASE_TICKER_URL = "https://api.exchange.coinbase.com/products/BTC-USD/ticker
 BTC_RISK_PCT = 0.5          # 每筆風險 = 帳戶 0.5% (24/7 + 高波動 → 比 XAUUSD 保守)
 BTC_EXCHANGE_DIFF_PCT = 0.8  # Coinbase vs 主源價差 >0.8% → UNVERIFIED (黃金 basis $40 之 BTC 版)
 SL_FLOOR_ATR_MULT = 0.8     # 同 XAUUSD — SL 至少 0.8×ATR
-MIN_RR = 1.0                # RR gate: TP1/risk >= 1.0 (RR<1 單贏都贏唔起 — live 9 筆實證)
+MIN_RR = 1.2                # RR gate: TP1/risk >= 1.2 (RR<1.2 單贏細輸大 — live 15 筆實證: 贏 avg +0.28R / 輸 avg -1.08R)
 ALLOWED_PATTERNS = ("Flag",)  # Pattern gate: 只做 Bull/Bear Flag (backtest +0.59/+0.66R; AT/雙頂負 EV)
 BTC_MIN_BARS_M30 = 240      # M30 最少 5 日數據
 BTC_MIN_BARS_H1 = 240
