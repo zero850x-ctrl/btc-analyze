@@ -40,16 +40,25 @@ def log(msg):
             f.writelines(lines[-500:])
 
 
-def _pnl_of(rec, exit_px, qty, fee):
-    """單一段 exit 嘅 pnl (fee 為 BTC 單位 → 扣 fee×exit_px 轉 USD)."""
+def _pnl_of(rec, exit_px, qty, fee, fee_asset):
+    """單一段 exit 嘅 pnl (扣 fee).
+
+    Binance spot: seller 付 USDT (quote)、buyer 付 BTC (base) —
+    用 myTrades 嘅 commissionAsset 判斷 (GLM review #A1, 真數據驗證):
+      USDT → 直接扣; BTC → ×price 轉 USD.
+    """
     direction = -1 if rec["side"] == "SELL" else 1
-    return (exit_px - rec["entry_fill"]) * qty * direction - fee * exit_px
+    fee_usdt = fee if str(fee_asset).upper() == "USDT" else fee * exit_px
+    return (exit_px - rec["entry_fill"]) * qty * direction - fee_usdt
 
 
 def _trail_leg(rec, open_map, key, secret):
-    """尾倉 SL (l3) 按 ATR step 推 — 每行 +1 ATR 利潤 → SL 追 1 ATR (鎖 1 ATR 浮動).
+    """尾倉 SL (l3) 按 ATR step 推 — 每行 +1 ATR 利潤 → SL 追 (steps-1)×ATR.
 
-    先 POST 新 SL order 成功先 DELETE 舊 (避免 naked 窗口); 失敗留待下個 tick 再試.
+    steps=1 時 SL 推到 breakeven (鎖打和); steps=2 鎖 +1 ATR, 如此類推.
+    先 POST 新 SL order 成功先 DELETE 舊 (避免 naked 窗口); DELETE 失敗 →
+    即刻 DELETE 剛 POST 嘅新 SL (rollback), 防止雙 SL live 開反向裸倉
+    (GLM review #B3).
     """
     from binance_testnet_paper import _signed_request, current_price
 
@@ -61,13 +70,17 @@ def _trail_leg(rec, open_map, key, secret):
         return
     entry = rec["entry_fill"]
     side = rec["side"]
+    # 高水位: 用本 tick 見過嘅最優價計 steps (spike 回落都唔會錯過追蹤)
     px = current_price()
+    best = max(rec.get("max_favorable_px") or 0, px) if side == "BUY" \
+        else min(rec.get("max_favorable_px") or px, px)
+    rec["max_favorable_px"] = best
     old_stop = float(open_map[l3_id]["stopPrice"])
     if side == "BUY":
-        steps = int((px - entry) / atr)
+        steps = int((best - entry) / atr)
         new_stop = entry + max(0, steps - 1) * atr
     else:
-        steps = int((entry - px) / atr)
+        steps = int((entry - best) / atr)
         new_stop = entry - max(0, steps - 1) * atr
     if steps < 1:
         return  # 未行夠 1 ATR
@@ -86,17 +99,97 @@ def _trail_leg(rec, open_map, key, secret):
                 "symbol": "BTCUSDT", "side": "BUY", "type": "STOP_LOSS_LIMIT",
                 "quantity": f"{qty:.5f}", "stopPrice": f"{new_stop:.2f}",
                 "price": f"{new_stop * 1.0015:.2f}", "timeInForce": "GTC"}, key, secret)
+    except Exception as e:
+        rec.setdefault("trail_errors", []).append(f"POST fail: {str(e)[:100]}")
+        return
+    # POST 成功先 DELETE 舊 SL; DELETE 失敗 → rollback 新 SL (雙 SL = 反向裸倉風險)
+    try:
         _signed_request("DELETE", "/api/v3/order",
                         {"symbol": "BTCUSDT", "orderId": l3_id}, key, secret)
-        rec["l3_id"] = r["orderId"]
-        rec.setdefault("exit_leg_ids", []).append(r["orderId"])   # 新 SL leg 都要 reconcile
-        rec["trail_stop"] = new_stop
-        rec.setdefault("trails", []).append({
-            "to": new_stop,
-            "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        })
     except Exception as e:
-        rec.setdefault("trail_errors", []).append(str(e)[:120])
+        try:
+            _signed_request("DELETE", "/api/v3/order",
+                            {"symbol": "BTCUSDT", "orderId": r["orderId"]}, key, secret)
+            rec.setdefault("trail_errors", []).append(
+                f"old-DELETE fail → new SL rolled back: {str(e)[:80]}")
+        except Exception as e2:
+            rec["trail_stuck"] = True   # 雙 SL 都剷唔走 → 標記, 下 tick 優先處理
+            rec.setdefault("trail_errors", []).append(
+                f"ROLLBACK FAIL 雙SL live old={l3_id} new={r['orderId']}: {str(e2)[:80]}")
+        return
+    rec["l3_id"] = r["orderId"]
+    rec.setdefault("exit_leg_ids", []).append(r["orderId"])   # 新 SL leg 都要 reconcile
+    rec["trail_stop"] = new_stop
+    rec.setdefault("trails", []).append({
+        "to": new_stop,
+        "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+
+
+def _breakeven_remaining(rec, open_map, key, secret):
+    """TP1 (OCO_A) 成交後 → OCO_B 嘅 SL leg 同尾倉 SL 一次過推去 breakeven.
+
+    GLM review #D2: TP1 落袋後剩倉仲掛原價 SL, 一個 reverse candle 就打回原形
+    (贏細輸大殘餘風險). 先 POST 後 DELETE 每單, DELETE 失敗即刻 rollback 新單.
+    """
+    from binance_testnet_paper import _signed_request
+
+    if not rec.get("oco_a_gone"):
+        return
+    entry = rec["entry_fill"]
+    side = rec["side"]
+    be = round(entry, 2)
+    # 目標 legs: OCO_B 嘅 stop leg + 尾倉 l3 — 佢哋 stopPrice 仲喺原價
+    targets = []
+    if rec.get("l3_id") and rec["l3_id"] in open_map:
+        targets.append(rec["l3_id"])
+    if rec.get("oco_b_id") is not None:
+        # OCO_B 兩腿 stopPrice 一致, 搵 open_orders 入面同 planned_stop 一致嘅 leg
+        for oid, o in open_map.items():
+            if oid in targets:
+                continue
+            if str(o.get("clientOrderId", "")).startswith("auto") or "stopPrice" in o:
+                if abs(float(o.get("stopPrice", 0)) - float(rec["planned_stop"])) < 1e-6:
+                    targets.append(oid)
+    # migrate: 用 closed_leg_ids 判斷 OCO_A 已成交
+    for oid in targets:
+        if oid not in open_map:
+            continue
+        o = open_map[oid]
+        if abs(float(o.get("stopPrice", 0)) - be) < 1e-6:
+            continue  # 已經係 breakeven
+        qty = float(o["origQty"])
+        try:
+            if side == "BUY":
+                r = _signed_request("POST", "/api/v3/order", {
+                    "symbol": "BTCUSDT", "side": "SELL", "type": "STOP_LOSS_LIMIT",
+                    "quantity": f"{qty:.5f}", "stopPrice": f"{be:.2f}",
+                    "price": f"{be * 0.9985:.2f}", "timeInForce": "GTC"}, key, secret)
+            else:
+                r = _signed_request("POST", "/api/v3/order", {
+                    "symbol": "BTCUSDT", "side": "BUY", "type": "STOP_LOSS_LIMIT",
+                    "quantity": f"{qty:.5f}", "stopPrice": f"{be:.2f}",
+                    "price": f"{be * 1.0015:.2f}", "timeInForce": "GTC"}, key, secret)
+        except Exception as e:
+            rec.setdefault("trail_errors", []).append(f"BE POST fail {oid}: {str(e)[:80]}")
+            continue
+        try:
+            _signed_request("DELETE", "/api/v3/order",
+                            {"symbol": "BTCUSDT", "orderId": oid}, key, secret)
+        except Exception as e:
+            try:
+                _signed_request("DELETE", "/api/v3/order",
+                                {"symbol": "BTCUSDT", "orderId": r["orderId"]}, key, secret)
+                rec.setdefault("trail_errors", []).append(f"BE rollback {oid}: {str(e)[:80]}")
+            except Exception as e2:
+                rec["trail_stuck"] = True
+                rec.setdefault("trail_errors", []).append(
+                    f"BE ROLLBACK FAIL {oid}+{r['orderId']}: {str(e2)[:80]}")
+            continue
+        rec.setdefault("exit_leg_ids", []).append(r["orderId"])
+        if rec.get("l3_id") == oid:
+            rec["l3_id"] = r["orderId"]
+        rec.setdefault("breakeven_moves", []).append({"oid": oid, "new": r["orderId"], "be": be})
 
 
 def reconcile_cycle(key, secret):
@@ -114,12 +207,20 @@ def reconcile_cycle(key, secret):
     open_ids = {o["orderId"] for o in opens}
     open_map = {o["orderId"]: o for o in opens}
     for rec in log_d["orders"]:
+        # 舊格式 (oco_leg_ids) → migration 到 exit_leg_ids (GLM review #C1:
+        # 唔 migrate 嘅舊單會永久佔住 cap 1 名額, 癱瘓新開倉)
+        if rec.get("status") == "OCO_PLACED" and not rec.get("exit_leg_ids") and rec.get("oco_leg_ids"):
+            rec["exit_leg_ids"] = list(rec["oco_leg_ids"])
         if rec.get("status") != "OCO_PLACED" or not rec.get("exit_leg_ids"):
             continue
         legs_gone = [i for i in rec["exit_leg_ids"] if i not in open_ids]
         done_ids = set(rec.get("closed_leg_ids") or [])
         new_gone = [i for i in legs_gone if i not in done_ids]
         if new_gone:
+            # OCO_A 兩腿都消失 = TP1 成交 → 剩倉 SL 推 breakeven
+            oco_a_ids = rec.get("oco_a_leg_ids") or []
+            if oco_a_ids and all(i in set(new_gone) | done_ids for i in oco_a_ids):
+                rec["oco_a_gone"] = True
             trades = _signed_request("GET", "/api/v3/myTrades", {"symbol": "BTCUSDT"}, key, secret)
             t = sorted(trades, key=lambda x: x["time"])
             exit_trades = [x for x in t if x["orderId"] in new_gone]
@@ -127,13 +228,16 @@ def reconcile_cycle(key, secret):
                 exit_qty = sum(float(x["qty"]) for x in exit_trades)
                 exit_px = sum(float(x["price"]) * float(x["qty"]) for x in exit_trades) / exit_qty
                 exit_fee = sum(float(x["commission"]) for x in exit_trades)
+                fee_assets = {str(x.get("commissionAsset", "BTC")).upper() for x in exit_trades}
+                fee_asset = "BTC" if fee_assets == {"BTC"} else ("USDT" if fee_assets == {"USDT"} else "MIXED")
                 rec["closed_leg_ids"] = sorted(done_ids | set(new_gone))
                 rec["realized_qty"] = round((rec.get("realized_qty") or 0.0) + exit_qty, 8)
                 rec["realized_pnl"] = round((rec.get("realized_pnl") or 0.0)
-                                            + _pnl_of(rec, exit_px, exit_qty, exit_fee), 2)
+                                            + _pnl_of(rec, exit_px, exit_qty, exit_fee, fee_asset), 2)
                 rec["exit_fee"] = round((rec.get("exit_fee") or 0.0) + exit_fee, 8)
                 rec.setdefault("realized_parts", []).append({
                     "qty": exit_qty, "price": round(exit_px, 2), "fee": exit_fee,
+                    "fee_asset": fee_asset,
                     "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 })
             else:
@@ -151,6 +255,7 @@ def reconcile_cycle(key, secret):
             rec["closed_via"] = "oco_legs_all_gone"
             changed.append(rec)
         else:
+            _breakeven_remaining(rec, open_map, key, secret)
             _trail_leg(rec, open_map, key, secret)
     if changed:
         save_log(log_d)

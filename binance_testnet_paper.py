@@ -153,10 +153,10 @@ def place_signal_order(setup, key, secret, atr=None):
     tp2 = float(setup["btc_tp2"]) if setup.get("btc_tp2") else None
     pattern = setup.get("pattern", "?")
 
-    # RR hard gate — 落單前最後防線, 唔信 json
+    # RR hard gate — 落單前最後防線, 唔信 json; 冇 TP1 = 冇法計 RR = 一律拒
     rr = _compute_rr(setup)
-    if rr is not None and rr < MIN_RR_EXEC:
-        return None, f"RR {rr:.2f} < {MIN_RR_EXEC} hard gate — skip"
+    if rr is None or rr < MIN_RR_EXEC:
+        return None, f"RR {'n/a(冇TP1)' if rr is None else f'{rr:.2f}'} < {MIN_RR_EXEC} hard gate — skip"
 
     px = current_price()
     lot_step, lot_min, min_notional = exchange_filters(key, secret)
@@ -255,6 +255,7 @@ def place_signal_order(setup, key, secret, atr=None):
         if oco_a is not None:
             rec["oco_a_id"] = oco_a["orderListId"]
             ids_a = [o["orderId"] for o in oco_a.get("orders", [])]
+            rec["oco_a_leg_ids"] = ids_a          # TP1 fill 偵測用 (breakeven trigger)
             leg_ids.extend(ids_a)
             exit_orders.append(("OCO_A", ids_a))
         oco_b = _oco_qty(q2, tp2) if tp2 else None
@@ -268,7 +269,10 @@ def place_signal_order(setup, key, secret, atr=None):
             rec["l3_id"] = l3["orderId"]
             leg_ids.append(l3["orderId"])
             exit_orders.append(("L3", [l3["orderId"]]))
-    except urllib.error.HTTPError as e:
+        if not leg_ids:
+            # exit 完全建唔成 (q1/q3 全 0 等) → 冇裸倉, 即 flatten (GLM review #B)
+            raise RuntimeError("no exit legs built (q1/q3 both 0)")
+    except (urllib.error.HTTPError, RuntimeError) as e:
         # exit 建立失敗 → 取消已建 exit order + market flatten (冇裸倉)
         for tag, ids in exit_orders:
             for oid in ids:
@@ -283,10 +287,11 @@ def place_signal_order(setup, key, secret, atr=None):
                 "quantity": f"{fill_qty:.5f}",
             }, key, secret)
             rec["status"] = "FLATTENED_OCO_FAILED"
-            rec["flatten_note"] = "exit order 建立失敗 → emergency market close"
+            rec["flatten_note"] = f"exit order 建立失敗 ({type(e).__name__}) → emergency market close"
         except urllib.error.HTTPError as e2:
             rec["flatten_error"] = e2.read().decode()[:200]
-        rec["oco_error"] = e.read().decode()[:200]
+        rec["oco_error"] = (e.read().decode()[:200] if isinstance(e, urllib.error.HTTPError)
+                            else str(e)[:200])
         rec["flatten_ts"] = time.time()
 
     if leg_ids and rec.get("status") != "FLATTENED_OCO_FAILED":
@@ -445,17 +450,18 @@ def main():
         if same_side:
             print(f"🚫 {s.get('pattern','?')} skip — 同向 live 已 1 單 (cap)")
             continue
-        # RR hard gate — 落單前最後防線 (歷史單 RR<1.2 全部贏細輸大)
+        # RR hard gate — 落單前最後防線 (歷史單 RR<1.2 全部贏細輸大); 冇 TP1 一律拒
         rr = _compute_rr(s)
-        if rr is not None and rr < MIN_RR_EXEC:
+        if rr is None or rr < MIN_RR_EXEC:
+            rr_txt = "n/a(冇TP1)" if rr is None else f"{rr:.2f}"
             log2 = load_log()
             log2["orders"].append({
                 "pattern": s.get("pattern", "?"), "side": s.get("btc_side"),
-                "status": "SKIP_PREFLIGHT", "skip_reason": f"RR {rr:.2f} < {MIN_RR_EXEC} hard gate",
+                "status": "SKIP_PREFLIGHT", "skip_reason": f"RR {rr_txt} < {MIN_RR_EXEC} hard gate",
                 "seeded_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             })
             save_log(log2)
-            print(f"❌ {s.get('pattern','?')}: RR {rr:.2f} < {MIN_RR_EXEC} hard gate — skip")
+            print(f"❌ {s.get('pattern','?')}: RR {rr_txt} < {MIN_RR_EXEC} hard gate — skip")
             continue
         if args.dry_run:
             print(f"[DRY] {s['btc_side']} {s.get('pattern','?')} entry={s['btc_entry']} SL={s['btc_stop']} TP1={s.get('btc_tp1')} TP2={s.get('btc_tp2')} RR={rr}")
