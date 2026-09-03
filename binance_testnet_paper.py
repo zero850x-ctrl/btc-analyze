@@ -37,6 +37,26 @@ TAKER_FEE = 0.001          # 0.1% (testnet 同主網同 fee schedule)
 MIN_NOTIONAL = 10.0        # BTCUSDT minimum
 LOT_STEP = 0.00001         # BTC lot step
 
+# fix/btc-exit-symmetry: 落單前 hard RR gate — 歷史實證 RR<1.2 嘅單全部贏細輸大
+# (engine json 嘅 rr_tp1 有缺口, 呢度做最後防線, 唔信 json)
+MIN_RR_EXEC = 1.2
+
+
+def _compute_rr(setup):
+    """setup → TP1/risk RR (用 planned entry/stop/tp1, 落單前驗證用)."""
+    try:
+        entry = float(setup["btc_entry"])
+        stop = float(setup["btc_stop"])
+        tp1 = float(setup["btc_tp1"]) if setup.get("btc_tp1") else None
+    except (KeyError, TypeError, ValueError):
+        return None
+    if tp1 is None:
+        return None
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    return abs(tp1 - entry) / risk
+
 
 def _load_keys():
     key = os.environ.get("BINANCE_TESTNET_API_KEY", "")
@@ -115,16 +135,28 @@ def round_step(qty, step):
     return max(0.0, int(qty / step) * step)
 
 
-def place_signal_order(setup, key, secret):
-    """引擎 setup → testnet 真單 (market 進場 + OCO SL/TP1).
+def place_signal_order(setup, key, secret, atr=None):
+    """引擎 setup → testnet 真單 (market 進場 + 3 段出場).
 
-    setup: btc_engine.py 輸出格式 (btc_side/btc_entry/btc_stop/btc_tp1/pattern)
+    fix/btc-exit-symmetry exit 結構:
+      - 1/3 qty → OCO A: stop-limit SL + limit TP1 (掛 TP 本價, 唔食 0.1% maker 差價)
+      - 1/3 qty → OCO B: stop-limit SL + limit TP2 (冇 TP2 就併入尾倉)
+      - 尾倉 1/3 → 獨立 stop-limit SL, 之後由 reconcile 按 ATR trailing
+    任一段 exit 建立失敗 → 取消已建 exit + market flatten (冇裸倉).
+
+    setup: btc_engine.py 輸出格式 (btc_side/btc_entry/btc_stop/btc_tp1/btc_tp2/pattern)
     """
     side = setup["btc_side"]
     entry = float(setup["btc_entry"])
     stop = float(setup["btc_stop"])
     tp1 = float(setup["btc_tp1"]) if setup.get("btc_tp1") else None
+    tp2 = float(setup["btc_tp2"]) if setup.get("btc_tp2") else None
     pattern = setup.get("pattern", "?")
+
+    # RR hard gate — 落單前最後防線, 唔信 json
+    rr = _compute_rr(setup)
+    if rr is not None and rr < MIN_RR_EXEC:
+        return None, f"RR {rr:.2f} < {MIN_RR_EXEC} hard gate — skip"
 
     px = current_price()
     lot_step, lot_min, min_notional = exchange_filters(key, secret)
@@ -160,50 +192,109 @@ def place_signal_order(setup, key, secret):
         "pattern": pattern, "side": side, "qty": fill_qty,
         "order_id": order["orderId"], "status": "FILLED_ENTRY",
         "entry_fill": round(fill_px, 2), "fee": fee_paid,
-        "planned_stop": stop, "planned_tp1": tp1,
+        "planned_stop": stop, "planned_tp1": tp1, "planned_tp2": tp2,
+        "atr": round(float(atr), 2) if atr else None,
         "seeded_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
-    # OCO 出場: SELL 單 → OCO SELL stop-loss-limit + limit-maker (TP)
-    if tp1:
-        exit_side = "SELL" if side == "BUY" else "BUY"
-        exit_qty = round_step(fill_qty, lot_step)
+    # ── 3 段出場 (1/3 each; TP2 冇就尾倉 2/3) ─────────────────────
+    exit_side = "SELL" if side == "BUY" else "BUY"
+    q1 = round_step(fill_qty / 3, lot_step)
+    q2 = round_step(fill_qty / 3, lot_step) if tp2 else 0.0
+    q3 = round_step(fill_qty - q1 - q2 + 1e-9, lot_step)   # +epsilon: float 精度唔好蝕尾數
+    if q1 + q2 + q3 > fill_qty + 1e-12:      # 尾數保護 (float 誤差唔計, round 後唔可以 over-sell)
+        q3 = round_step(fill_qty - q1 - q2, lot_step) - lot_step
+        if q3 < 0:
+            q3 = 0.0
+
+    exit_orders = []   # (tag, ids) for cleanup
+    leg_ids = []
+
+    def _oco_qty(sl_qty, tp_price):
+        if sl_qty <= 0:
+            return None
+        if exit_side == "SELL":
+            return _signed_request("POST", "/api/v3/order/oco", {
+                "symbol": SYMBOL, "side": "SELL",
+                "quantity": f"{sl_qty:.5f}",
+                "price": f"{tp_price:.2f}",              # TP 本價 (fix: 唔再 ×0.999 蝕 0.1%)
+                "stopPrice": f"{stop:.2f}",
+                "stopLimitPrice": f"{stop * 0.9985:.2f}",
+                "stopLimitTimeInForce": "GTC",
+            }, key, secret)
+        return _signed_request("POST", "/api/v3/order/oco", {
+            "symbol": SYMBOL, "side": "BUY",
+            "quantity": f"{sl_qty:.5f}",
+            "price": f"{tp_price:.2f}",
+            "stopPrice": f"{stop:.2f}",
+            "stopLimitPrice": f"{stop * 1.0015:.2f}",
+            "stopLimitTimeInForce": "GTC",
+        }, key, secret)
+
+    def _sl_only_qty(sl_qty):
+        if sl_qty <= 0:
+            return None
+        if exit_side == "SELL":
+            return _signed_request("POST", "/api/v3/order", {
+                "symbol": SYMBOL, "side": "SELL", "type": "STOP_LOSS_LIMIT",
+                "quantity": f"{sl_qty:.5f}",
+                "stopPrice": f"{stop:.2f}",
+                "price": f"{stop * 0.9985:.2f}",
+                "timeInForce": "GTC",
+            }, key, secret)
+        return _signed_request("POST", "/api/v3/order", {
+            "symbol": SYMBOL, "side": "BUY", "type": "STOP_LOSS_LIMIT",
+            "quantity": f"{sl_qty:.5f}",
+            "stopPrice": f"{stop:.2f}",
+            "price": f"{stop * 1.0015:.2f}",
+            "timeInForce": "GTC",
+        }, key, secret)
+
+    try:
+        oco_a = _oco_qty(q1, tp1) if tp1 else None
+        if oco_a is not None:
+            rec["oco_a_id"] = oco_a["orderListId"]
+            ids_a = [o["orderId"] for o in oco_a.get("orders", [])]
+            leg_ids.extend(ids_a)
+            exit_orders.append(("OCO_A", ids_a))
+        oco_b = _oco_qty(q2, tp2) if tp2 else None
+        if oco_b is not None:
+            rec["oco_b_id"] = oco_b["orderListId"]
+            ids_b = [o["orderId"] for o in oco_b.get("orders", [])]
+            leg_ids.extend(ids_b)
+            exit_orders.append(("OCO_B", ids_b))
+        l3 = _sl_only_qty(q3)
+        if l3 is not None:
+            rec["l3_id"] = l3["orderId"]
+            leg_ids.append(l3["orderId"])
+            exit_orders.append(("L3", [l3["orderId"]]))
+    except urllib.error.HTTPError as e:
+        # exit 建立失敗 → 取消已建 exit order + market flatten (冇裸倉)
+        for tag, ids in exit_orders:
+            for oid in ids:
+                try:
+                    _signed_request("DELETE", "/api/v3/order",
+                                    {"symbol": SYMBOL, "orderId": oid}, key, secret)
+                except Exception:
+                    pass
         try:
-            if exit_side == "SELL":
-                oco = _signed_request("POST", "/api/v3/order/oco", {
-                    "symbol": SYMBOL, "side": "SELL",
-                    "quantity": f"{exit_qty:.5f}",
-                    "price": f"{tp1 * 0.999:.2f}",         # limit maker 略低過 TP
-                    "stopPrice": f"{stop:.2f}",
-                    "stopLimitPrice": f"{stop * 0.9985:.2f}",
-                    "stopLimitTimeInForce": "GTC",
-                }, key, secret)
-            else:
-                oco = _signed_request("POST", "/api/v3/order/oco", {
-                    "symbol": SYMBOL, "side": "BUY",
-                    "quantity": f"{exit_qty:.5f}",
-                    "price": f"{tp1 * 1.001:.2f}",
-                    "stopPrice": f"{stop:.2f}",
-                    "stopLimitPrice": f"{stop * 1.0015:.2f}",
-                    "stopLimitTimeInForce": "GTC",
-                }, key, secret)
-            rec["oco_id"] = oco["orderListId"]
-            rec["status"] = "OCO_PLACED"
-            rec["oco_leg_ids"] = [o["orderId"] for o in oco.get("orders", [])]
-        except urllib.error.HTTPError as e:
-            rec["status"] = "OCO_FAILED"
-            rec["oco_error"] = e.read().decode()[:200]
-            # 安全網: OCO 掛唔上 → 立刻 market 平返 (冇裸倉過夜)
-            try:
-                _signed_request("POST", "/api/v3/order", {
-                    "symbol": SYMBOL, "side": exit_side, "type": "MARKET",
-                    "quantity": f"{exit_qty:.5f}",
-                }, key, secret)
-                rec["status"] = "FLATTENED_OCO_FAILED"
-                rec["flatten_note"] = "OCO rejected → emergency market close"
-            except urllib.error.HTTPError as e2:
-                rec["flatten_error"] = e2.read().decode()[:200]
-            rec["flatten_ts"] = time.time()
+            _signed_request("POST", "/api/v3/order", {
+                "symbol": SYMBOL, "side": exit_side, "type": "MARKET",
+                "quantity": f"{fill_qty:.5f}",
+            }, key, secret)
+            rec["status"] = "FLATTENED_OCO_FAILED"
+            rec["flatten_note"] = "exit order 建立失敗 → emergency market close"
+        except urllib.error.HTTPError as e2:
+            rec["flatten_error"] = e2.read().decode()[:200]
+        rec["oco_error"] = e.read().decode()[:200]
+        rec["flatten_ts"] = time.time()
+
+    if leg_ids and rec.get("status") != "FLATTENED_OCO_FAILED":
+        rec["exit_leg_ids"] = leg_ids
+        rec["status"] = "OCO_PLACED"
+    elif not leg_ids and rec.get("status") == "FILLED_ENTRY":
+        rec["status"] = "OCO_FAILED"
+        rec["oco_error"] = "no exit legs built"
 
     log = load_log()
     log["orders"].append(rec)
@@ -339,21 +430,37 @@ def main():
     todo = cooled
     if not todo:
         return
-    # 風控: 同方向最多 2 單 live + 相反方向鎖
+    # 風控 (fix/btc-exit-symmetry): 同 pattern 限 1 單 + 同方向限 1 單 + 相反方向鎖
     for s in todo:
         live = [o for o in load_log()["orders"] if o.get("status") in ("FILLED_ENTRY", "OCO_PLACED")]
+        same_pattern = [o for o in live if o.get("pattern") == s.get("pattern")]
         same_side = [o for o in live if o.get("side") == s["btc_side"]]
         opp_side = [o for o in live if o.get("side") != s["btc_side"]]
+        if same_pattern:
+            print(f"🚫 {s.get('pattern','?')} skip — 同 pattern 已 live, 限 1 單")
+            continue
         if opp_side:
             print(f"🚫 {s.get('pattern','?')} skip — 有一邊向 {opp_side[0]['side']} live 倉, 唔開反向")
             continue
-        if len(same_side) >= 2:
-            print(f"🚫 {s.get('pattern','?')} skip — 同向 live 已 2 單 (cap)")
+        if same_side:
+            print(f"🚫 {s.get('pattern','?')} skip — 同向 live 已 1 單 (cap)")
+            continue
+        # RR hard gate — 落單前最後防線 (歷史單 RR<1.2 全部贏細輸大)
+        rr = _compute_rr(s)
+        if rr is not None and rr < MIN_RR_EXEC:
+            log2 = load_log()
+            log2["orders"].append({
+                "pattern": s.get("pattern", "?"), "side": s.get("btc_side"),
+                "status": "SKIP_PREFLIGHT", "skip_reason": f"RR {rr:.2f} < {MIN_RR_EXEC} hard gate",
+                "seeded_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            })
+            save_log(log2)
+            print(f"❌ {s.get('pattern','?')}: RR {rr:.2f} < {MIN_RR_EXEC} hard gate — skip")
             continue
         if args.dry_run:
-            print(f"[DRY] {s['btc_side']} {s.get('pattern','?')} entry={s['btc_entry']} SL={s['btc_stop']} TP1={s.get('btc_tp1')}")
+            print(f"[DRY] {s['btc_side']} {s.get('pattern','?')} entry={s['btc_entry']} SL={s['btc_stop']} TP1={s.get('btc_tp1')} TP2={s.get('btc_tp2')} RR={rr}")
             continue
-        rec, err = place_signal_order(s, key, secret)
+        rec, err = place_signal_order(s, key, secret, atr=data.get("atr"))
         if err:
             # 記入 log (SKIP_PREFLIGHT) — 下次 tick 見到同 pattern 已 skip 就靜默, 唔會重複 ❌
             log2 = load_log()
@@ -365,7 +472,7 @@ def main():
             save_log(log2)
             print(f"❌ {s.get('pattern','?')}: {err}")
         else:
-            print(f"✅ {rec['side']} {rec['pattern']} fill={rec['entry_fill']} qty={rec['qty']} status={rec['status']} oco={rec.get('oco_id','-')}")
+            print(f"✅ {rec['side']} {rec['pattern']} fill={rec['entry_fill']} qty={rec['qty']} status={rec['status']} ocoA={rec.get('oco_a_id','-')} ocoB={rec.get('oco_b_id','-')} l3={rec.get('l3_id','-')}")
 
 
 if __name__ == "__main__":
