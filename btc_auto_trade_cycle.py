@@ -271,6 +271,7 @@ def reconcile_cycle(key, secret):
 
     log_d = load_log()
     changed = []
+    dirty = False   # partial fill / breakeven / trail rebuild 後必須 save (bug fix 09-03)
     opens = _signed_request("GET", "/api/v3/openOrders", {"symbol": "BTCUSDT"}, key, secret)
     open_ids = {o["orderId"] for o in opens}
     open_map = {o["orderId"]: o for o in opens}
@@ -281,6 +282,7 @@ def reconcile_cycle(key, secret):
             rec["exit_leg_ids"] = list(rec["oco_leg_ids"])
             # 舊格式 = 單一 OCO 全倉 = OCO_A (DSv4 review #E: 舊單 breakeven 保護)
             rec.setdefault("oco_a_leg_ids", list(rec["oco_leg_ids"]))
+            dirty = True
         if rec.get("status") != "OCO_PLACED" or not rec.get("exit_leg_ids"):
             continue
         legs_gone = [i for i in rec["exit_leg_ids"] if i not in open_ids]
@@ -319,9 +321,11 @@ def reconcile_cycle(key, secret):
                     "fee_asset": "USDT(EQV)",
                     "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 })
+                dirty = True
             else:
                 # leg 消失但搵唔到 trade (例如被 cancel) — mark done 避免每 tick 重查
                 rec["closed_leg_ids"] = sorted(done_ids | set(new_gone))
+                dirty = True
         remaining = round(rec.get("qty", 0) - (rec.get("realized_qty") or 0.0), 8)
         if remaining <= 1e-8:
             rec["status"] = "CLOSED"
@@ -334,10 +338,14 @@ def reconcile_cycle(key, secret):
             rec["closed_via"] = "oco_legs_all_gone"
             changed.append(rec)
         else:
+            before = json.dumps(rec, sort_keys=True, default=str)
             _breakeven_remaining(rec, open_map, key, secret)
             _trail_leg(rec, open_map, key, secret)
-    if changed:
+            if json.dumps(rec, sort_keys=True, default=str) != before:
+                dirty = True
+    if changed or dirty:
         save_log(log_d)
+    if changed:
         # 追加 closed history
         hist = json.load(open(HISTORY)) if os.path.exists(HISTORY) else {"trades": []}
         hist["trades"].extend(changed)
