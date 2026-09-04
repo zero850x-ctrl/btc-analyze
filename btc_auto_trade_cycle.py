@@ -279,6 +279,15 @@ def reconcile_cycle(key, secret):
         if remaining <= 1e-8:
             rec["status"] = "CLOSED"
             rec["exit_qty"] = rec.get("realized_qty")
+            # exit_fill = realized_parts 加權平均 exit price (bug fix 09-04:
+            # 之前冇 set → main() c['exit_fill'] KeyError crash)
+            parts = rec.get("realized_parts") or []
+            if parts:
+                pq = sum(float(p["qty"]) for p in parts)
+                if pq > 0:
+                    rec["exit_fill"] = round(sum(float(p["price"]) * float(p["qty"]) for p in parts) / pq, 2)
+            else:
+                rec["exit_fill"] = rec.get("exit_fill") or rec.get("entry_fill")
             risk = abs(rec["entry_fill"] - float(rec["planned_stop"])) * rec["qty"]
             rec["pnl_usdt"] = round((rec.get("realized_pnl") or 0.0)
                                     - (rec.get("fee") or 0.0) * rec["entry_fill"], 2)
@@ -313,7 +322,9 @@ def main():
     # 1. reconcile
     closed = reconcile_cycle(key, secret)
     for c in closed:
-        log(f"🔒 CLOSED {c['side']} {c['pattern'][:18]} exit={c['exit_fill']} pnl={c['pnl_usdt']}USDT R={c['r_multiple']}")
+        # .get() 防禦 — 任何缺 field 都唔可以 crash 個 watchdog (bug fix 09-04)
+        log(f"🔒 CLOSED {c.get('side','?')} {(c.get('pattern') or '?')[:18]} "
+            f"exit={c.get('exit_fill')} pnl={c.get('pnl_usdt')}USDT R={c.get('r_multiple')}")
 
     # 2. 引擎掃描
     out = sh("python3 btc_engine.py 2>&1 | tail -30")
