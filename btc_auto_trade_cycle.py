@@ -145,12 +145,16 @@ def _trail_leg(rec, open_map, key, secret):
 
 
 def _breakeven_remaining(rec, open_map, key, secret):
-    """TP1 成交後 → OCO_B 同尾倉 SL 推 breakeven.
+    """TP1 (OCO_A) 成交後 → 只推尾倉 l3 SL 去 breakeven.
 
-    Binance OCO 係 order list: DELETE 單一 leg = 取消成個 list (連 TP2 一齊冇)
-    → OCO_B 必須成個 orderList 取消再重建 (TP2 原價 + breakeven stop);
-    l3 係獨立 SL → 直接 POST/DELETE. 全部先 POST 後 DELETE (失敗 rollback).
+    3 注結構 (用戶確認 2026-09-03):
+      1. OCO_A @TP1 成交 = 賣第 1 份 ✅
+      2. OCO_B 保持原狀 → 照等 TP2 = 賣第 2 份 (唔郁!)
+      3. 尾倉 l3 → 推 breakeven, 之後 ATR trail = 食大趨勢
+    之前錯誤地將 OCO_B 都取消重建去 breakeven → 第 2 份冇等 TP2,
+    彈返 breakeven 就 2/3 全走 (BTC 爆上 $81k 得 0 手).
 
+    l3 係獨立 SL → 直接 POST 新 (breakeven) + DELETE 舊, 失敗 rollback.
     只喺 OCO_A 嘅 **TP leg 成交** 先 trigger (SL leg 成交 = 價格已反轉,
     推 breakeven 會令剩倉 SL 高過市價即時觸發 — 唔可以做).
     """
@@ -163,101 +167,46 @@ def _breakeven_remaining(rec, open_map, key, secret):
     entry = rec["entry_fill"]
     side = rec["side"]
     be = round(entry, 2)
-    exit_side = "SELL" if side == "BUY" else "BUY"
 
-    def _oco_rebuild():
-        """OCO_B → 成個 orderList 取消, 重建 (TP2 + breakeven stop)."""
-        oco_b_id = rec.get("oco_b_id")
-        if oco_b_id is None:
-            return
-        legs = [o for o in open_map.values() if o.get("orderListId") == oco_b_id and o.get("symbol") == "BTCUSDT"]
-        if not legs:
-            return  # 已冇 leg (可能已成交) — 唔郁
-        o = legs[0]
-        qty = float(o["origQty"])
-        tp2 = rec.get("planned_tp2")
-        if not tp2 or abs(float(o.get("stopPrice", 0)) - be) < 1e-6:
-            return  # 已係 breakeven 或冇 TP2
-        try:
-            if exit_side == "SELL":
-                nr = _signed_request("POST", "/api/v3/order/oco", {
-                    "symbol": "BTCUSDT", "side": "SELL",
-                    "quantity": f"{qty:.5f}", "price": f"{tp2:.2f}",
-                    "stopPrice": f"{be:.2f}",
-                    "stopLimitPrice": f"{be * 0.9985:.2f}",
-                    "stopLimitTimeInForce": "GTC"}, key, secret)
-            else:
-                nr = _signed_request("POST", "/api/v3/order/oco", {
-                    "symbol": "BTCUSDT", "side": "BUY",
-                    "quantity": f"{qty:.5f}", "price": f"{tp2:.2f}",
-                    "stopPrice": f"{be:.2f}",
-                    "stopLimitPrice": f"{be * 1.0015:.2f}",
-                    "stopLimitTimeInForce": "GTC"}, key, secret)
-        except Exception as e:
-            rec.setdefault("trail_errors", []).append(f"BE OCO POST fail: {str(e)[:80]}")
-            return
-        try:
-            _signed_request("DELETE", "/api/v3/orderList",
-                            {"symbol": "BTCUSDT", "orderListId": oco_b_id}, key, secret)
-        except Exception as e:
-            try:
-                _signed_request("DELETE", "/api/v3/orderList",
-                                {"symbol": "BTCUSDT", "orderListId": nr["orderListId"]}, key, secret)
-                rec.setdefault("trail_errors", []).append(f"BE OCO rollback: {str(e)[:80]}")
-            except Exception as e2:
-                rec["trail_stuck"] = True
-                rec.setdefault("trail_errors", []).append(f"BE OCO ROLLBACK FAIL: {str(e2)[:80]}")
-            return
-        # 更新 referenced leg ids: 移除舊 OCO_B legs, 加新
-        old_legs = {o["orderId"] for o in legs}
-        new_legs = [o["orderId"] for o in nr.get("orders", [])]
-        rec["exit_leg_ids"] = [i for i in rec.get("exit_leg_ids", []) if i not in old_legs] + new_legs
-        rec["oco_b_id"] = nr["orderListId"]
-        rec.setdefault("breakeven_moves", []).append({"list": oco_b_id, "new": nr["orderListId"], "be": be})
-
-    def _l3_rebuild():
-        """尾倉獨立 SL → POST 新 (breakeven) + DELETE 舊, 失敗 rollback."""
-        l3_id = rec.get("l3_id")
-        if not l3_id or l3_id not in open_map:
-            return
-        o = open_map[l3_id]
-        if abs(float(o.get("stopPrice", 0)) - be) < 1e-6:
-            return
-        qty = float(o["origQty"])
-        try:
-            if side == "BUY":
-                r = _signed_request("POST", "/api/v3/order", {
-                    "symbol": "BTCUSDT", "side": "SELL", "type": "STOP_LOSS_LIMIT",
-                    "quantity": f"{qty:.5f}", "stopPrice": f"{be:.2f}",
-                    "price": f"{be * 0.9985:.2f}", "timeInForce": "GTC"}, key, secret)
-            else:
-                r = _signed_request("POST", "/api/v3/order", {
-                    "symbol": "BTCUSDT", "side": "BUY", "type": "STOP_LOSS_LIMIT",
-                    "quantity": f"{qty:.5f}", "stopPrice": f"{be:.2f}",
-                    "price": f"{be * 1.0015:.2f}", "timeInForce": "GTC"}, key, secret)
-        except Exception as e:
-            rec.setdefault("trail_errors", []).append(f"BE l3 POST fail: {str(e)[:80]}")
-            return
+    l3_id = rec.get("l3_id")
+    if not l3_id or l3_id not in open_map:
+        return  # 冇尾倉 (無 TP1 冇 TP2 時 q3 先有) — 冇嘢要郁
+    o = open_map[l3_id]
+    if abs(float(o.get("stopPrice", 0)) - be) < 1e-6:
+        rec["be_done"] = True   # 已係 breakeven
+        return
+    qty = float(o["origQty"])
+    try:
+        if side == "BUY":
+            r = _signed_request("POST", "/api/v3/order", {
+                "symbol": "BTCUSDT", "side": "SELL", "type": "STOP_LOSS_LIMIT",
+                "quantity": f"{qty:.5f}", "stopPrice": f"{be:.2f}",
+                "price": f"{be * 0.9985:.2f}", "timeInForce": "GTC"}, key, secret)
+        else:
+            r = _signed_request("POST", "/api/v3/order", {
+                "symbol": "BTCUSDT", "side": "BUY", "type": "STOP_LOSS_LIMIT",
+                "quantity": f"{qty:.5f}", "stopPrice": f"{be:.2f}",
+                "price": f"{be * 1.0015:.2f}", "timeInForce": "GTC"}, key, secret)
+    except Exception as e:
+        rec.setdefault("trail_errors", []).append(f"BE l3 POST fail: {str(e)[:80]}")
+        return
+    try:
+        _signed_request("DELETE", "/api/v3/order",
+                        {"symbol": "BTCUSDT", "orderId": l3_id}, key, secret)
+    except Exception as e:
         try:
             _signed_request("DELETE", "/api/v3/order",
-                            {"symbol": "BTCUSDT", "orderId": l3_id}, key, secret)
-        except Exception as e:
-            try:
-                _signed_request("DELETE", "/api/v3/order",
-                                {"symbol": "BTCUSDT", "orderId": r["orderId"]}, key, secret)
-                rec.setdefault("trail_errors", []).append(f"BE l3 rollback: {str(e)[:80]}")
-            except Exception as e2:
-                rec["trail_stuck"] = True
-                rec.setdefault("trail_errors", []).append(f"BE l3 ROLLBACK FAIL: {str(e2)[:80]}")
-            return
-        rec["l3_id"] = r["orderId"]
-        rec["exit_leg_ids"] = [i for i in rec.get("exit_leg_ids", []) if i != l3_id] + [r["orderId"]]
-        rec.setdefault("breakeven_moves", []).append({"l3": l3_id, "new": r["orderId"], "be": be})
-
-    _oco_rebuild()
-    _l3_rebuild()
-    if rec.get("breakeven_moves"):
-        rec["be_done"] = True
+                            {"symbol": "BTCUSDT", "orderId": r["orderId"]}, key, secret)
+            rec.setdefault("trail_errors", []).append(f"BE l3 rollback: {str(e)[:80]}")
+        except Exception as e2:
+            rec["trail_stuck"] = True
+            rec.setdefault("trail_errors", []).append(f"BE l3 ROLLBACK FAIL: {str(e2)[:80]}")
+        return
+    rec["l3_id"] = r["orderId"]
+    rec["exit_leg_ids"] = [i for i in rec.get("exit_leg_ids", []) if i != l3_id] + [r["orderId"]]
+    rec["breakeven_done_l3"] = True
+    rec["be_done"] = True
+    rec.setdefault("breakeven_moves", []).append({"l3": l3_id, "new": r["orderId"], "be": be})
 
 
 def reconcile_cycle(key, secret):
