@@ -42,6 +42,9 @@ BTC_RISK_PCT = 0.5          # 每筆風險 = 帳戶 0.5% (24/7 + 高波動 → �
 BTC_EXCHANGE_DIFF_PCT = 0.8  # Coinbase vs 主源價差 >0.8% → UNVERIFIED (黃金 basis $40 之 BTC 版)
 SL_FLOOR_ATR_MULT = 0.8     # 同 XAUUSD — SL 至少 0.8×ATR
 MIN_RR = 1.2                # RR gate: TP1/risk >= 1.2 (RR<1.2 單贏細輸大 — live 15 筆實證: 贏 avg +0.28R / 輸 avg -1.08R)
+MAX_MA50_EXT_PCT = 2.0      # Flag extended gate: 離 MA50(m30) > ±2% 唔開 Flag
+                            # (09-04 實證: 3 單 Bull Flag entry 離 MA50 +2.0~3.8% 全部 SL;
+                            #  歷史 15 單 Flag: 呢個 gate 擋 -2.50R、誤殺正R $0.00)
 ALLOWED_PATTERNS = ("Flag",)  # Pattern gate: 只做 Bull/Bear Flag (backtest +0.59/+0.66R; AT/雙頂負 EV)
 BTC_MIN_BARS_M30 = 240      # M30 最少 5 日數據
 BTC_MIN_BARS_H1 = 240
@@ -141,13 +144,15 @@ def _parse_setup_level(val):
     return float(m.group(0).replace(",", "")) if m else None
 
 
-def btc_filter_setups(setups, atr, px, diff_check):
-    """套用 BTC 校準: SL floor、RR 篩選、pattern gate、risk sizing、UNVERIFIED 標記.
+def btc_filter_setups(setups, atr, px, diff_check, ma50=None):
+    """套用 BTC 校準: SL floor、RR 篩選、pattern gate、MA50 extended gate、risk sizing、UNVERIFIED 標記.
 
     引擎 setup 欄位: direction/pattern/entry_zone/stop_loss/tp1/tp2/tp3/risk_amount (字串格式).
     Gate (backtest 68 樣本 + testnet 9 筆實證 2026-08-30):
-      - RR >= 1.0: TP(pattern 高度) 細過 SL floor 嘅單贏都贏唔起 (AT/fib live RR 0.1-0.4)
+      - RR >= 1.2: TP(pattern 高度) 細過 SL floor 嘅單贏都贏唔起 (AT/fib live RR 0.1-0.4)
       - Pattern: 只做 Bull/Bear Flag (+0.59/+0.66R); AT 33.3% -0.25R、雙頂負 EV 全 live 實證
+      - MA50 extended (09-04): Flag = trend continuation; entry 離 MA50(m30) 太遠 = 追火棒,
+        假突破風險高 (今日 3 單 Bull Flag 離 MA50 +2~3.8% 全 SL)
     """
     out = []
     for s in setups:
@@ -193,6 +198,17 @@ def btc_filter_setups(setups, atr, px, diff_check):
             if rr < MIN_RR:
                 s["_gate_skip"] = f"rr_{s['rr_tp1']}_lt_{MIN_RR}"
                 continue
+        # MA50 extended gate: Flag = trend continuation, entry 離 MA50 太遠 = 追火棒
+        if ma50 is not None and np.isfinite(ma50) and ma50 > 0:
+            ext = (entry / ma50 - 1) * 100.0
+            s["ma50_ext_pct"] = round(ext, 2)
+            # +1e-6 epsilon: 邊界 2.0000000000000018 唔算超 (浮點)
+            if side == "BUY" and ext > MAX_MA50_EXT_PCT + 1e-6:
+                s["_gate_skip"] = f"ma50_ext_{ext:.1f}pct_gt_{MAX_MA50_EXT_PCT}"
+                continue
+            if side == "SELL" and ext < -(MAX_MA50_EXT_PCT + 1e-6):
+                s["_gate_skip"] = f"ma50_ext_{ext:.1f}pct_lt_-{MAX_MA50_EXT_PCT}"
+                continue
         # UNVERIFIED 標記
         if diff_check["status"] != "OK":
             s["verified"] = False
@@ -215,7 +231,7 @@ def pick_best_setup(setups):
 
 
 # ── 報告 ────────────────────────────────────────────────────────
-def build_btc_report(data, patterns, setups, daily_trend, h1_trend, diff_check, best):
+def build_btc_report(data, patterns, setups, daily_trend, h1_trend, diff_check, best, ma50=None):
     px = data["spot"]
     atr = None
     if data.get("m30") is not None:
@@ -230,6 +246,9 @@ def build_btc_report(data, patterns, setups, daily_trend, h1_trend, diff_check, 
     lines.append(f"- 數據源: {data['source']}  |  spot: {BASIS_SOURCE_LABEL}")
     lines.append(f"- 時間: {now.strftime('%Y-%m-%d %H:%M UTC')} (24/7 — 冇 session gates)")
     lines.append(f"- 價格: ${px:,.0f}  |  ATR(14, M30): ${atr:,.0f} ({atr/px*100:.2f}%)" if atr else f"- 價格: ${px:,.0f}")
+    if ma50:
+        ext = (px / ma50 - 1) * 100.0
+        lines.append(f"- MA50(M30): ${ma50:,.0f} (現價 {ext:+.1f}% — Flag extended gate ±{MAX_MA50_EXT_PCT}%)")
     lines.append(f"- 交易所價差: {diff_check['note']}")
     lines.append(f"- 日線趨勢: {daily_trend['trend'] if isinstance(daily_trend, dict) else daily_trend}  |  H1 趨勢: {h1_trend['trend'] if isinstance(h1_trend, dict) else h1_trend}")
     lines.append("")
@@ -267,15 +286,16 @@ def main():
     df = av3.add_indicators(base.copy())
     atr = float(df["ATR"].iloc[-1])
     px = float(df["Close"].iloc[-1])
+    ma50 = float(df["MA50"].iloc[-1]) if "MA50" in df.columns and np.isfinite(df["MA50"].iloc[-1]) else None
     pts = av3.find_swings_ordered(df["High"].values, df["Low"].values, lookback=3,
                                   atr=df["ATR"].values, close=df["Close"].values)
     patterns = av3.detect_all_patterns(df, pts, atr=atr)
     daily_trend = av3.analyze_daily_trend(data["day"]) if data["day"] is not None else {"trend": "NEUTRAL"}
     h1_trend = av3.analyze_h1_trend(data["h1"]) if data["h1"] is not None else {"trend": "NEUTRAL"}
     setups = av3.generate_trade_setups(df, patterns, pts, daily_trend, px, atr, h1_trend=h1_trend)
-    setups = btc_filter_setups(setups, atr, px, diff_check)
+    setups = btc_filter_setups(setups, atr, px, diff_check, ma50=ma50)
     best = pick_best_setup(setups)
-    report = build_btc_report(data, patterns, setups, daily_trend, h1_trend, diff_check, best)
+    report = build_btc_report(data, patterns, setups, daily_trend, h1_trend, diff_check, best, ma50=ma50)
 
     if args.json:
         payload = {
@@ -283,6 +303,8 @@ def main():
             "symbol": "BTC-USD",
             "price": px,
             "atr": atr,
+            "ma50": ma50,
+            "ma50_ext_pct": round((px / ma50 - 1) * 100.0, 2) if ma50 else None,
             "source": data["source"],
             "coinbase_spot": data.get("coinbase_spot"),
             "exchange_diff": diff_check,
