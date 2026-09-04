@@ -28,7 +28,7 @@ sys.path.insert(0, REPO)
 
 # ── 參數 (受限制馬丁) ────────────────────────────────────────────
 S0_NOTIONAL = 15.0          # 第一注 notional USD
-WIN_TARGET_USD = 1.0        # chain 淨盈 target → 全平 ($3 對 $15 首注太難達, 改 $1)
+WIN_TARGET_USD = 0.2        # chain 淨盈 target → 全平 (首注 ~1.3%; $1 對 $14.7 首注 = 6.8% 太難達)
 MAX_LEVEL = 3               # level 0..3 = 最多 4 注 (1+2+4+8 = 15×S0)
 DAILY_LOSS_CAP = 225.0      # 每日 chain 止損累計 cap (2.25% 帳戶)
 ATR_TRIGGER_MULT = 1.0      # 反向觸發加註: >= 1×ATR(15m)
