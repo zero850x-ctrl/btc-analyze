@@ -72,6 +72,34 @@ def _load_keys():
     return key, secret
 
 
+RETRYABLE_HTTP = {429, 500, 502, 503, 504}   # testnet 偶發 502/5xx/429 → retry
+MAX_RETRIES = 3
+RETRY_DELAYS = (2.0, 5.0, 10.0)
+
+
+def _http_open(req, retries=MAX_RETRIES):
+    """urlopen with retry — 食甩 testnet 短暫 502/5xx/429/network 問題.
+
+    全部 retry 完都失敗 → 照 raise (caller 可 catch). 2026-09-09 實證:
+    testnet 全面 502 時 cron 每 15 分鐘 crash spam; retry 只係食甩短暫
+    中斷, 長時間 down 要靠 wrapper 靜默 (見 cron wrapper 暫時性錯誤處理).
+    """
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            last_exc = e
+            if e.code not in RETRYABLE_HTTP:
+                raise
+        except (urllib.error.URLError, TimeoutError, ConnectionResetError, OSError) as e:
+            last_exc = e
+        if attempt < retries - 1:
+            time.sleep(RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)])
+    raise last_exc
+
+
 def _signed_request(method, path, params, key, secret):
     params = dict(params or {})
     params["timestamp"] = int(time.time() * 1000)
@@ -80,16 +108,14 @@ def _signed_request(method, path, params, key, secret):
     sig = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
     url = f"{BASE}{path}?{query}&signature={sig}"
     req = urllib.request.Request(url, method=method, headers={"X-MBX-APIKEY": key})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode())
+    return _http_open(req)
 
 
 def _public_request(path, params=None):
     query = urllib.parse.urlencode(params or {})
     url = f"{BASE}{path}" + (f"?{query}" if query else "")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode())
+    return _http_open(req)
 
 
 def load_log():
