@@ -117,6 +117,50 @@ def chain_net(chain, px, entries):
     return gross
 
 
+def _fetch_trades(key, secret):
+    """最近成交 (由舊到新)."""
+    r = _signed_request("GET", "/api/v3/myTrades",
+                        {"symbol": SYMBOL, "limit": 1000}, key, secret)
+    return sorted(r, key=lambda x: x["time"])
+
+
+def reconcile_chain(chain, trades, min_age_s=600):
+    """以 testnet 成交為準, 移除幻影注 (testnet 帳戶重置後 log 仍留住嘅注).
+
+    2026-09-09 實證: Binance testnet 維護重置帳戶 → 成交歷史清空, 但 log
+    仲當 D 注存在, 之後落平倉單會因餘額不足 fail。
+    配對: 同向 + 價差 <0.2% + qty 差 <=1.5 lot step (entry 太新 (<min_age_s)
+    唔判定 — 避免 eventual consistency 誤殺)。
+    回傳 (kept_entries, removed_entries).
+    """
+    want_buy = chain["side"] == "BUY"
+    pool = [t for t in trades if bool(t["isBuyer"]) == want_buy]
+    now = datetime.now(timezone.utc)
+    used, kept, removed = set(), [], []
+    for e in chain["entries"]:
+        try:
+            age = (now - datetime.fromisoformat(str(e["time"]).replace("Z", "+00:00"))).total_seconds()
+        except Exception:
+            age = min_age_s + 1
+        if age < min_age_s:
+            kept.append(e)
+            continue
+        hit = None
+        for i, t in enumerate(pool):
+            if i in used:
+                continue
+            if abs(float(t["price"]) - e["px"]) / e["px"] < 0.002 and \
+               abs(float(t["qty"]) - e["qty"]) <= LOT_STEP * 1.5:
+                hit = i
+                break
+        if hit is None:
+            removed.append(e)
+        else:
+            used.add(hit)
+            kept.append(e)
+    return kept, removed
+
+
 def tick(key, secret, dry=False):
     closes, atr = klines_15m()
     px = float(_public_request("/api/v3/ticker/price", {"symbol": SYMBOL})["price"])
@@ -133,6 +177,24 @@ def tick(key, secret, dry=False):
 
     chain = s["active"]
     if chain is not None:
+        # 對帳: testnet 成交係 source of truth (帳戶重置後 log 會有幻影注)
+        try:
+            kept, removed = reconcile_chain(chain, _fetch_trades(key, secret))
+            if removed:
+                chain["entries"] = kept
+                chain["level"] = max(0, len(kept) - 1)
+                out.append(f"⚠️ 馬丁 drift 修正: 移除 {len(removed)} 注幻影 (testnet 成交冇記錄)")
+                if not kept:
+                    chain.update({"state": "WIPED", "profit_usd": 0.0,
+                                  "closed_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+                    s["chains"].append(chain)
+                    s["active"] = None
+                    if not dry:
+                        save_state(s)
+                    print("\n".join(out))
+                    return
+        except Exception as e:
+            out.append(f"⚠️ 馬丁對帳失敗 (跳過): {str(e)[:80]}")
         entries = chain["entries"]
         net = chain_net(chain, px, entries)
         total_qty = round_step(sum(e["qty"] for e in entries), LOT_STEP)
@@ -184,6 +246,7 @@ def tick(key, secret, dry=False):
                 else:
                     o = _mk_order(chain["side"], qty, key, secret)
                     chain["entries"].append({"qty": o["qty"], "px": o["fill_px"],
+                                             "order_id": o.get("order_id"),
                                              "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
                     chain["level"] = lvl
                     out.append(f"➕ 馬丁 ADD level={lvl} {chain['side']} {o['qty']:.5f}@{o['fill_px']:.0f}")
@@ -204,7 +267,8 @@ def tick(key, secret, dry=False):
         else:
             o = _mk_order(side, qty, key, secret)
             s["active"] = {"id": f"m-{o['order_id']}", "side": side, "level": 0,
-                           "entries": [{"qty": o["qty"], "px": o["fill_px"], "time": now}],
+                           "entries": [{"qty": o["qty"], "px": o["fill_px"],
+                                        "order_id": o.get("order_id"), "time": now}],
                            "state": "OPEN", "target_usd": WIN_TARGET_USD, "opened": now}
             out.append(f"🔵 馬丁 OPEN {side} {o['qty']:.5f}@{o['fill_px']:.0f} (SMA50={m:.0f})")
 
