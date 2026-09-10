@@ -220,6 +220,7 @@ def reconcile_cycle(key, secret):
 
     log_d = load_log()
     changed = []
+    wiped = []      # testnet 帳戶重置 → 幻影倉 (唔入 HISTORY, 唔污染 sumR)
     dirty = False   # partial fill / breakeven / trail rebuild 後必須 save (bug fix 09-03)
     opens = _signed_request("GET", "/api/v3/openOrders", {"symbol": "BTCUSDT"}, key, secret)
     open_ids = {o["orderId"] for o in opens}
@@ -237,6 +238,27 @@ def reconcile_cycle(key, secret):
         legs_gone = [i for i in rec["exit_leg_ids"] if i not in open_ids]
         done_ids = set(rec.get("closed_leg_ids") or [])
         new_gone = [i for i in legs_gone if i not in done_ids]
+        # ── testnet 帳戶重置偵測 (2026-09-09 實證) ──────────────────────
+        # 全部 exit legs 唔喺 openOrders + 完全冇 open orders + entry 成交都喺
+        # myTrades 消失 → Binance testnet 維護重置咗帳戶 (成交歷史被清空)。
+        # 唔處理嘅後果: log 永遠當佢 live → cap 1 名額被幻影倉永久佔住,
+        # 系統之後永遠唔開新倉, 整點報告出假浮動 (09-10 實測 -1.19 假數)。
+        if rec["exit_leg_ids"] and len(legs_gone) == len(rec["exit_leg_ids"]) and not opens:
+            trades_all = _signed_request("GET", "/api/v3/myTrades",
+                                         {"symbol": "BTCUSDT", "limit": 1000}, key, secret)
+            entry_id = rec.get("order_id")
+            entry_gone = (not entry_id) or not any(x["orderId"] == entry_id for x in trades_all)
+            remaining_chk = round(rec.get("qty", 0) - (rec.get("realized_qty") or 0.0), 8)
+            if entry_gone and remaining_chk > 1e-8:
+                rec["status"] = "WIPED"
+                rec["closed_via"] = "testnet_account_reset"
+                rec["wiped_remaining_qty"] = remaining_chk
+                rec["wiped_note"] = "exit legs + entry 成交全部消失 (testnet 帳戶重置)"
+                rec["closed_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                # 唔 append 入 HISTORY → 唔計入 sumR / 勝率 (realized_parts 保留做記錄)
+                dirty = True
+                wiped.append(rec)
+                continue
         if new_gone:
             # OCO_A legs 消失 → 判斷係 TP 定 SL 成交 (TP 成交先推 breakeven)
             oco_a_ids = rec.get("oco_a_leg_ids") or []
@@ -309,7 +331,7 @@ def reconcile_cycle(key, secret):
         hist["trades"].extend(changed)
         with open(HISTORY, "w") as f:
             json.dump(hist, f, ensure_ascii=False, indent=2)
-    return changed
+    return changed, wiped
 
 
 def main():
@@ -320,11 +342,15 @@ def main():
         return
 
     # 1. reconcile
-    closed = reconcile_cycle(key, secret)
+    closed, wiped = reconcile_cycle(key, secret)
     for c in closed:
         # .get() 防禦 — 任何缺 field 都唔可以 crash 個 watchdog (bug fix 09-04)
         log(f"🔒 CLOSED {c.get('side','?')} {(c.get('pattern') or '?')[:18]} "
             f"exit={c.get('exit_fill')} pnl={c.get('pnl_usdt')}USDT R={c.get('r_multiple')}")
+    for w in wiped:
+        log(f"🧹 WIPED {w.get('side','?')} {(w.get('pattern') or '?')[:18]} "
+            f"entry={w.get('entry_fill')} remaining={w.get('wiped_remaining_qty')} "
+            f"(testnet 帳戶重置 — 唔計入 sumR, cap 1 已釋放)")
 
     # 2. 引擎掃描
     out = sh("python3 btc_engine.py 2>&1 | tail -30")
