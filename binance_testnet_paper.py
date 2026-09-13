@@ -42,10 +42,16 @@ LOT_STEP = 0.00001         # BTC lot step
 MIN_RR_EXEC = 1.2
 
 
-def _compute_rr(setup):
-    """setup → TP1/risk RR (用 planned entry/stop/tp1, 落單前驗證用)."""
+def _compute_rr(setup, entry_override=None):
+    """setup → TP1/risk RR (落單前驗證用).
+
+    entry_override: 用現價/實際成交價代替 planned entry 計 RR。
+    09-13 實證: gate 用 planned entry 計出 1.35, 但 MARKET 成交差 57-77 點
+    (0.07-0.1%) → 實際 RR 跌到 0.51。25 單統計: 實際 RR<1.2 佔 21 單
+    (贏 +0.37R / 輸 -0.90R = 贏細輸大)。所以 gate 要同時用現價計一次。
+    """
     try:
-        entry = float(setup["btc_entry"])
+        entry = float(entry_override if entry_override is not None else setup["btc_entry"])
         stop = float(setup["btc_stop"])
         tp1 = float(setup["btc_tp1"]) if setup.get("btc_tp1") else None
     except (KeyError, TypeError, ValueError):
@@ -187,6 +193,18 @@ def place_signal_order(setup, key, secret, atr=None):
     px = current_price()
     lot_step, lot_min, min_notional = exchange_filters(key, secret)
 
+    # fix 1 (09-13): 落單前 RR 用「現價」重算 — market 單成交價 ≈ px, 唔係 planned entry。
+    # 唔做嘅話 planned RR 1.35 過關但實際落到 0.51 (滑價 0.07-0.1% 蠶食 RR)。
+    if tp1:
+        if px == stop:
+            return None, f"risk 0 (px={px:.0f} = stop) — skip"
+        rr_px = abs(tp1 - px) / abs(px - stop)
+        if rr_px < MIN_RR_EXEC:
+            return None, (f"RR(現價 ${px:,.0f}) {rr_px:.2f} < {MIN_RR_EXEC} — skip "
+                          f"(planned RR {rr:.2f} 但市價已追高 {abs(px - entry) / entry * 100:.2f}%)")
+    else:
+        return None, "冇 TP1 — 冇法計 RR, skip"
+
     # Pre-flight level 驗證 — OCO 拒單係因為 TP 喺市價錯邊 (下單必敗, 先擋慳手續費)
     if tp1:
         if side == "BUY" and tp1 <= px * 1.0005:
@@ -221,10 +239,37 @@ def place_signal_order(setup, key, secret, atr=None):
         "planned_stop": stop, "planned_tp1": tp1, "planned_tp2": tp2,
         "atr": round(float(atr), 2) if atr else None,
         "seeded_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "rr_planned": round(rr, 2) if rr else None,
+        "rr_px": round(abs(tp1 - px) / abs(px - stop), 2) if (tp1 and px != stop) else None,
     }
 
-    # ── 3 段出場 (1/3 each; TP2 冇就尾倉 2/3) ─────────────────────
+    # ── fix 2 (09-13): 成交後 RR 覆核 ─────────────────────────────
+    # MARKET 一定有滑價, 落單前估嘅 RR 同實際成交可以差好遠 (09-12 單: 計劃 1.35 → 實際 0.51)。
+    # 未建 exit legs 就發現 → 即刻市價平倉 (唔使 cancel 任何 order, 成本 = spread)。
     exit_side = "SELL" if side == "BUY" else "BUY"
+    risk_fill = abs(fill_px - stop)
+    rr_fill = (abs(tp1 - fill_px) / risk_fill) if (tp1 and risk_fill > 0) else None
+    rec["rr_fill"] = round(rr_fill, 2) if rr_fill is not None else None
+    if rr_fill is None or rr_fill < MIN_RR_EXEC:
+        rec["status"] = "FLATTENED_LOW_FILL_RR"
+        rec["flatten_note"] = (f"成交後 RR {rr_fill:.2f} < {MIN_RR_EXEC} "
+                               f"(entry_fill={fill_px:.2f}, 計劃 RR {rr:.2f}) — 即刻市價平倉")
+        try:
+            _signed_request("POST", "/api/v3/order", {
+                "symbol": SYMBOL, "side": exit_side, "type": "MARKET",
+                "quantity": f"{fill_qty:.5f}",
+            }, key, secret)
+            rec["flatten_ok"] = True
+        except urllib.error.HTTPError as e2:
+            rec["flatten_ok"] = False
+            rec["flatten_error"] = e2.read().decode()[:200]
+        rec["flatten_ts"] = time.time()
+        log = load_log()
+        log["orders"].append(rec)
+        save_log(log)
+        return rec, None
+
+    # ── 3 段出場 (1/3 each; TP2 冇就尾倉 2/3) ─────────────────────
     q1 = round_step(fill_qty / 3, lot_step)
     q2 = round_step(fill_qty / 3, lot_step) if tp2 else 0.0
     q3 = round_step(fill_qty - q1 - q2 + 1e-9, lot_step)   # +epsilon: float 精度唔好蝕尾數
@@ -504,7 +549,11 @@ def main():
             save_log(log2)
             print(f"❌ {s.get('pattern','?')}: {err}")
         else:
-            print(f"✅ {rec['side']} {rec['pattern']} fill={rec['entry_fill']} qty={rec['qty']} status={rec['status']} ocoA={rec.get('oco_a_id','-')} ocoB={rec.get('oco_b_id','-')} l3={rec.get('l3_id','-')}")
+            if rec.get("status") == "FLATTENED_LOW_FILL_RR":
+                print(f"⚠️ {rec['side']} {rec['pattern']} 成交後 RR {rec.get('rr_fill')} < "
+                      f"{MIN_RR_EXEC} → 即刻平倉 (fill={rec['entry_fill']}, 計劃 RR {rec.get('rr_planned')})")
+            else:
+                print(f"✅ {rec['side']} {rec['pattern']} fill={rec['entry_fill']} qty={rec['qty']} status={rec['status']} ocoA={rec.get('oco_a_id','-')} ocoB={rec.get('oco_b_id','-')} l3={rec.get('l3_id','-')}")
 
 
 if __name__ == "__main__":
