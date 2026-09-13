@@ -12,7 +12,8 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-REPO = "/tmp/btc-analyze"
+# 2026-09-13: 自我定位 (clone 已由 /tmp 搬入 ~/repos)；BTC_REPO env 可覆寫
+REPO = os.environ.get("BTC_REPO") or os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO)
 LOG_PATH = os.path.expanduser("~/.hermes/reports/btc_testnet_orders.json")
 HEARTBEAT = os.path.expanduser("~/.hermes/reports/btc_auto_trade_heartbeat.txt")
