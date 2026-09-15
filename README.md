@@ -11,6 +11,8 @@ BTC 形態交易系統 — 由 [xauusd-analyze-v3](https://github.com/zero850x-c
 | `btc_engine.py` | **BTC 適配層**：數據源（TradingView BITSTAMP:BTCUSD → yfinance BTC-USD fallback）、Coinbase 價差驗證（>0.8% → UNVERIFIED）、24/7 無 session gates、USD % 風險 sizing、SL floor 0.8×ATR |
 | `paper_trade_btc.py` | BTC paper trading：`~/.hermes/reports/paper_trade_log_btc.json`（與黃金 log 分離）、anti-stacking、dedup、daily loss limit |
 | `backtest_btc.py` | 凍結窗口 backtest：M30 bars 逐 24h 取樣 → 引擎訊號 → staged-exit 模擬（含 0.1% 成本） |
+| `binance_testnet_paper.py` | **Spot Testnet 執行層**：引擎 setup → market 進場 + 3 段出場（1/3 OCO TP1、1/3 OCO TP2、尾倉 SL ATR-trailing）、落單前 RR≥1.2 hard gate、同 pattern/同向 cap 1、OCO 失敗 → emergency flatten |
+| `btc_auto_trade_cycle.py` | Cron cycle 入口：reconcile 3 段 exit（partial fills 累計、全平先計 R、尾倉 SL trailing）→ 引擎掃描 → 落單 |
 
 ## 與黃金版嘅主要差異
 

@@ -164,6 +164,27 @@ def _finite_px(val):
     return x
 
 
+def _exit_fill(level, bar_open, is_sell, is_stop):
+    """Gap-aware exit fill — never a price the bar did not trade.
+
+    If the bar OPENED beyond the trigger level, the exit happens at the open
+    (worse for a stop, better for a target); otherwise at the level itself.
+    Without this, a bar that gaps past the stop produces a synthetic fill
+    outside the bar's range, _guard_close rejects it, and the position can
+    never close — it stays LIVE forever (2026-09-12 XAUUSD incident).
+    """
+    lvl = _finite_px(level)
+    assert lvl is not None, "exit trigger level must be finite"
+    op = _finite_px(bar_open)
+    if op is None:
+        px = lvl
+    elif is_sell:
+        px = max(lvl, op) if is_stop else min(lvl, op)
+    else:
+        px = min(lvl, op) if is_stop else max(lvl, op)
+    return px + SLIPPAGE_TICKS if is_sell else px - SLIPPAGE_TICKS
+
+
 def _norm_dir(direction):
     """Canonical BUY/SELL from setup or log strings (emoji prefixes allowed)."""
     s = (direction or "").upper()
@@ -405,7 +426,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         stop_first = bool(stop_in and (not tp_dists or abs(eff_stop - bar_open) <= min(tp_dists)))
 
         if stop_in and stop_first:
-            fill = eff_stop + SLIPPAGE_TICKS if is_sell else eff_stop - SLIPPAGE_TICKS
+            fill = _exit_fill(eff_stop, bar_open, is_sell, is_stop=True)
             r_exit = (entry - fill) / risk if is_sell else (fill - entry) / risk
             portions_open = 3 - (1 if tp1_hit else 0) - (1 if tp2_hit else 0)
             total_r = r_tp1 + r_tp2 + r_exit * portions_open / 3.0
@@ -425,12 +446,12 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
 
         if not tp1_hit and tp1 > 0 and ((is_sell and low <= tp1) or (not is_sell and high >= tp1)):
             tp1_hit = True
-            fill = tp1 + SLIPPAGE_TICKS if is_sell else tp1 - SLIPPAGE_TICKS
+            fill = _exit_fill(tp1, bar_open, is_sell, is_stop=False)
             r_tp1 = ((entry - fill) / risk if is_sell else (fill - entry) / risk) / 3.0
 
         if not tp2_hit and tp2 > 0 and not stop_in and ((is_sell and low <= tp2) or (not is_sell and high >= tp2)):
             tp2_hit = True
-            fill = tp2 + SLIPPAGE_TICKS if is_sell else tp2 - SLIPPAGE_TICKS
+            fill = _exit_fill(tp2, bar_open, is_sell, is_stop=False)
             r_tp2 = ((entry - fill) / risk if is_sell else (fill - entry) / risk) / 3.0
 
         if bars_held >= MAX_BARS_HELD:
@@ -812,7 +833,7 @@ def _fetch_m30(start, end):
         try:
             bars = _tv.get_hist(
                 symbol="XAUUSD", exchange="OANDA",
-                interval=TVInterval.min_30,
+                interval=TVInterval.in_30_minute,
                 n_bars=500,
             )
             if bars is not None and not bars.empty:
