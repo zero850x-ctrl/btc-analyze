@@ -812,7 +812,7 @@ def _fetch_m30(start, end):
         try:
             bars = _tv.get_hist(
                 symbol="XAUUSD", exchange="OANDA",
-                interval=TVInterval.min_30,
+                interval=TVInterval.in_30_minute,
                 n_bars=500,
             )
             if bars is not None and not bars.empty:
