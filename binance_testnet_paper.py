@@ -41,6 +41,13 @@ LOT_STEP = 0.00001         # BTC lot step
 # (engine json 嘅 rr_tp1 有缺口, 呢度做最後防線, 唔信 json)
 MIN_RR_EXEC = 1.2
 
+# 入場模式 (feat/limit-entry, 09-16):
+#   "limit"  = 掛 LIMIT @ engine 指定價, 等價格返到 zone 才成交 (RR 準確, 冇滑價; 可能唔成交)
+#   "market" = legacy 市價追入 (09-13 前嘅行為)
+ENTRY_MODE = os.environ.get("BTC_ENTRY_MODE", "limit")
+# 限價單存活上限 — 超過就 cancel 放返 cap (engine 每 15 分鐘重算, 形態會過期)
+LIMIT_TTL_HOURS = float(os.environ.get("BTC_LIMIT_TTL_HOURS", "8"))
+
 
 def _compute_rr(setup, entry_override=None):
     """setup → TP1/risk RR (落單前驗證用).
@@ -51,7 +58,13 @@ def _compute_rr(setup, entry_override=None):
     (贏 +0.37R / 輸 -0.90R = 贏細輸大)。所以 gate 要同時用現價計一次。
     """
     try:
-        entry = float(entry_override if entry_override is not None else setup["btc_entry"])
+        if entry_override is not None:
+            entry = float(entry_override)
+        elif setup.get("btc_limit_px"):
+            # feat/limit-entry: 實際成交價 = 限價, 用佢計 RR 才準
+            entry = float(setup["btc_limit_px"])
+        else:
+            entry = float(setup["btc_entry"])
         stop = float(setup["btc_stop"])
         tp1 = float(setup["btc_tp1"]) if setup.get("btc_tp1") else None
     except (KeyError, TypeError, ValueError):
@@ -167,7 +180,7 @@ def round_step(qty, step):
     return max(0.0, int(qty / step) * step)
 
 
-def place_signal_order(setup, key, secret, atr=None):
+def place_signal_order(setup, key, secret, atr=None, mode=None):
     """引擎 setup → testnet 真單 (market 進場 + 3 段出場).
 
     fix/btc-exit-symmetry exit 結構:
@@ -184,6 +197,8 @@ def place_signal_order(setup, key, secret, atr=None):
     tp1 = float(setup["btc_tp1"]) if setup.get("btc_tp1") else None
     tp2 = float(setup["btc_tp2"]) if setup.get("btc_tp2") else None
     pattern = setup.get("pattern", "?")
+    if mode is None:
+        mode = ENTRY_MODE
 
     # RR hard gate — 落單前最後防線, 唔信 json; 冇 TP1 = 冇法計 RR = 一律拒
     rr = _compute_rr(setup)
@@ -193,28 +208,31 @@ def place_signal_order(setup, key, secret, atr=None):
     px = current_price()
     lot_step, lot_min, min_notional = exchange_filters(key, secret)
 
-    # fix 1 (09-13): 落單前 RR 用「現價」重算 — market 單成交價 ≈ px, 唔係 planned entry。
-    # 唔做嘅話 planned RR 1.35 過關但實際落到 0.51 (滑價 0.07-0.1% 蠶食 RR)。
-    if tp1:
-        if px == stop:
-            return None, f"risk 0 (px={px:.0f} = stop) — skip"
-        rr_px = abs(tp1 - px) / abs(px - stop)
-        if rr_px < MIN_RR_EXEC:
-            return None, (f"RR(現價 ${px:,.0f}) {rr_px:.2f} < {MIN_RR_EXEC} — skip "
-                          f"(planned RR {rr:.2f} 但市價已追高 {abs(px - entry) / entry * 100:.2f}%)")
-    else:
-        return None, "冇 TP1 — 冇法計 RR, skip"
+    # fix 1 (09-13): 落單前 RR 用「現價」重算 — 只適用 market 模式。
+    # (limit 模式成交價 = limit_px, 唔受市價影響; 佢自己喺下面 limit 分支覆核 RR)
+    if mode == "market":
+        if tp1:
+            if px == stop:
+                return None, f"risk 0 (px={px:.0f} = stop) — skip"
+            rr_px = abs(tp1 - px) / abs(px - stop)
+            if rr_px < MIN_RR_EXEC:
+                return None, (f"RR(現價 ${px:,.0f}) {rr_px:.2f} < {MIN_RR_EXEC} — skip "
+                              f"(planned RR {rr:.2f} 但市價已追高 {abs(px - entry) / entry * 100:.2f}%)")
+        else:
+            return None, "冇 TP1 — 冇法計 RR, skip"
 
     # Pre-flight level 驗證 — OCO 拒單係因為 TP 喺市價錯邊 (下單必敗, 先擋慳手續費)
+    # limit 模式: OCO 喺成交後才建, 屆時價 ≈ limit_px, 所以用 limit_px 做參考價
+    ref_px = float(setup.get("btc_limit_px") or entry) if mode == "limit" else px
     if tp1:
-        if side == "BUY" and tp1 <= px * 1.0005:
-            return None, f"TP1 {tp1} 喺市價 {px:.0f} 下面 — BUY OCO 必拒, skip"
-        if side == "SELL" and tp1 >= px * 0.9995:
-            return None, f"TP1 {tp1} 喺市價 {px:.0f} 上面 — SELL OCO 必拒, skip"
-        if side == "BUY" and stop >= px * 0.9995:
-            return None, f"SL {stop} 喺市價 {px:.0f} 上面 — BUY OCO 必拒, skip"
-        if side == "SELL" and stop <= px * 1.0005:
-            return None, f"SL {stop} 喺市價 {px:.0f} 下面 — SELL OCO 必拒, skip"
+        if side == "BUY" and tp1 <= ref_px * 1.0005:
+            return None, f"TP1 {tp1} 喺參考價 {ref_px:.0f} 下面 — BUY OCO 必拒, skip"
+        if side == "SELL" and tp1 >= ref_px * 0.9995:
+            return None, f"TP1 {tp1} 喺參考價 {ref_px:.0f} 上面 — SELL OCO 必拒, skip"
+        if side == "BUY" and stop >= ref_px * 0.9995:
+            return None, f"SL {stop} 喺參考價 {ref_px:.0f} 上面 — BUY OCO 必拒, skip"
+        if side == "SELL" and stop <= ref_px * 1.0005:
+            return None, f"SL {stop} 喺參考價 {ref_px:.0f} 下面 — SELL OCO 必拒, skip"
 
     # qty: USD 200 notional / entry (paper 額度), round 落 step
     notional = 200.0
@@ -222,7 +240,51 @@ def place_signal_order(setup, key, secret, atr=None):
     if qty < lot_min or qty * entry < min_notional:
         return None, f"qty {qty} below filter (step={lot_step}, min_notional={min_notional})"
 
-    # 進場: market (MVP 簡化; 引擎 breakout 訊號市價追)
+    # ── feat/limit-entry: 限價掛單 (唔追市價) ──────────────────────
+    # 09-14 實證: 市價追入時價已穿過 entry zone 0.10-0.17%, TP1 又近 → 實際 RR 0.44-0.90
+    # (planned 1.23-1.74), 32 次 setup 冇一個追得過 gate。改為掛 LIMIT 等價格返到
+    # 引擎指定價位, 成交價 = limit_px → RR 準確、冇滑價。
+    # 代價: 唔成交就冇 trade (由 reconcile 用 TTL / setup 失效 cancel)。
+    if mode == "limit":
+        limit_px = float(setup.get("btc_limit_px") or entry)
+        # 掛單價一定要喺市價「正確一邊」, 否則變 taker 立即成交 = 追高
+        if side == "BUY" and limit_px >= px * 0.9995:
+            return None, (f"限價 {limit_px:,.2f} 唔低過市價 {px:,.0f} — skip "
+                          f"(等返 zone 先入)")
+        if side == "SELL" and limit_px <= px * 1.0005:
+            return None, (f"限價 {limit_px:,.2f} 唔高過市價 {px:,.0f} — skip "
+                          f"(等返 zone 先入)")
+        # RR 覆核: 成交價 = limit_px, 用呢個價計先係真實 RR
+        rr_lim = abs(tp1 - limit_px) / abs(limit_px - stop) if (tp1 and limit_px != stop) else None
+        if rr_lim is None or rr_lim < MIN_RR_EXEC:
+            return None, (f"RR(限價) {rr_lim if rr_lim is None else round(rr_lim, 2)} "
+                          f"< {MIN_RR_EXEC} — skip")
+        qty = round_step(notional / limit_px, lot_step)
+        if qty < lot_min or qty * limit_px < min_notional:
+            return None, f"qty {qty} below filter (limit_px={limit_px})"
+        order = _signed_request("POST", "/api/v3/order", {
+            "symbol": SYMBOL, "side": side, "type": "LIMIT",
+            "quantity": f"{qty:.5f}", "price": f"{limit_px:.2f}",
+            "timeInForce": "GTC",
+        }, key, secret)
+        rec = {
+            "pattern": pattern, "side": side, "qty": qty,
+            "order_id": order["orderId"], "status": "LIMIT_PENDING",
+            "limit_px": round(limit_px, 2), "limit_ts": time.time(),
+            "planned_stop": stop, "planned_tp1": tp1, "planned_tp2": tp2,
+            "planned_entry": round(entry, 2),
+            "atr": round(float(atr), 2) if atr else None,
+            "seeded_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "rr_planned": round(rr, 2) if rr else None,
+            "rr_limit": round(rr_lim, 2),
+            "px_at_place": round(px, 2),
+        }
+        log = load_log()
+        log["orders"].append(rec)
+        save_log(log)
+        return rec, None
+
+    # 進場: market (legacy 模式; BTC_ENTRY_MODE=market)
     order = _signed_request("POST", "/api/v3/order", {
         "symbol": SYMBOL, "side": side, "type": "MARKET", "quantity": f"{qty:.5f}",
     }, key, secret)
@@ -268,6 +330,25 @@ def place_signal_order(setup, key, secret, atr=None):
         log["orders"].append(rec)
         save_log(log)
         return rec, None
+
+    return build_exit_legs(rec, key, secret, lot_step)
+
+
+def build_exit_legs(rec, key, secret, lot_step):
+    """已成交倉 (rec) → 建 3 段 exit: OCO_A(SL+TP1) / OCO_B(SL+TP2) / L3(尾倉 SL).
+
+    由 place_signal_order 抽出, 因為 feat/limit-entry 之後限價單係「掛單 → 遲啲成交」,
+    成交時已經係另一個 reconcile tick, 兩邊都要用同一套建 leg 邏輯。
+
+    任一段建立失敗 → 取消已建 exit + market flatten (冇裸倉)。
+    rec 需要: side / qty / planned_stop / planned_tp1 / planned_tp2 / pattern / atr
+    """
+    side = rec["side"]
+    stop = rec["planned_stop"]
+    tp1 = rec.get("planned_tp1")
+    tp2 = rec.get("planned_tp2")
+    fill_qty = rec["qty"]
+    exit_side = "SELL" if side == "BUY" else "BUY"
 
     # ── 3 段出場 (1/3 each; TP2 冇就尾倉 2/3) ─────────────────────
     q1 = round_step(fill_qty / 3, lot_step)
@@ -368,12 +449,12 @@ def place_signal_order(setup, key, secret, atr=None):
     if leg_ids and rec.get("status") != "FLATTENED_OCO_FAILED":
         rec["exit_leg_ids"] = leg_ids
         rec["status"] = "OCO_PLACED"
-    elif not leg_ids and rec.get("status") == "FILLED_ENTRY":
+    elif not leg_ids and rec.get("status") in ("FILLED_ENTRY", "LIMIT_FILLED"):
         rec["status"] = "OCO_FAILED"
         rec["oco_error"] = "no exit legs built"
 
     log = load_log()
-    log["orders"].append(rec)
+    log["orders"].append(rec) if rec not in log["orders"] else None
     save_log(log)
     return rec, None
 
@@ -452,7 +533,8 @@ def main():
     log = load_log()
     # 同 pattern dedup (即時更新: 落一單入一單, 5min cron 唔會重複)
     def _live_patterns():
-        return {o["pattern"] for o in load_log()["orders"] if o.get("status") in ("FILLED_ENTRY", "OCO_PLACED", "OCO_FAILED")}
+        return {o["pattern"] for o in load_log()["orders"]
+                if o.get("status") in ("FILLED_ENTRY", "OCO_PLACED", "OCO_FAILED", "LIMIT_PENDING")}
 
     todo = [s for s in setups if s.get("pattern") not in _live_patterns()]
     # C: 平倉/flatten 後同 pattern 60 分鐘冷靜期 — 防 churn (平完即刻重入, 每次俾費用)
@@ -508,7 +590,8 @@ def main():
         return
     # 風控 (fix/btc-exit-symmetry): 同 pattern 限 1 單 + 同方向限 1 單 + 相反方向鎖
     for s in todo:
-        live = [o for o in load_log()["orders"] if o.get("status") in ("FILLED_ENTRY", "OCO_PLACED")]
+        live = [o for o in load_log()["orders"]
+                if o.get("status") in ("FILLED_ENTRY", "OCO_PLACED", "LIMIT_PENDING")]
         same_pattern = [o for o in live if o.get("pattern") == s.get("pattern")]
         same_side = [o for o in live if o.get("side") == s["btc_side"]]
         opp_side = [o for o in live if o.get("side") != s["btc_side"]]
@@ -535,7 +618,11 @@ def main():
             print(f"❌ {s.get('pattern','?')}: RR {rr_txt} < {MIN_RR_EXEC} hard gate — skip")
             continue
         if args.dry_run:
-            print(f"[DRY] {s['btc_side']} {s.get('pattern','?')} entry={s['btc_entry']} SL={s['btc_stop']} TP1={s.get('btc_tp1')} TP2={s.get('btc_tp2')} RR={rr}")
+            _lp = s.get("btc_limit_px") or s["btc_entry"]
+            print(f"[DRY] {s['btc_side']} {s.get('pattern','?')} "
+                  f"{'掛LIMIT @ ' + format(_lp, ',.2f') if ENTRY_MODE == 'limit' else '市價'} "
+                  f"(zone 下緣 {s['btc_entry']}) SL={s['btc_stop']} TP1={s.get('btc_tp1')} "
+                  f"TP2={s.get('btc_tp2')} RR={rr}")
             continue
         rec, err = place_signal_order(s, key, secret, atr=data.get("atr"))
         if err:
@@ -552,6 +639,9 @@ def main():
             if rec.get("status") == "FLATTENED_LOW_FILL_RR":
                 print(f"⚠️ {rec['side']} {rec['pattern']} 成交後 RR {rec.get('rr_fill')} < "
                       f"{MIN_RR_EXEC} → 即刻平倉 (fill={rec['entry_fill']}, 計劃 RR {rec.get('rr_planned')})")
+            elif rec.get("status") == "LIMIT_PENDING":
+                print(f"📌 {rec['side']} {rec['pattern']} 掛 LIMIT @ {rec['limit_px']:,.2f} "
+                      f"(市價 {rec['px_at_place']:,.0f}, RR {rec['rr_limit']}) — 等成交")
             else:
                 print(f"✅ {rec['side']} {rec['pattern']} fill={rec['entry_fill']} qty={rec['qty']} status={rec['status']} ocoA={rec.get('oco_a_id','-')} ocoB={rec.get('oco_b_id','-')} l3={rec.get('l3_id','-')}")
 

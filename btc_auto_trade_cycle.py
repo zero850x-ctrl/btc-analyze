@@ -10,6 +10,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+import urllib.error
 from datetime import datetime, timezone
 
 # 2026-09-13: 自我定位 (clone 已由 /tmp 搬入 ~/repos)；BTC_REPO env 可覆寫
@@ -217,7 +219,9 @@ def reconcile_cycle(key, secret):
     2. 全部 qty 已實現 → CLOSED, 計 R (扣 fee)
     3. 尾倉 SL 仲開住 + 價格行咗 >=1 ATR → 推 SL (trailing)
     """
-    from binance_testnet_paper import _signed_request, load_log, save_log
+    from binance_testnet_paper import (_signed_request, load_log, save_log,
+                                       build_exit_legs, exchange_filters,
+                                       current_price, LIMIT_TTL_HOURS)
 
     log_d = load_log()
     changed = []
@@ -226,6 +230,97 @@ def reconcile_cycle(key, secret):
     opens = _signed_request("GET", "/api/v3/openOrders", {"symbol": "BTCUSDT"}, key, secret)
     open_ids = {o["orderId"] for o in opens}
     open_map = {o["orderId"]: o for o in opens}
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # ── feat/limit-entry: 限價掛單對帳 (09-16) ─────────────────────────
+    # 掛單喺 openOrders → 仲等緊；唔喺 → 查最終狀態 (FILLED → 建 3 段 exit /
+    # CANCELED → 釋放 cap / 部分成交 → cancel 剩餘 + 用已成交 qty 建 exit)。
+    # 兩道 cancel 條件: TTL 過期 (engine 每 15min 重算, 形態會過期) 或價格偏離太遠
+    # (形態已失效, 掛單永遠唔會成交, 但霸住 cap 1)。
+    for rec in log_d["orders"]:
+        if rec.get("status") != "LIMIT_PENDING":
+            continue
+        oid = rec.get("order_id")
+        if oid in open_ids:
+            age_h = (time.time() - (rec.get("limit_ts") or time.time())) / 3600.0
+            o = open_map.get(oid) or {}
+            far = False
+            try:
+                lpx = float(rec.get("limit_px") or 0)
+                if lpx:
+                    far = abs(current_price() - lpx) / lpx > 0.03   # 離掛單價 > 3%
+            except Exception:
+                far = False
+            if age_h >= LIMIT_TTL_HOURS or far:
+                why = (f"掛單 {age_h:.1f}h 未成交 (TTL {LIMIT_TTL_HOURS:g}h)"
+                       if age_h >= LIMIT_TTL_HOURS else
+                       f"價格已偏離掛單價 >3% (形態失效)")
+                try:
+                    _signed_request("DELETE", "/api/v3/order",
+                                    {"symbol": "BTCUSDT", "orderId": oid}, key, secret)
+                    rec["status"] = "LIMIT_EXPIRED"
+                    rec["closed_note"] = f"{why} → cancel (釋放 cap)"
+                    rec["closed_time"] = now_iso
+                    rec["closed_via"] = "limit_ttl"
+                    changed.append(rec)
+                    dirty = True
+                except urllib.error.HTTPError as e:
+                    rec["limit_cancel_error"] = e.read().decode()[:200]
+                    dirty = True
+            continue
+
+        # 唔喺 openOrders → 攞最終狀態
+        try:
+            o = _signed_request("GET", "/api/v3/order",
+                                {"symbol": "BTCUSDT", "orderId": oid}, key, secret)
+        except urllib.error.HTTPError:
+            o = None
+        st = (o or {}).get("status", "")
+        exec_qty = float((o or {}).get("executedQty") or 0)
+        if st == "FILLED" or exec_qty > 0:
+            # 限價成交 (可能部分) → 建 3 段 exit
+            if st not in ("FILLED",):
+                # 部分成交: cancel 剩餘, 用已成交 qty 建 exit
+                try:
+                    _signed_request("DELETE", "/api/v3/order",
+                                    {"symbol": "BTCUSDT", "orderId": oid}, key, secret)
+                except urllib.error.HTTPError:
+                    pass
+            cum_quote = float((o or {}).get("cummulativeQuoteQty") or 0)
+            fill_px = (cum_quote / exec_qty) if exec_qty else float(rec.get("limit_px") or 0)
+            fee_paid = 0.0
+            try:
+                for t in _signed_request("GET", "/api/v3/myTrades",
+                                         {"symbol": "BTCUSDT", "limit": 100}, key, secret):
+                    if t.get("orderId") == oid:
+                        fee_paid += float(t.get("commission") or 0)
+            except urllib.error.HTTPError:
+                pass
+            rec["qty"] = exec_qty
+            rec["entry_fill"] = round(fill_px, 2)
+            rec["fee"] = fee_paid
+            rec["filled_time"] = now_iso
+            rec["status"] = "LIMIT_FILLED"
+            rec["was_limit_fill"] = True
+            rec["rr_fill"] = (round(abs(rec["planned_tp1"] - fill_px)
+                                    / abs(fill_px - rec["planned_stop"]), 2)
+                              if rec.get("planned_tp1") and fill_px != rec.get("planned_stop")
+                              else None)
+            lot_step, _lm, _mn = exchange_filters(key, secret)
+            rec, _ = build_exit_legs(rec, key, secret, lot_step)
+            changed.append(rec)
+            dirty = True
+            continue
+        if st in ("CANCELED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"):
+            rec["status"] = "LIMIT_CANCELLED"
+            rec["closed_note"] = f"限價單 {st} (未成交)"
+            rec["closed_time"] = now_iso
+            rec["closed_via"] = "limit_" + st.lower()
+            changed.append(rec)
+            dirty = True
+            continue
+        # 狀態不明 (API 冇回應等) → 下個 tick 再試
+
     for rec in log_d["orders"]:
         # 舊格式 (oco_leg_ids) → migration 到 exit_leg_ids (GLM review #C1:
         # 唔 migrate 嘅舊單會永久佔住 cap 1 名額, 癱瘓新開倉)
@@ -327,11 +422,15 @@ def reconcile_cycle(key, secret):
     if changed or dirty:
         save_log(log_d)
     if changed:
-        # 追加 closed history
-        hist = json.load(open(HISTORY)) if os.path.exists(HISTORY) else {"trades": []}
-        hist["trades"].extend(changed)
-        with open(HISTORY, "w") as f:
-            json.dump(hist, f, ensure_ascii=False, indent=2)
+        # 追加 closed history — **只計真正平倉嘅單**。
+        # feat/limit-entry: LIMIT_EXPIRED / LIMIT_CANCELLED 係「掛單未成交就取消」,
+        # 冇 trade 過、冇 PnL, 寫入 HISTORY 會污染 sumR / 勝率 (佢哋冇 r_multiple)。
+        closed_recs = [r for r in changed if r.get("status") == "CLOSED"]
+        if closed_recs:
+            hist = json.load(open(HISTORY)) if os.path.exists(HISTORY) else {"trades": []}
+            hist["trades"].extend(closed_recs)
+            with open(HISTORY, "w") as f:
+                json.dump(hist, f, ensure_ascii=False, indent=2)
     return changed, wiped
 
 
@@ -345,9 +444,21 @@ def main():
     # 1. reconcile
     closed, wiped = reconcile_cycle(key, secret)
     for c in closed:
+        st = c.get("status")
         # .get() 防禦 — 任何缺 field 都唔可以 crash 個 watchdog (bug fix 09-04)
-        log(f"🔒 CLOSED {c.get('side','?')} {(c.get('pattern') or '?')[:18]} "
-            f"exit={c.get('exit_fill')} pnl={c.get('pnl_usdt')}USDT R={c.get('r_multiple')}")
+        if st == "CLOSED":
+            log(f"🔒 CLOSED {c.get('side','?')} {(c.get('pattern') or '?')[:18]} "
+                f"exit={c.get('exit_fill')} pnl={c.get('pnl_usdt')}USDT R={c.get('r_multiple')}")
+        elif c.get("was_limit_fill"):
+            log(f"🎯 限價成交 {c.get('side','?')} {(c.get('pattern') or '?')[:18]} "
+                f"@ {c.get('entry_fill')} (掛單 {c.get('limit_px')}) → "
+                f"3 段 exit 已建 (RR {c.get('rr_fill')})")
+        elif st == "LIMIT_EXPIRED":
+            log(f"⌛ 限價過期 cancel {c.get('side','?')} {(c.get('pattern') or '?')[:18]} "
+                f"@ {c.get('limit_px')} — {c.get('closed_note')}")
+        elif st == "LIMIT_CANCELLED":
+            log(f"🚫 限價單取消 {c.get('side','?')} {(c.get('pattern') or '?')[:18]} "
+                f"@ {c.get('limit_px')} — {c.get('closed_note')}")
     for w in wiped:
         log(f"🧹 WIPED {w.get('side','?')} {(w.get('pattern') or '?')[:18]} "
             f"entry={w.get('entry_fill')} remaining={w.get('wiped_remaining_qty')} "
@@ -364,7 +475,7 @@ def main():
     if out2.strip():
         log(f"掃描結果: {out2.strip().splitlines()[-1]}")
     for line in out2.splitlines():
-        if any(k in line for k in ("✅", "🚫", "❌", "[DRY]")):
+        if any(k in line for k in ("✅", "🚫", "❌", "[DRY]", "📌", "⚠️")):
             log(line.strip())
 
     # 4. 每日統計
