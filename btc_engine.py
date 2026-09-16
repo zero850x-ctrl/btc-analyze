@@ -15,6 +15,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -144,6 +145,43 @@ def _parse_setup_level(val):
     return float(m.group(0).replace(",", "")) if m else None
 
 
+_LEVEL_NUM_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def parse_entry_limit(trigger, zone):
+    """限價入場價 — 引擎明示嘅掛單價.
+
+    entry_trigger 例: '限價買入 @ $74913（形態邊界入場）' → 74913
+    fallback: entry_zone '$74796 - $75031' → 中點 (74913.5)
+    最後 fallback: zone 第一個數字
+
+    為什麼唔用 _parse_setup_level 嘅 zone 第一個數 (下緣):
+      BUY 取 zone 下緣 = 最便宜、SELL 取 zone 下緣 = 最低沽價, 兩邊都係「最樂觀價」,
+      令 planned RR 系統性高估。09-14 實證: planned RR 1.23-1.74 但無一個價位成交得到
+      (市價已穿過 zone 0.10-0.17%), 實際 RR 0.44-0.90。用 engine 明示嘅掛單價才對得上。
+    """
+    if trigger:
+        m = re.search(r"@\s*\$?\s*([\d,]+(?:\.\d+)?)", str(trigger))
+        if m:
+            try:
+                return float(m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+    if zone:
+        nums = []
+        for x in _LEVEL_NUM_RE.findall(str(zone)):
+            try:
+                nums.append(float(x.replace(",", "")))
+            except ValueError:
+                pass
+        if len(nums) >= 2:
+            return (min(nums) + max(nums)) / 2
+        if nums:
+            return nums[0]
+    return None
+
+
+
 def btc_filter_setups(setups, atr, px, diff_check, ma50=None):
     """套用 BTC 校準: SL floor、RR 篩選、pattern gate、MA50 extended gate、risk sizing、UNVERIFIED 標記.
 
@@ -166,34 +204,41 @@ def btc_filter_setups(setups, atr, px, diff_check, ma50=None):
         entry = _parse_setup_level(s.get("entry_zone"))
         if entry is None:
             entry = _parse_setup_level(s.get("entry_trigger"))
+        # 限價入場價 (feat/limit-entry): 引擎明示嘅掛單價 (trigger 中嘅 @ $X, 否則 zone 中點)。
+        # entry (zone 下緣) 保留做參考, 但 RR / sizing 一律用 limit 價計 — 因為實際只會
+        # 喺 limit 價成交, 用下緣計係系統性樂觀。
+        limit_px = parse_entry_limit(s.get("entry_trigger"), s.get("entry_zone"))
+        if limit_px is None:
+            limit_px = entry
         stop = _parse_setup_level(s.get("stop_loss"))
         tp1 = _parse_setup_level(s.get("tp1"))
         tp2 = _parse_setup_level(s.get("tp2"))
         if entry is None or stop is None or not np.isfinite(stop):
             continue
-        risk = abs(entry - stop)
+        risk = abs(limit_px - stop)
         if risk <= 0:
             continue
         # SL floor: >= 0.8×ATR (BTC 1h ATR ~0.48%, 波動大, floor 更重要)
         min_stop_dist = SL_FLOOR_ATR_MULT * atr
         if risk < min_stop_dist:
             if side == "SELL":
-                stop = entry + min_stop_dist
+                stop = limit_px + min_stop_dist
             else:
-                stop = entry - min_stop_dist
-            risk = abs(entry - stop)
+                stop = limit_px - min_stop_dist
+            risk = abs(limit_px - stop)
             s["sl_floor_applied"] = True
         # risk sizing: USD risk % — BTC 冇 lot, 直接計倉位 ($10k 帳戶示例)
         s["btc_side"] = side
         s["btc_entry"] = round(entry, 2)
+        s["btc_limit_px"] = round(limit_px, 2)
         s["btc_stop"] = round(stop, 2)
         s["btc_tp1"] = round(tp1, 2) if tp1 else None
         s["btc_tp2"] = round(tp2, 2) if tp2 else None
         s["btc_risk_pct"] = BTC_RISK_PCT
-        s["btc_position_size_usd"] = round(10000 * BTC_RISK_PCT / 100 / risk * entry, 2)
+        s["btc_position_size_usd"] = round(10000 * BTC_RISK_PCT / 100 / risk * limit_px, 2)
         # RR gate: TP 細過 risk → 贏都贏唔起, skip (live 實證: RR<1 單贏 +0.09R 但輸 −1.08R)
         if tp1:
-            rr = abs(tp1 - entry) / risk
+            rr = abs(tp1 - limit_px) / risk
             s["rr_tp1"] = round(rr, 2)
             if rr < MIN_RR:
                 s["_gate_skip"] = f"rr_{s['rr_tp1']}_lt_{MIN_RR}"

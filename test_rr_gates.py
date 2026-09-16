@@ -53,14 +53,14 @@ btp.current_price = lambda: 77310.0
 btp.exchange_filters = lambda k, s: (0.00001, 0.0, 5.0)
 btp._signed_request = fake_post_flat
 
-rec, err = btp.place_signal_order(dict(SETUP), "k", "s", atr=145.6)
+rec, err = btp.place_signal_order(dict(SETUP), "k", "s", atr=145.6, mode="market")
 result("T1c 現價 RR<1.2 → 落單前擋住", rec is None and err and "現價" in err, f"({err})")
 result("T1d 冇落任何單", len(placed) == 0, f"(calls={len(placed)})")
 
 # T2: 現價 RR 過關 → 正常落單
 placed.clear()
 btp.current_price = lambda: 77215.0
-rec2, err2 = btp.place_signal_order(dict(SETUP), "k", "s", atr=145.6)
+rec2, err2 = btp.place_signal_order(dict(SETUP), "k", "s", atr=145.6, mode="market")
 result("T2 現價 RR 過關 → 正常落單", err2 is None, f"(err={err2})")
 order_calls = [c for c in placed if c[1] == "/api/v3/order" and c[2].get("type") == "MARKET"]
 result("T2b 有落 market 單", len(order_calls) >= 1, f"(market calls={len(order_calls)})")
@@ -86,7 +86,7 @@ saved = {}
 btp.load_log = lambda: {"orders": [], "history": []}
 btp.save_log = lambda lg: saved.update({"lg": lg})
 
-rec3, err3 = btp.place_signal_order(dict(SETUP), "k", "s", atr=145.6)
+rec3, err3 = btp.place_signal_order(dict(SETUP), "k", "s", atr=145.6, mode="market")
 result("T3 成交後 RR 0.51 < 1.2 → FLATTENED_LOW_FILL_RR",
        rec3 is not None and rec3.get("status") == "FLATTENED_LOW_FILL_RR",
        f"(status={rec3.get('status') if rec3 else None}, rr_fill={rec3.get('rr_fill') if rec3 else None})")
@@ -120,7 +120,7 @@ def fake_post_good(method, path, params, key, secret):
 
 
 btp._signed_request = fake_post_good
-rec4, err4 = btp.place_signal_order(dict(SETUP), "k", "s", atr=145.6)
+rec4, err4 = btp.place_signal_order(dict(SETUP), "k", "s", atr=145.6, mode="market")
 result("T4 成交價好 → 唔 flat (RR 過關)",
        rec4 is not None and rec4.get("status") != "FLATTENED_LOW_FILL_RR",
        f"(status={rec4.get('status') if rec4 else None}, rr_fill={rec4.get('rr_fill') if rec4 else None})")
@@ -130,7 +130,7 @@ placed.clear()
 no_tp1 = dict(SETUP)
 no_tp1.pop("btc_tp1")
 btp.current_price = lambda: 77215.0
-rec5, err5 = btp.place_signal_order(no_tp1, "k", "s", atr=145.6)
+rec5, err5 = btp.place_signal_order(no_tp1, "k", "s", atr=145.6, mode="market")
 result("T5 冇 TP1 → 唔落單", rec5 is None and err5, f"({err5})")
 
 print(f"\n{sum(1 for _, ok in RESULTS if ok)}/{len(RESULTS)} PASS")
