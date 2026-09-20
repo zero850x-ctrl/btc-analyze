@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Sanity check: vendor 檔案同上游 xauusd-analyze-v3 main 一致."""
-import hashlib, sys
+import hashlib, os, sys
+
+# 2026-09-13: 上游 clone 已由 /tmp 搬入 ~/repos，唔再寫死路徑
+XAUUSD_DIR = os.environ.get("XAUUSD_REPO") or os.path.expanduser("~/repos/xauusd-analyze-v3")
 
 PAIRS = [
-    ("analyze_v3.py", "/tmp/xauusd-analyze-v3/analyze_v3.py"),
-    ("paper_trade.py", "/tmp/xauusd-analyze-v3/paper_trade.py"),
+    ("analyze_v3.py", os.path.join(XAUUSD_DIR, "analyze_v3.py")),
+    ("paper_trade.py", os.path.join(XAUUSD_DIR, "paper_trade.py")),
 ]
 
 def sha(p):

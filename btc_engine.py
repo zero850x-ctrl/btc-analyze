@@ -15,6 +15,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -41,8 +42,52 @@ COINBASE_TICKER_URL = "https://api.exchange.coinbase.com/products/BTC-USD/ticker
 BTC_RISK_PCT = 0.5          # 每筆風險 = 帳戶 0.5% (24/7 + 高波動 → 比 XAUUSD 保守)
 BTC_EXCHANGE_DIFF_PCT = 0.8  # Coinbase vs 主源價差 >0.8% → UNVERIFIED (黃金 basis $40 之 BTC 版)
 SL_FLOOR_ATR_MULT = 0.8     # 同 XAUUSD — SL 至少 0.8×ATR
-MIN_RR = 1.0                # RR gate: TP1/risk >= 1.0 (RR<1 單贏都贏唔起 — live 9 筆實證)
-ALLOWED_PATTERNS = ("Flag",)  # Pattern gate: 只做 Bull/Bear Flag (backtest +0.59/+0.66R; AT/雙頂負 EV)
+MIN_RR = 1.2                # RR gate: TP1/risk >= 1.2 (RR<1.2 單贏細輸大 — live 15 筆實證: 贏 avg +0.28R / 輸 avg -1.08R)
+MAX_MA50_EXT_PCT = 2.0      # Flag extended gate: 離 MA50(m30) > ±2% 唔開 Flag
+                            # (09-04 實證: 3 單 Bull Flag entry 離 MA50 +2.0~3.8% 全部 SL;
+                            #  歷史 15 單 Flag: 呢個 gate 擋 -2.50R、誤殺正R $0.00)
+# ── Pattern gate (2026-09-20 重寫) ─────────────────────────────────────────────
+# 舊寫法 `any(k in pattern for k in ("Flag",))` 用**顯示標籤 substring** 判斷, 會靜默
+# drop 任何未量度嘅 setup 家族。實例: fib0786/fib 嘅 pattern 標籤係
+# "0.786 深度回調 ($…)", 唔含 "Flag" → 永遠過唔到, 而且冇任何 consumer 讀 _gate_skip,
+# 所以完全靜默。證據:
+#   - gate (e8bf635, 2026-08-30 20:24) 上線前 12 小時內有 12 筆 fib 單; 上線後 0 筆
+#   - justify 個 gate 嘅 83 樣本實驗 (bt_gate_results.json) 裏面**完全冇** fib/0.786
+#   ⇒ 排除 0.786 係未經評估嘅副作用, 唔係測過嘅決定。
+#
+# 政策**不變** (0.786 / fib / boundary 仍然唔開) —— 但改成明示對照表, 每個家族嘅
+# 去留都寫死喺呢度; 新家族會帶 "UNKNOWN" 標記 fail-closed, 唔會再靜默。
+ALLOWED_PATTERN_FAMILIES = ("Flag",)
+
+# entry_mode → 家族。fib0786/fib 係**獨立於 pattern 產生**, 唔可以靠 pattern 標籤分辨。
+_ENTRY_MODE_FAMILY = {
+    "fib0786": "fib0786",
+    "fib": "fib",
+    "boundary": "boundary",
+}
+
+# pattern 顯示標籤 → 家族 (順序有意義: 先配對較具體嘅)
+_PATTERN_FAMILY_KEYS = (
+    ("Flag", "Flag"), ("旗", "Flag"),
+    ("Double Top", "DoubleTop"), ("雙頂", "DoubleTop"),
+    ("Double Bottom", "DoubleBottom"), ("雙底", "DoubleBottom"),
+    ("Wedge", "Wedge"), ("楔", "Wedge"),
+    ("Triangle", "Triangle"), ("三角", "Triangle"),
+    ("Channel", "Channel"),
+)
+
+
+def setup_family(s):
+    """setup → 明示家族名。認唔到就回 "UNKNOWN:<label>" (唔會默認當合格)。"""
+    mode = str(s.get("entry_mode") or "").strip().lower()
+    if mode in _ENTRY_MODE_FAMILY:
+        return _ENTRY_MODE_FAMILY[mode]
+    pat = str(s.get("pattern", ""))
+    for key, fam in _PATTERN_FAMILY_KEYS:
+        if key in pat:
+            return fam
+    return "UNKNOWN:" + (pat[:24] if pat else "?")
+
 BTC_MIN_BARS_M30 = 240      # M30 最少 5 日數據
 BTC_MIN_BARS_H1 = 240
 BTC_MIN_BARS_DAY = 120
@@ -141,57 +186,118 @@ def _parse_setup_level(val):
     return float(m.group(0).replace(",", "")) if m else None
 
 
-def btc_filter_setups(setups, atr, px, diff_check):
-    """套用 BTC 校準: SL floor、RR 篩選、pattern gate、risk sizing、UNVERIFIED 標記.
+_LEVEL_NUM_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def parse_entry_limit(trigger, zone):
+    """限價入場價 — 引擎明示嘅掛單價.
+
+    entry_trigger 例: '限價買入 @ $74913（形態邊界入場）' → 74913
+    fallback: entry_zone '$74796 - $75031' → 中點 (74913.5)
+    最後 fallback: zone 第一個數字
+
+    為什麼唔用 _parse_setup_level 嘅 zone 第一個數 (下緣):
+      BUY 取 zone 下緣 = 最便宜、SELL 取 zone 下緣 = 最低沽價, 兩邊都係「最樂觀價」,
+      令 planned RR 系統性高估。09-14 實證: planned RR 1.23-1.74 但無一個價位成交得到
+      (市價已穿過 zone 0.10-0.17%), 實際 RR 0.44-0.90。用 engine 明示嘅掛單價才對得上。
+    """
+    if trigger:
+        m = re.search(r"@\s*\$?\s*([\d,]+(?:\.\d+)?)", str(trigger))
+        if m:
+            try:
+                return float(m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+    if zone:
+        nums = []
+        for x in _LEVEL_NUM_RE.findall(str(zone)):
+            try:
+                nums.append(float(x.replace(",", "")))
+            except ValueError:
+                pass
+        if len(nums) >= 2:
+            return (min(nums) + max(nums)) / 2
+        if nums:
+            return nums[0]
+    return None
+
+
+
+def btc_filter_setups(setups, atr, px, diff_check, ma50=None):
+    """套用 BTC 校準: SL floor、RR 篩選、pattern gate、MA50 extended gate、risk sizing、UNVERIFIED 標記.
 
     引擎 setup 欄位: direction/pattern/entry_zone/stop_loss/tp1/tp2/tp3/risk_amount (字串格式).
     Gate (backtest 68 樣本 + testnet 9 筆實證 2026-08-30):
-      - RR >= 1.0: TP(pattern 高度) 細過 SL floor 嘅單贏都贏唔起 (AT/fib live RR 0.1-0.4)
-      - Pattern: 只做 Bull/Bear Flag (+0.59/+0.66R); AT 33.3% -0.25R、雙頂負 EV 全 live 實證
+      - RR >= 1.2: TP(pattern 高度) 細過 SL floor 嘅單贏都贏唔起 (AT/fib live RR 0.1-0.4)
+      - Family: 只做 Flag (見 ALLOWED_PATTERN_FAMILIES)。用明示家族對照表, 唔用標籤
+        substring —— 舊寫法會靜默 drop fib0786/fib。被擋嘅 setup 一律帶 _gate_skip,
+        由 summarize_gate_skips() 匯報, 唔會再靜默。
+      - MA50 extended (09-04): Flag = trend continuation; entry 離 MA50(m30) 太遠 = 追火棒,
+        假突破風險高 (今日 3 單 Bull Flag 離 MA50 +2~3.8% 全 SL)
     """
     out = []
     for s in setups:
         side = "SELL" if "SELL" in str(s.get("direction", "")) else "BUY"
         pattern = str(s.get("pattern", "?"))
-        # Pattern gate: 負 EV pattern 直接 skip (保留 setup 字串方便 debug)
-        if ALLOWED_PATTERNS is not None:
-            if not any(k in pattern for k in ALLOWED_PATTERNS):
-                s["_gate_skip"] = "pattern_not_allowed"
-                continue
+        # Pattern gate (2026-09-20): 用**明示家族**判斷, 唔再用顯示標籤 substring。
+        # 舊寫法會靜默 drop fib0786/fib (標籤 "0.786 深度回調 …" 唔含 "Flag")。
+        fam = setup_family(s)
+        s["_family"] = fam
+        if ALLOWED_PATTERN_FAMILIES is not None and fam not in ALLOWED_PATTERN_FAMILIES:
+            s["_gate_skip"] = f"family_{fam}_not_allowed"
+            continue
         entry = _parse_setup_level(s.get("entry_zone"))
         if entry is None:
             entry = _parse_setup_level(s.get("entry_trigger"))
+        # 限價入場價 (feat/limit-entry): 引擎明示嘅掛單價 (trigger 中嘅 @ $X, 否則 zone 中點)。
+        # entry (zone 下緣) 保留做參考, 但 RR / sizing 一律用 limit 價計 — 因為實際只會
+        # 喺 limit 價成交, 用下緣計係系統性樂觀。
+        limit_px = parse_entry_limit(s.get("entry_trigger"), s.get("entry_zone"))
+        if limit_px is None:
+            limit_px = entry
         stop = _parse_setup_level(s.get("stop_loss"))
         tp1 = _parse_setup_level(s.get("tp1"))
         tp2 = _parse_setup_level(s.get("tp2"))
         if entry is None or stop is None or not np.isfinite(stop):
             continue
-        risk = abs(entry - stop)
+        risk = abs(limit_px - stop)
         if risk <= 0:
             continue
         # SL floor: >= 0.8×ATR (BTC 1h ATR ~0.48%, 波動大, floor 更重要)
         min_stop_dist = SL_FLOOR_ATR_MULT * atr
         if risk < min_stop_dist:
             if side == "SELL":
-                stop = entry + min_stop_dist
+                stop = limit_px + min_stop_dist
             else:
-                stop = entry - min_stop_dist
-            risk = abs(entry - stop)
+                stop = limit_px - min_stop_dist
+            risk = abs(limit_px - stop)
             s["sl_floor_applied"] = True
         # risk sizing: USD risk % — BTC 冇 lot, 直接計倉位 ($10k 帳戶示例)
         s["btc_side"] = side
         s["btc_entry"] = round(entry, 2)
+        s["btc_limit_px"] = round(limit_px, 2)
         s["btc_stop"] = round(stop, 2)
         s["btc_tp1"] = round(tp1, 2) if tp1 else None
         s["btc_tp2"] = round(tp2, 2) if tp2 else None
         s["btc_risk_pct"] = BTC_RISK_PCT
-        s["btc_position_size_usd"] = round(10000 * BTC_RISK_PCT / 100 / risk * entry, 2)
+        s["btc_position_size_usd"] = round(10000 * BTC_RISK_PCT / 100 / risk * limit_px, 2)
         # RR gate: TP 細過 risk → 贏都贏唔起, skip (live 實證: RR<1 單贏 +0.09R 但輸 −1.08R)
         if tp1:
-            rr = abs(tp1 - entry) / risk
+            rr = abs(tp1 - limit_px) / risk
             s["rr_tp1"] = round(rr, 2)
             if rr < MIN_RR:
                 s["_gate_skip"] = f"rr_{s['rr_tp1']}_lt_{MIN_RR}"
+                continue
+        # MA50 extended gate: Flag = trend continuation, entry 離 MA50 太遠 = 追火棒
+        if ma50 is not None and np.isfinite(ma50) and ma50 > 0:
+            ext = (entry / ma50 - 1) * 100.0
+            s["ma50_ext_pct"] = round(ext, 2)
+            # +1e-6 epsilon: 邊界 2.0000000000000018 唔算超 (浮點)
+            if side == "BUY" and ext > MAX_MA50_EXT_PCT + 1e-6:
+                s["_gate_skip"] = f"ma50_ext_{ext:.1f}pct_gt_{MAX_MA50_EXT_PCT}"
+                continue
+            if side == "SELL" and ext < -(MAX_MA50_EXT_PCT + 1e-6):
+                s["_gate_skip"] = f"ma50_ext_{ext:.1f}pct_lt_-{MAX_MA50_EXT_PCT}"
                 continue
         # UNVERIFIED 標記
         if diff_check["status"] != "OK":
@@ -201,6 +307,26 @@ def btc_filter_setups(setups, atr, px, diff_check):
             s["verified"] = True
         out.append(s)
     return out
+
+
+def summarize_gate_skips(raw_setups):
+    """匯報每個 setup 被擋嘅原因 —— 令 gate 出聲 (舊版完全靜默)。
+
+    回傳 {"n_raw": int, "n_kept": int, "reasons": {reason: count},
+          "families_seen": {family: count}}
+    """
+    import collections
+
+    reasons = collections.Counter()
+    fams = collections.Counter()
+    for s in raw_setups:
+        fams[str(s.get("_family") or setup_family(s))] += 1
+        sk = s.get("_gate_skip")
+        if sk:
+            reasons[str(sk)] += 1
+    n_kept = sum(1 for s in raw_setups if not s.get("_gate_skip"))
+    return {"n_raw": len(raw_setups), "n_kept": n_kept,
+            "reasons": dict(reasons), "families_seen": dict(fams)}
 
 
 def pick_best_setup(setups):
@@ -215,7 +341,7 @@ def pick_best_setup(setups):
 
 
 # ── 報告 ────────────────────────────────────────────────────────
-def build_btc_report(data, patterns, setups, daily_trend, h1_trend, diff_check, best):
+def build_btc_report(data, patterns, setups, daily_trend, h1_trend, diff_check, best, ma50=None):
     px = data["spot"]
     atr = None
     if data.get("m30") is not None:
@@ -230,6 +356,9 @@ def build_btc_report(data, patterns, setups, daily_trend, h1_trend, diff_check, 
     lines.append(f"- 數據源: {data['source']}  |  spot: {BASIS_SOURCE_LABEL}")
     lines.append(f"- 時間: {now.strftime('%Y-%m-%d %H:%M UTC')} (24/7 — 冇 session gates)")
     lines.append(f"- 價格: ${px:,.0f}  |  ATR(14, M30): ${atr:,.0f} ({atr/px*100:.2f}%)" if atr else f"- 價格: ${px:,.0f}")
+    if ma50:
+        ext = (px / ma50 - 1) * 100.0
+        lines.append(f"- MA50(M30): ${ma50:,.0f} (現價 {ext:+.1f}% — Flag extended gate ±{MAX_MA50_EXT_PCT}%)")
     lines.append(f"- 交易所價差: {diff_check['note']}")
     lines.append(f"- 日線趨勢: {daily_trend['trend'] if isinstance(daily_trend, dict) else daily_trend}  |  H1 趨勢: {h1_trend['trend'] if isinstance(h1_trend, dict) else h1_trend}")
     lines.append("")
@@ -267,15 +396,20 @@ def main():
     df = av3.add_indicators(base.copy())
     atr = float(df["ATR"].iloc[-1])
     px = float(df["Close"].iloc[-1])
+    ma50 = float(df["MA50"].iloc[-1]) if "MA50" in df.columns and np.isfinite(df["MA50"].iloc[-1]) else None
     pts = av3.find_swings_ordered(df["High"].values, df["Low"].values, lookback=3,
                                   atr=df["ATR"].values, close=df["Close"].values)
     patterns = av3.detect_all_patterns(df, pts, atr=atr)
     daily_trend = av3.analyze_daily_trend(data["day"]) if data["day"] is not None else {"trend": "NEUTRAL"}
     h1_trend = av3.analyze_h1_trend(data["h1"]) if data["h1"] is not None else {"trend": "NEUTRAL"}
-    setups = av3.generate_trade_setups(df, patterns, pts, daily_trend, px, atr, h1_trend=h1_trend)
-    setups = btc_filter_setups(setups, atr, px, diff_check)
+    raw_setups = av3.generate_trade_setups(df, patterns, pts, daily_trend, px, atr, h1_trend=h1_trend)
+    setups = btc_filter_setups(raw_setups, atr, px, diff_check, ma50=ma50)
+    gate_skips = summarize_gate_skips(raw_setups)
+    if gate_skips["reasons"]:
+        _log(f"[gate] raw={gate_skips['n_raw']} kept={gate_skips['n_kept']} "
+             f"skipped={gate_skips['reasons']} families={gate_skips['families_seen']}")
     best = pick_best_setup(setups)
-    report = build_btc_report(data, patterns, setups, daily_trend, h1_trend, diff_check, best)
+    report = build_btc_report(data, patterns, setups, daily_trend, h1_trend, diff_check, best, ma50=ma50)
 
     if args.json:
         payload = {
@@ -283,6 +417,8 @@ def main():
             "symbol": "BTC-USD",
             "price": px,
             "atr": atr,
+            "ma50": ma50,
+            "ma50_ext_pct": round((px / ma50 - 1) * 100.0, 2) if ma50 else None,
             "source": data["source"],
             "coinbase_spot": data.get("coinbase_spot"),
             "exchange_diff": diff_check,
@@ -290,16 +426,23 @@ def main():
             "h1_trend": h1_trend["trend"] if isinstance(h1_trend, dict) else str(h1_trend),
             "patterns": len(patterns),
             "setups": setups,
+            "gate_skips": gate_skips,
             "best": best,
         }
         print(json.dumps(payload, ensure_ascii=False, default=str))
     else:
         print(report)
+        if gate_skips["reasons"]:
+            print(f"\n## Gate 擋咗 ({gate_skips['n_raw'] - gate_skips['n_kept']}/"
+                  f"{gate_skips['n_raw']})")
+            for r, n in sorted(gate_skips["reasons"].items(), key=lambda x: -x[1]):
+                print(f"- {r} × {n}")
         # 保存 JSON 供 paper_trade 用
         out = os.path.join(REPO, "btc_last_analysis.json")
         with open(out, "w") as f:
             json.dump({"generated_at": now_iso(), "price": px, "atr": atr,
                        "exchange_diff": diff_check, "setups": setups, "best": best,
+                       "gate_skips": gate_skips,
                        "daily_trend": str(daily_trend), "h1_trend": str(h1_trend)},
                       f, ensure_ascii=False, default=str)
         _log(f"[*] JSON saved {out}")

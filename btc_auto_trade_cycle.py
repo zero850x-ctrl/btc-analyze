@@ -10,9 +10,12 @@ import json
 import os
 import subprocess
 import sys
+import time
+import urllib.error
 from datetime import datetime, timezone
 
-REPO = "/tmp/btc-analyze"
+# 2026-09-13: 自我定位 (clone 已由 /tmp 搬入 ~/repos)；BTC_REPO env 可覆寫
+REPO = os.environ.get("BTC_REPO") or os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO)
 LOG_PATH = os.path.expanduser("~/.hermes/reports/btc_testnet_orders.json")
 HEARTBEAT = os.path.expanduser("~/.hermes/reports/btc_auto_trade_heartbeat.txt")
@@ -40,53 +43,465 @@ def log(msg):
             f.writelines(lines[-500:])
 
 
+def _pnl_of(rec, exit_px, qty, fee, fee_asset):
+    """單一段 exit 嘅 pnl (扣 fee).
+
+    Binance spot: seller 付 USDT (quote)、buyer 付 BTC (base) —
+    用 myTrades 嘅 commissionAsset 判斷 (GLM review #A1, 真數據驗證):
+      USDT → 直接扣; BTC → ×price 轉 USD.
+    """
+    direction = -1 if rec["side"] == "SELL" else 1
+    fee_usdt = fee if str(fee_asset).upper() == "USDT" else fee * exit_px
+    return (exit_px - rec["entry_fill"]) * qty * direction - fee_usdt
+
+
+def _trail_leg(rec, open_map, key, secret):
+    """尾倉 SL (l3) 按 ATR step 推 — 每行 +1 ATR 利潤 → SL 追 (steps-1)×ATR.
+
+    steps=1 時 SL 推到 breakeven (鎖打和); steps=2 鎖 +1 ATR, 如此類推.
+    先 POST 新 SL order 成功先 DELETE 舊 (避免 naked 窗口); DELETE 失敗 →
+    即刻 DELETE 剛 POST 嘅新 SL (rollback), 防止雙 SL live 開反向裸倉
+    (GLM review #B3).
+    """
+    from binance_testnet_paper import _signed_request, current_price
+
+    l3_id = rec.get("l3_id")
+    if not l3_id or l3_id not in open_map:
+        return
+    # trail_stuck cleanup (DSv4 review #C): 上 tick rollback 失敗留低雙 SL →
+    # 掃 open_map 清走同向獨立 stop-limit (orderListId=-1 = 唔係 OCO leg)
+    if rec.get("trail_stuck"):
+        exit_side = "SELL" if rec["side"] == "BUY" else "BUY"
+        for o in list(open_map.values()):
+            if (o.get("type") == "STOP_LOSS_LIMIT" and o.get("symbol") == "BTCUSDT"
+                    and o.get("side") == exit_side
+                    and int(o.get("orderListId") or -1) == -1
+                    and o["orderId"] != l3_id):
+                try:
+                    _signed_request("DELETE", "/api/v3/order",
+                                    {"symbol": "BTCUSDT", "orderId": o["orderId"]}, key, secret)
+                    rec.setdefault("trail_errors", []).append(
+                        f"stuck cleanup del {o['orderId']}")
+                except Exception as e:
+                    rec.setdefault("trail_errors", []).append(
+                        f"stuck cleanup FAIL {o['orderId']}: {str(e)[:60]}")
+        rec["trail_stuck"] = False
+    atr = rec.get("atr")
+    if not atr or atr <= 0:
+        return
+    entry = rec["entry_fill"]
+    side = rec["side"]
+    # 高水位: 用本 tick 見過嘅最優價計 steps (spike 回落都唔會錯過追蹤)
+    px = current_price()
+    best = max(rec.get("max_favorable_px") or 0, px) if side == "BUY" \
+        else min(rec.get("max_favorable_px") or px, px)
+    rec["max_favorable_px"] = best
+    old_stop = float(open_map[l3_id]["stopPrice"])
+    if side == "BUY":
+        steps = int((best - entry) / atr)
+        new_stop = entry + max(0, steps - 1) * atr
+    else:
+        steps = int((entry - best) / atr)
+        new_stop = entry - max(0, steps - 1) * atr
+    if steps < 1:
+        return  # 未行夠 1 ATR
+    new_stop = round(new_stop, 2)
+    if (side == "BUY" and new_stop <= old_stop) or (side == "SELL" and new_stop >= old_stop):
+        return  # 唔更有利
+    qty = float(open_map[l3_id]["origQty"])
+    try:
+        if side == "BUY":
+            r = _signed_request("POST", "/api/v3/order", {
+                "symbol": "BTCUSDT", "side": "SELL", "type": "STOP_LOSS_LIMIT",
+                "quantity": f"{qty:.5f}", "stopPrice": f"{new_stop:.2f}",
+                "price": f"{new_stop * 0.9985:.2f}", "timeInForce": "GTC"}, key, secret)
+        else:
+            r = _signed_request("POST", "/api/v3/order", {
+                "symbol": "BTCUSDT", "side": "BUY", "type": "STOP_LOSS_LIMIT",
+                "quantity": f"{qty:.5f}", "stopPrice": f"{new_stop:.2f}",
+                "price": f"{new_stop * 1.0015:.2f}", "timeInForce": "GTC"}, key, secret)
+    except Exception as e:
+        rec.setdefault("trail_errors", []).append(f"POST fail: {str(e)[:100]}")
+        return
+    # POST 成功先 DELETE 舊 SL; DELETE 失敗 → rollback 新 SL (雙 SL = 反向裸倉風險)
+    try:
+        _signed_request("DELETE", "/api/v3/order",
+                        {"symbol": "BTCUSDT", "orderId": l3_id}, key, secret)
+    except Exception as e:
+        try:
+            _signed_request("DELETE", "/api/v3/order",
+                            {"symbol": "BTCUSDT", "orderId": r["orderId"]}, key, secret)
+            rec.setdefault("trail_errors", []).append(
+                f"old-DELETE fail → new SL rolled back: {str(e)[:80]}")
+        except Exception as e2:
+            rec["trail_stuck"] = True   # 雙 SL 都剷唔走 → 標記, 下 tick 優先處理
+            rec.setdefault("trail_errors", []).append(
+                f"ROLLBACK FAIL 雙SL live old={l3_id} new={r['orderId']}: {str(e2)[:80]}")
+        return
+    rec["l3_id"] = r["orderId"]
+    rec.setdefault("exit_leg_ids", []).append(r["orderId"])   # 新 SL leg 都要 reconcile
+    rec["trail_stop"] = new_stop
+    rec.setdefault("trails", []).append({
+        "to": new_stop,
+        "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+
+
+def _breakeven_remaining(rec, open_map, key, secret):
+    """TP1 (OCO_A) 成交後 → 只推尾倉 l3 SL 去 breakeven.
+
+    3 注結構 (用戶確認 2026-09-03):
+      1. OCO_A @TP1 成交 = 賣第 1 份 ✅
+      2. OCO_B 保持原狀 → 照等 TP2 = 賣第 2 份 (唔郁!)
+      3. 尾倉 l3 → 推 breakeven, 之後 ATR trail = 食大趨勢
+    之前錯誤地將 OCO_B 都取消重建去 breakeven → 第 2 份冇等 TP2,
+    彈返 breakeven 就 2/3 全走 (BTC 爆上 $81k 得 0 手).
+
+    l3 係獨立 SL → 直接 POST 新 (breakeven) + DELETE 舊, 失敗 rollback.
+    只喺 OCO_A 嘅 **TP leg 成交** 先 trigger (SL leg 成交 = 價格已反轉,
+    推 breakeven 會令剩倉 SL 高過市價即時觸發 — 唔可以做).
+    """
+    from binance_testnet_paper import _signed_request
+
+    if not rec.get("oco_a_tp_hit"):
+        return
+    if rec.get("be_done"):
+        return
+    entry = rec["entry_fill"]
+    side = rec["side"]
+    be = round(entry, 2)
+
+    l3_id = rec.get("l3_id")
+    if not l3_id or l3_id not in open_map:
+        return  # 冇尾倉 (無 TP1 冇 TP2 時 q3 先有) — 冇嘢要郁
+    o = open_map[l3_id]
+    if abs(float(o.get("stopPrice", 0)) - be) < 1e-6:
+        rec["be_done"] = True   # 已係 breakeven
+        return
+    qty = float(o["origQty"])
+    try:
+        if side == "BUY":
+            r = _signed_request("POST", "/api/v3/order", {
+                "symbol": "BTCUSDT", "side": "SELL", "type": "STOP_LOSS_LIMIT",
+                "quantity": f"{qty:.5f}", "stopPrice": f"{be:.2f}",
+                "price": f"{be * 0.9985:.2f}", "timeInForce": "GTC"}, key, secret)
+        else:
+            r = _signed_request("POST", "/api/v3/order", {
+                "symbol": "BTCUSDT", "side": "BUY", "type": "STOP_LOSS_LIMIT",
+                "quantity": f"{qty:.5f}", "stopPrice": f"{be:.2f}",
+                "price": f"{be * 1.0015:.2f}", "timeInForce": "GTC"}, key, secret)
+    except Exception as e:
+        rec.setdefault("trail_errors", []).append(f"BE l3 POST fail: {str(e)[:80]}")
+        return
+    try:
+        _signed_request("DELETE", "/api/v3/order",
+                        {"symbol": "BTCUSDT", "orderId": l3_id}, key, secret)
+    except Exception as e:
+        try:
+            _signed_request("DELETE", "/api/v3/order",
+                            {"symbol": "BTCUSDT", "orderId": r["orderId"]}, key, secret)
+            rec.setdefault("trail_errors", []).append(f"BE l3 rollback: {str(e)[:80]}")
+        except Exception as e2:
+            rec["trail_stuck"] = True
+            rec.setdefault("trail_errors", []).append(f"BE l3 ROLLBACK FAIL: {str(e2)[:80]}")
+        return
+    rec["l3_id"] = r["orderId"]
+    rec["exit_leg_ids"] = [i for i in rec.get("exit_leg_ids", []) if i != l3_id] + [r["orderId"]]
+    rec["breakeven_done_l3"] = True
+    rec["be_done"] = True
+    rec.setdefault("breakeven_moves", []).append({"l3": l3_id, "new": r["orderId"], "be": be})
+
+
 def reconcile_cycle(key, secret):
-    """OCO legs 消失 = 其中一腿成交 → 對 myTrades 計入場/出場/fee → 計 R."""
-    from binance_testnet_paper import _signed_request, load_log, save_log
+    """3 段 exit reconcile + 尾倉 trailing.
+
+    1. exit leg 消失 → myTrades 對應 fill → 累計 realized (已計 legs 唔重複)
+    2. 全部 qty 已實現 → CLOSED, 計 R (扣 fee)
+    3. 尾倉 SL 仲開住 + 價格行咗 >=1 ATR → 推 SL (trailing)
+    """
+    from binance_testnet_paper import (_signed_request, load_log, save_log,
+                                       build_exit_legs, exchange_filters,
+                                       current_price, LIMIT_TTL_HOURS,
+                                       resolve_orphan_states, is_live_rec,
+                                       DONE_STATUS, ORPHAN_STATUS, estimate_held_for,
+                                       HOLDING_STATUS)
 
     log_d = load_log()
     changed = []
+    wiped = []      # testnet 帳戶重置 → 幻影倉 (唔入 HISTORY, 唔污染 sumR)
+    dirty = False   # partial fill / breakeven / trail rebuild 後必須 save (bug fix 09-03)
+    opens = _signed_request("GET", "/api/v3/openOrders", {"symbol": "BTCUSDT"}, key, secret)
+    open_ids = {o["orderId"] for o in opens}
+    open_map = {o["orderId"]: o for o in opens}
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # ── fail-closed 復原 (2026-09-20 GLM review #1 / A / B) ────────────────
+    # is_live_rec() 係 fail-closed: 唔喺 DONE_STATUS 就當 live。好處係唔會漏 guard,
+    # 代價係「實際已經冇倉」嘅孤兒狀態會永久鎖死引擎 (所有新單被 same_side 擋)。
+    # 所以每次 reconcile 都對帳:
+    #   冇倉 (低於 dust) → 歸 CLOSED (解鎖)
+    #   有倉             → **真正補建 exit legs** (唔可以只標 needs_legs —— 冇消費者
+    #                      = 死巷, 倉會永久裸掛冇止損, 比原問題更危險)
+    # 用 per-record 持倉判斷 (GLM B/F1): 帳戶總額對 N 個孤兒係語意錯配。
+    # F1 修正: 之前 _held_for 完全冇讀 rec → 假 per-record。而家:
+    #   (1) 帳戶餘額喺 loop 外查**一次** (之前 N 個孤兒 = N 次 API call, rate limit 風險)
+    #   (2) 每筆扣除「其他仍 live 記錄」嘅 qty → 得出該筆自己嘅估算持倉
+    try:
+        lot_step, _lm, _mn = exchange_filters(key, secret)
+    except Exception:                                   # noqa: BLE001
+        lot_step = None
+    dust_eps = (lot_step * 10) if lot_step else 0.0001
+
+    try:
+        _acct = _signed_request("GET", "/api/v3/account", {}, key, secret)
+        _acct_btc = next((float(b["free"]) + float(b["locked"])
+                          for b in _acct.get("balances", []) if b.get("asset") == "BTC"), 0.0)
+    except Exception:                                   # noqa: BLE001
+        _acct_btc = None                                # 查唔到 → resolve 會 skip
+    # LOW-4 (GLM 第五輪): 只扣「持貨類」status 嘅 qty。
+    # LOW-I (第六輪): tuple 由 binance_testnet_paper 定義 (HOLDING_STATUS),
+    #   唔喺呢度重複一份 —— 兩份會 drift, 而 LOW-4 正正就係食過呢個虧。
+    _live_recs = [r for r in log_d["orders"]
+                  if is_live_rec(r) and str(r.get("status") or "") in HOLDING_STATUS]
+
+    def _held_for(rec):
+        """該筆自己嘅估算持倉 —— 邏輯喺 estimate_held_for() (可測)。"""
+        return estimate_held_for(rec, _acct_btc, _live_recs)
+
+    def _rebuild(rec):
+        if lot_step is None:
+            raise RuntimeError("冇 lot_step, 唔敢建 legs")
+        return build_exit_legs(rec, key, secret, lot_step)
+
+    orph, orph_summ = resolve_orphan_states(
+        log_d, _held_for, dust_eps=dust_eps,
+        rebuild=_rebuild if lot_step is not None else None,
+        acct_btc=_acct_btc)          # HIGH-1: freeze-on-ambiguity 要用帳戶總額
+    if orph:
+        changed.extend(orph)
+        dirty = True
+        log("🩹 孤兒狀態對帳: " + ", ".join(f"{k}={v}" for k, v in orph_summ.items() if v)
+            + f" (dust_eps={dust_eps:.5f}, acct_btc={_acct_btc})")
+
+    # ── F4: 未知 status 要出聲 (之前會永久 live 但零 log) ──────────────────
+    _known = set(DONE_STATUS) | set(ORPHAN_STATUS) | {"LIMIT_PENDING", "OCO_PLACED"}
+    _unknown = {}
+    for r in log_d["orders"]:
+        st = str(r.get("status") or "")
+        if st and st not in _known:
+            _unknown[st] = _unknown.get(st, 0) + 1
+    if _unknown:
+        log(f"⚠️ 未見過嘅 status (會被當 live, 永久鎖引擎): {_unknown} — 需人手確認")
+
+    # ── feat/limit-entry: 限價掛單對帳 (09-16) ─────────────────────────
+    # 掛單喺 openOrders → 仲等緊；唔喺 → 查最終狀態 (FILLED → 建 3 段 exit /
+    # CANCELED → 釋放 cap / 部分成交 → cancel 剩餘 + 用已成交 qty 建 exit)。
+    # 兩道 cancel 條件: TTL 過期 (engine 每 15min 重算, 形態會過期) 或價格偏離太遠
+    # (形態已失效, 掛單永遠唔會成交, 但霸住 cap 1)。
     for rec in log_d["orders"]:
-        if rec.get("status") != "OCO_PLACED" or not rec.get("oco_leg_ids"):
+        if rec.get("status") != "LIMIT_PENDING":
             continue
-        opens = _signed_request("GET", "/api/v3/openOrders", {"symbol": "BTCUSDT"}, key, secret)
-        open_ids = {o["orderId"] for o in opens}
-        legs_gone = [i for i in rec["oco_leg_ids"] if i not in open_ids]
-        if not legs_gone:
+        oid = rec.get("order_id")
+        if oid in open_ids:
+            age_h = (time.time() - (rec.get("limit_ts") or time.time())) / 3600.0
+            o = open_map.get(oid) or {}
+            far = False
+            try:
+                lpx = float(rec.get("limit_px") or 0)
+                if lpx:
+                    far = abs(current_price() - lpx) / lpx > 0.03   # 離掛單價 > 3%
+            except Exception:
+                far = False
+            if age_h >= LIMIT_TTL_HOURS or far:
+                why = (f"掛單 {age_h:.1f}h 未成交 (TTL {LIMIT_TTL_HOURS:g}h)"
+                       if age_h >= LIMIT_TTL_HOURS else
+                       f"價格已偏離掛單價 >3% (形態失效)")
+                try:
+                    _signed_request("DELETE", "/api/v3/order",
+                                    {"symbol": "BTCUSDT", "orderId": oid}, key, secret)
+                    rec["status"] = "LIMIT_EXPIRED"
+                    rec["closed_note"] = f"{why} → cancel (釋放 cap)"
+                    rec["closed_time"] = now_iso
+                    rec["closed_via"] = "limit_ttl"
+                    changed.append(rec)
+                    dirty = True
+                except urllib.error.HTTPError as e:
+                    rec["limit_cancel_error"] = e.read().decode()[:200]
+                    dirty = True
             continue
-        # OCO 打咗 — 搵出場 trade
-        trades = _signed_request("GET", "/api/v3/myTrades", {"symbol": "BTCUSDT"}, key, secret)
-        t = sorted(trades, key=lambda x: x["time"])
-        exit_trades = [x for x in t if x["orderId"] in legs_gone]
-        if not exit_trades:
+
+        # 唔喺 openOrders → 攞最終狀態
+        try:
+            o = _signed_request("GET", "/api/v3/order",
+                                {"symbol": "BTCUSDT", "orderId": oid}, key, secret)
+        except urllib.error.HTTPError:
+            o = None
+        st = (o or {}).get("status", "")
+        exec_qty = float((o or {}).get("executedQty") or 0)
+        if st == "FILLED" or exec_qty > 0:
+            # 限價成交 (可能部分) → 建 3 段 exit
+            if st not in ("FILLED",):
+                # 部分成交: cancel 剩餘, 用已成交 qty 建 exit
+                try:
+                    _signed_request("DELETE", "/api/v3/order",
+                                    {"symbol": "BTCUSDT", "orderId": oid}, key, secret)
+                except urllib.error.HTTPError:
+                    pass
+            cum_quote = float((o or {}).get("cummulativeQuoteQty") or 0)
+            fill_px = (cum_quote / exec_qty) if exec_qty else float(rec.get("limit_px") or 0)
+            fee_paid = 0.0
+            try:
+                for t in _signed_request("GET", "/api/v3/myTrades",
+                                         {"symbol": "BTCUSDT", "limit": 100}, key, secret):
+                    if t.get("orderId") == oid:
+                        fee_paid += float(t.get("commission") or 0)
+            except urllib.error.HTTPError:
+                pass
+            rec["qty"] = exec_qty
+            rec["entry_fill"] = round(fill_px, 2)
+            rec["fee"] = fee_paid
+            rec["filled_time"] = now_iso
+            rec["status"] = "LIMIT_FILLED"
+            rec["was_limit_fill"] = True
+            rec["rr_fill"] = (round(abs(rec["planned_tp1"] - fill_px)
+                                    / abs(fill_px - rec["planned_stop"]), 2)
+                              if rec.get("planned_tp1") and fill_px != rec.get("planned_stop")
+                              else None)
+            # ── 2026-09-20 fix: 成交即刻寫 log, 唔等成個 loop 行完 ──────────────
+            # 舊寫法: 呢個 for 迴圈行完才一次過 save_log。迴圈內每個成交都要
+            # build_exit_legs (2-3 次 API, 實測 1-2 秒) → 期間 log 完全冇記錄,
+            # 令同 tick 之後嘅 setup (同 tick 之後嘅 reconcile) 見到「冇 live 倉」
+            # 而繞過 same_pattern / same_side / opp_side guard。
+            # 實證 (2026-08-29~08-31): 4 對同 pattern 重疊倉, seeded_time 相隔 1-2 秒,
+            # log 由頭到尾冇一筆 same_pattern skip 記錄。
+            rec["status"] = "ENTRY_FILLED_PENDING_EXITS"
+            save_log(log_d)
+            lot_step, _lm, _mn = exchange_filters(key, secret)
+            rec, _ = build_exit_legs(rec, key, secret, lot_step)
+            changed.append(rec)
+            dirty = True
             continue
-        exit_px = sum(float(x["price"]) * float(x["qty"]) for x in exit_trades) / sum(float(x["qty"]) for x in exit_trades)
-        exit_qty = sum(float(x["qty"]) for x in exit_trades)
-        exit_fee = sum(float(x["commission"]) for x in exit_trades)
-        entry_px = rec["entry_fill"]
-        # R 計法: 風險 = |entry - planned_stop| × qty (USDT), 獲利/虧損同理
-        risk = abs(entry_px - float(rec["planned_stop"])) * exit_qty
-        pnl = (exit_px - entry_px) * exit_qty * (-1 if rec["side"] == "SELL" else 1)
-        r_mult = round(pnl / risk, 3) if risk > 0 else 0.0
-        rec.update({
-            "status": "CLOSED",
-            "exit_fill": round(exit_px, 2),
-            "exit_qty": exit_qty,
-            "exit_fee": exit_fee,
-            "pnl_usdt": round(pnl, 2),
-            "r_multiple": r_mult,
-            "closed_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "closed_via": "oco_leg_gone",
-        })
-        changed.append(rec)
-    if changed:
+        if st in ("CANCELED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"):
+            rec["status"] = "LIMIT_CANCELLED"
+            rec["closed_note"] = f"限價單 {st} (未成交)"
+            rec["closed_time"] = now_iso
+            rec["closed_via"] = "limit_" + st.lower()
+            changed.append(rec)
+            dirty = True
+            continue
+        # 狀態不明 (API 冇回應等) → 下個 tick 再試
+
+    for rec in log_d["orders"]:
+        # 舊格式 (oco_leg_ids) → migration 到 exit_leg_ids (GLM review #C1:
+        # 唔 migrate 嘅舊單會永久佔住 cap 1 名額, 癱瘓新開倉)
+        if rec.get("status") == "OCO_PLACED" and not rec.get("exit_leg_ids") and rec.get("oco_leg_ids"):
+            rec["exit_leg_ids"] = list(rec["oco_leg_ids"])
+            # 舊格式 = 單一 OCO 全倉 = OCO_A (DSv4 review #E: 舊單 breakeven 保護)
+            rec.setdefault("oco_a_leg_ids", list(rec["oco_leg_ids"]))
+            dirty = True
+        if rec.get("status") != "OCO_PLACED" or not rec.get("exit_leg_ids"):
+            continue
+        legs_gone = [i for i in rec["exit_leg_ids"] if i not in open_ids]
+        done_ids = set(rec.get("closed_leg_ids") or [])
+        new_gone = [i for i in legs_gone if i not in done_ids]
+        # ── testnet 帳戶重置偵測 (2026-09-09 實證) ──────────────────────
+        # 全部 exit legs 唔喺 openOrders + 完全冇 open orders + entry 成交都喺
+        # myTrades 消失 → Binance testnet 維護重置咗帳戶 (成交歷史被清空)。
+        # 唔處理嘅後果: log 永遠當佢 live → cap 1 名額被幻影倉永久佔住,
+        # 系統之後永遠唔開新倉, 整點報告出假浮動 (09-10 實測 -1.19 假數)。
+        if rec["exit_leg_ids"] and len(legs_gone) == len(rec["exit_leg_ids"]) and not opens:
+            trades_all = _signed_request("GET", "/api/v3/myTrades",
+                                         {"symbol": "BTCUSDT", "limit": 1000}, key, secret)
+            entry_id = rec.get("order_id")
+            entry_gone = (not entry_id) or not any(x["orderId"] == entry_id for x in trades_all)
+            remaining_chk = round(rec.get("qty", 0) - (rec.get("realized_qty") or 0.0), 8)
+            if entry_gone and remaining_chk > 1e-8:
+                rec["status"] = "WIPED"
+                rec["closed_via"] = "testnet_account_reset"
+                rec["wiped_remaining_qty"] = remaining_chk
+                rec["wiped_note"] = "exit legs + entry 成交全部消失 (testnet 帳戶重置)"
+                rec["closed_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                # 唔 append 入 HISTORY → 唔計入 sumR / 勝率 (realized_parts 保留做記錄)
+                dirty = True
+                wiped.append(rec)
+                continue
+        if new_gone:
+            # OCO_A legs 消失 → 判斷係 TP 定 SL 成交 (TP 成交先推 breakeven)
+            oco_a_ids = rec.get("oco_a_leg_ids") or []
+            if oco_a_ids and all(i in set(new_gone) | done_ids for i in oco_a_ids):
+                rec["oco_a_gone"] = True
+            trades = _signed_request("GET", "/api/v3/myTrades", {"symbol": "BTCUSDT"}, key, secret)
+            t = sorted(trades, key=lambda x: x["time"])
+            exit_trades = [x for x in t if x["orderId"] in new_gone]
+            if exit_trades:
+                exit_qty = sum(float(x["qty"]) for x in exit_trades)
+                exit_px = sum(float(x["price"]) * float(x["qty"]) for x in exit_trades) / exit_qty
+                # fee 逐筆按 commissionAsset 換算 (MIXED 都啱 — DSv4 review #B)
+                fee_usdt = sum(
+                    (float(x["commission"])
+                     if str(x.get("commissionAsset", "BTC")).upper() == "USDT"
+                     else float(x["commission"]) * float(x["price"]))
+                    for x in exit_trades)
+                # OCO_A 成交判定: exit price 向 TP 方向行 = TP hit, 向 SL = stop hit
+                tp1 = rec.get("planned_tp1")
+                if rec.get("oco_a_gone") and tp1:
+                    if (rec["side"] == "BUY" and exit_px >= float(tp1) * 0.9985) or \
+                       (rec["side"] == "SELL" and exit_px <= float(tp1) * 1.0015):
+                        rec["oco_a_tp_hit"] = True
+                rec["closed_leg_ids"] = sorted(done_ids | set(new_gone))
+                rec["realized_qty"] = round((rec.get("realized_qty") or 0.0) + exit_qty, 8)
+                rec["realized_pnl"] = round((rec.get("realized_pnl") or 0.0)
+                                            + _pnl_of(rec, exit_px, exit_qty, fee_usdt, "USDT"), 2)
+                rec["exit_fee"] = round((rec.get("exit_fee") or 0.0) + fee_usdt, 8)
+                rec.setdefault("realized_parts", []).append({
+                    "qty": exit_qty, "price": round(exit_px, 2), "fee": fee_usdt,
+                    "fee_asset": "USDT(EQV)",
+                    "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                })
+                dirty = True
+            else:
+                # leg 消失但搵唔到 trade (例如被 cancel) — mark done 避免每 tick 重查
+                rec["closed_leg_ids"] = sorted(done_ids | set(new_gone))
+                dirty = True
+        remaining = round(rec.get("qty", 0) - (rec.get("realized_qty") or 0.0), 8)
+        if remaining <= 1e-8:
+            rec["status"] = "CLOSED"
+            rec["exit_qty"] = rec.get("realized_qty")
+            # exit_fill = realized_parts 加權平均 exit price (bug fix 09-04:
+            # 之前冇 set → main() c['exit_fill'] KeyError crash)
+            parts = rec.get("realized_parts") or []
+            if parts:
+                pq = sum(float(p["qty"]) for p in parts)
+                if pq > 0:
+                    rec["exit_fill"] = round(sum(float(p["price"]) * float(p["qty"]) for p in parts) / pq, 2)
+            else:
+                rec["exit_fill"] = rec.get("exit_fill") or rec.get("entry_fill")
+            risk = abs(rec["entry_fill"] - float(rec["planned_stop"])) * rec["qty"]
+            rec["pnl_usdt"] = round((rec.get("realized_pnl") or 0.0)
+                                    - (rec.get("fee") or 0.0) * rec["entry_fill"], 2)
+            rec["r_multiple"] = round(rec["pnl_usdt"] / risk, 3) if risk > 0 else 0.0
+            rec["closed_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            rec["closed_via"] = "oco_legs_all_gone"
+            changed.append(rec)
+        else:
+            before = json.dumps(rec, sort_keys=True, default=str)
+            _breakeven_remaining(rec, open_map, key, secret)
+            _trail_leg(rec, open_map, key, secret)
+            if json.dumps(rec, sort_keys=True, default=str) != before:
+                dirty = True
+    if changed or dirty:
         save_log(log_d)
-        # 追加 closed history
-        hist = json.load(open(HISTORY)) if os.path.exists(HISTORY) else {"trades": []}
-        hist["trades"].extend(changed)
-        with open(HISTORY, "w") as f:
-            json.dump(hist, f, ensure_ascii=False, indent=2)
-    return changed
+    if changed:
+        # 追加 closed history — **只計真正平倉嘅單**。
+        # feat/limit-entry: LIMIT_EXPIRED / LIMIT_CANCELLED 係「掛單未成交就取消」,
+        # 冇 trade 過、冇 PnL, 寫入 HISTORY 會污染 sumR / 勝率 (佢哋冇 r_multiple)。
+        closed_recs = [r for r in changed if r.get("status") == "CLOSED"]
+        if closed_recs:
+            hist = json.load(open(HISTORY)) if os.path.exists(HISTORY) else {"trades": []}
+            hist["trades"].extend(closed_recs)
+            with open(HISTORY, "w") as f:
+                json.dump(hist, f, ensure_ascii=False, indent=2)
+    return changed, wiped
 
 
 def main():
@@ -97,9 +512,27 @@ def main():
         return
 
     # 1. reconcile
-    closed = reconcile_cycle(key, secret)
+    closed, wiped = reconcile_cycle(key, secret)
     for c in closed:
-        log(f"🔒 CLOSED {c['side']} {c['pattern'][:18]} exit={c['exit_fill']} pnl={c['pnl_usdt']}USDT R={c['r_multiple']}")
+        st = c.get("status")
+        # .get() 防禦 — 任何缺 field 都唔可以 crash 個 watchdog (bug fix 09-04)
+        if st == "CLOSED":
+            log(f"🔒 CLOSED {c.get('side','?')} {(c.get('pattern') or '?')[:18]} "
+                f"exit={c.get('exit_fill')} pnl={c.get('pnl_usdt')}USDT R={c.get('r_multiple')}")
+        elif c.get("was_limit_fill"):
+            log(f"🎯 限價成交 {c.get('side','?')} {(c.get('pattern') or '?')[:18]} "
+                f"@ {c.get('entry_fill')} (掛單 {c.get('limit_px')}) → "
+                f"3 段 exit 已建 (RR {c.get('rr_fill')})")
+        elif st == "LIMIT_EXPIRED":
+            log(f"⌛ 限價過期 cancel {c.get('side','?')} {(c.get('pattern') or '?')[:18]} "
+                f"@ {c.get('limit_px')} — {c.get('closed_note')}")
+        elif st == "LIMIT_CANCELLED":
+            log(f"🚫 限價單取消 {c.get('side','?')} {(c.get('pattern') or '?')[:18]} "
+                f"@ {c.get('limit_px')} — {c.get('closed_note')}")
+    for w in wiped:
+        log(f"🧹 WIPED {w.get('side','?')} {(w.get('pattern') or '?')[:18]} "
+            f"entry={w.get('entry_fill')} remaining={w.get('wiped_remaining_qty')} "
+            f"(testnet 帳戶重置 — 唔計入 sumR, cap 1 已釋放)")
 
     # 2. 引擎掃描
     out = sh("python3 btc_engine.py 2>&1 | tail -30")
@@ -112,7 +545,7 @@ def main():
     if out2.strip():
         log(f"掃描結果: {out2.strip().splitlines()[-1]}")
     for line in out2.splitlines():
-        if any(k in line for k in ("✅", "🚫", "❌", "[DRY]")):
+        if any(k in line for k in ("✅", "🚫", "❌", "[DRY]", "📌", "⚠️")):
             log(line.strip())
 
     # 4. 每日統計
