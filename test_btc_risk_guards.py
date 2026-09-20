@@ -83,27 +83,30 @@ lg = btp.load_log()
 check(len(lg["orders"]) == 1, "更新唔會重複 append", f"len={len(lg['orders'])}")
 check(lg["orders"][0]["status"] == "OCO_PLACED", "狀態已更新")
 
-print("\n=== C. guard 會擋：重現 08-29 情境 ===")
+print("\n=== C. guard 會擋（call 生產嘅 guards_allow，唔係 test 自己實作）===")
+# ⚠️ 2026-09-20 GLM review: 第一版喺 test 入面重新實作過濾邏輯 → 測緊自己,
+# mutation 刪走 main() 嘅 check 都捉唔到。而家直接 call 生產嘅 guards_allow()。
 reset_log()
-# 第一筆已 live（同 pattern、同方向）
 btp._log_upsert({"order_id": 9646238, "pattern": "🚩 Bear Flag (熊旗)", "side": "SELL",
                  "status": "OCO_PLACED", "entry_fill": 77666.0})
-live = [o for o in btp.load_log()["orders"] if btp.is_live_rec(o)]
-s = {"pattern": "🚩 Bear Flag (熊旗)", "btc_side": "SELL"}
-same_pattern = [o for o in live if o.get("pattern") == s.get("pattern")]
-same_side = [o for o in live if o.get("side") == s["btc_side"]]
-opp_side = [o for o in live if o.get("side") != s["btc_side"]]
-check(bool(same_pattern), "同 pattern 會被擋 (08-29 第二筆而家入唔到)")
-check(bool(same_side), "同方向會被擋")
-check(not opp_side, "同方向時 opp_side 為空 (唔會誤擋)")
+s_same = {"pattern": "🚩 Bear Flag (熊旗)", "btc_side": "SELL"}
+allow, why = btp.guards_allow(btp.load_log(), s_same)
+check(not allow, f"同 pattern 被擋 ({why})")
+check("same_pattern" in why, "擋嘅理由指名 same_pattern", why)
 
-# 反向情境
+s_same2 = {"pattern": "🚩 Bull Flag (牛旗)", "btc_side": "SELL"}
+allow, why = btp.guards_allow(btp.load_log(), s_same2)
+check(not allow, f"同方向 (唔同 pattern) 被擋 ({why})")
+check("同向" in why or "cap" in why, "擋嘅理由指名同向上限", why)
+
+s_opp = {"pattern": "🚩 Bull Flag (牛旗)", "btc_side": "BUY"}
+allow, why = btp.guards_allow(btp.load_log(), s_opp)
+check(not allow, f"反向被擋 ({why})")
+check("反向" in why, "擋嘅理由指名反向", why)
+
 reset_log()
-btp._log_upsert({"order_id": 1, "pattern": "🚩 Bull Flag (牛旗)", "side": "BUY",
-                 "status": "OCO_PLACED", "entry_fill": 80000.0})
-live = [o for o in btp.load_log()["orders"] if btp.is_live_rec(o)]
-opp = [o for o in live if o.get("side") != "SELL"]
-check(bool(opp), "反向會被擋")
+allow, why = btp.guards_allow(btp.load_log(), s_same)
+check(allow, "冇任何 live 倉時放行")
 
 # Bug 2 情境: FLATTENED_OCO_FAILED 而家要當 live
 reset_log()
@@ -111,6 +114,8 @@ btp._log_upsert({"order_id": 2, "pattern": "📐 Ascending Triangle (上升三�
                  "side": "BUY", "status": "FLATTENED_OCO_FAILED", "entry_fill": 78086.0})
 live = [o for o in btp.load_log()["orders"] if btp.is_live_rec(o)]
 check(len(live) == 1, "FLATTENED_OCO_FAILED 而家算 live (舊版算冇倉)")
+allow, why = btp.guards_allow(btp.load_log(), {"pattern": "x", "btc_side": "BUY"})
+check(not allow, "孤兒狀態會擋新單 (fail-closed 生效)")
 
 print("\n=== D. 每日 -R hard stop ===")
 check(btp.MAX_DAILY_LOSS_R == 3.0, f"MAX_DAILY_LOSS_R = 3.0", str(btp.MAX_DAILY_LOSS_R))
@@ -243,6 +248,76 @@ check("MAX_DAILY_LOSS_R" in src and "BTC_MAX_DAILY_LOSS_R" in src,
       "門檻可由環境變數覆蓋")
 check("daily_loss_brake" in src.split("def daily_loss_brake")[1],
       "daily_loss_brake 有被引用 (唔係死代碼)")
+
+print("\n=== H. 孤兒狀態復原（GLM #1: fail-closed 必須有復原路徑）===")
+reset_log()
+btp._log_upsert({"order_id": 11, "pattern": "A", "side": "BUY",
+                 "status": "FLATTENED_OCO_FAILED", "entry_fill": 80000.0})
+btp._log_upsert({"order_id": 12, "pattern": "B", "side": "BUY",
+                 "status": "OCO_FAILED", "entry_fill": 80100.0})
+btp._log_upsert({"order_id": 13, "pattern": "C", "side": "BUY",
+                 "status": "CLOSED", "entry_fill": 80200.0})
+# 情境 1: exchange 冇倉 → 孤兒歸 CLOSED (引擎解鎖)
+lg = btp.load_log()
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.0)
+check(summ["closed_orphan"] == 2, f"2 個孤兒歸 CLOSED", str(summ))
+check(not any(o.get("status") == "FLATTENED_OCO_FAILED" for o in lg["orders"]),
+      "FLATTENED_OCO_FAILED 已復原")
+check(all(btp.is_live_rec(o) is False for o in lg["orders"]),
+      "全部記錄唔再當 live (引擎解鎖)")
+check(any(o.get("resolved_via") == "no_position" for o in lg["orders"]),
+      "有標記 resolved_via=no_position (可審計)")
+check(len(changed) == 2 and summ["closed_orphan"] == 2,
+      f"回傳 changed 有 2 筆 (唔可以丟棄改動)", f"changed={len(changed)}")
+# CLOSED 唔應該被改
+check(any(o.get("order_id") == 13 and o.get("resolved_via") is None for o in lg["orders"]),
+      "本來已 CLOSED 嘅單唔會被改")
+
+# 情境 2: exchange 有倉 + 冇 rebuild → 標 needs_legs, 唔會靜默
+reset_log()
+btp._log_upsert({"order_id": 21, "pattern": "A", "side": "BUY",
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001)
+check(summ["needs_legs"] == 1, "有倉 + 冇 rebuild → needs_legs=1", str(summ))
+check(lg["orders"][0].get("needs_legs") is True, "標記 needs_legs (唔會靜默裸掛)")
+check(btp.is_live_rec(lg["orders"][0]), "有倉嘅孤兒仍然當 live (唔會誤放行)")
+
+# 情境 3: held_qty 未知 (None) → 一律 skip, 唔改
+reset_log()
+btp._log_upsert({"order_id": 31, "pattern": "A", "side": "BUY",
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+changed, summ = btp.resolve_orphan_states(lg, held_qty=None)
+check(summ["skipped"] == 1 and summ["closed_orphan"] == 0,
+      "倉位未知時唔會亂改 (skip)", str(summ))
+check(btp.is_live_rec(lg["orders"][0]), "未知時維持 live (fail-closed 保守)")
+
+print("\n=== I. reconcile 路徑時序（GLM #3: 主案發現場喺 btc_auto_trade_cycle）===")
+# 呢個係真正出 08-29 事嘅路徑: btc_auto_trade_cycle.reconcile_cycle 處理 LIMIT 成交。
+# 舊 code: for loop 行完才 save_log → 每個成交 build_exit_legs (1-2 秒) 期間 log 冇記錄。
+import re as _re
+CYCLE = os.path.join(REPO, "btc_auto_trade_cycle.py")
+csrc = open(CYCLE, encoding="utf-8").read()
+# 斷言 fix 存在: 成交偵測段 (status=LIMIT_FILLED) 之後、build_exit_legs 之前有 save_log
+m = _re.search(r'rec\["status"\]\s*=\s*"ENTRY_FILLED_PENDING_EXITS"\s*\n\s*save_log\(log_d\)',
+               csrc)
+check(m is not None,
+      "reconcile 成交段有『成交即寫 log』(ENTRY_FILLED_PENDING_EXITS + save_log)")
+if m:
+    after = csrc[m.end():m.end() + 300]
+    build_idx = after.find("build_exit_legs")
+    save_idx = after.find("save_log")
+    check(build_idx >= 0, "save_log 之後仍有 build_exit_legs (流程完整)")
+    check(save_idx == -1 or save_idx > build_idx,
+          f"下一次 save_log 喺 build_exit_legs 之後 (即係唔會早過建 OCO)",
+          f"save@{save_idx} build@{build_idx}")
+check("save_log(log_d)" in csrc,
+      "檔案有 save_log(log_d) (確認變數名正確)")
+# 反向: 確認原本嘅「loop 完才寫」已被改變 —— 統計 save_log 出現次數要 >= 2
+n_save = len(_re.findall(r"save_log\(log_d\)", csrc))
+check(n_save >= 2,
+      f"save_log(log_d) 出現 >= 2 次 (loop 中途 + loop 之後)", str(n_save))
 
 print("\n" + "=" * 70)
 print(f"總共 {N} 個斷言, {len(FAILS)} 個 FAIL")

@@ -221,7 +221,8 @@ def reconcile_cycle(key, secret):
     """
     from binance_testnet_paper import (_signed_request, load_log, save_log,
                                        build_exit_legs, exchange_filters,
-                                       current_price, LIMIT_TTL_HOURS)
+                                       current_price, LIMIT_TTL_HOURS,
+                                       resolve_orphan_states)
 
     log_d = load_log()
     changed = []
@@ -231,6 +232,24 @@ def reconcile_cycle(key, secret):
     open_ids = {o["orderId"] for o in opens}
     open_map = {o["orderId"]: o for o in opens}
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # ── fail-closed 復原 (2026-09-20 GLM review #1) ────────────────────────
+    # is_live_rec() 係 fail-closed: 唔喺 DONE_STATUS 就當 live。好處係唔會漏 guard,
+    # 但代價係「實際已經冇倉」嘅孤兒狀態會永久鎖死引擎 (所有新單被 same_side 擋)。
+    # 所以每次 reconcile 都用 exchange 實際持倉對帳: 冇倉 → 歸 CLOSED (解鎖);
+    # 有倉 → 標 needs_legs (唔會靜默裸掛, 亦唔會誤放行)。
+    try:
+        acct = _signed_request("GET", "/api/v3/account", {}, key, secret)
+        held = next((float(b["free"]) + float(b["locked"])
+                     for b in acct.get("balances", []) if b.get("asset") == "BTC"), 0.0)
+    except Exception:                                   # noqa: BLE001
+        held = None                                     # 查唔到 → resolve 會 skip
+    orph, orph_summ = resolve_orphan_states(log_d, held)
+    if orph:
+        changed.extend(orph)
+        dirty = True
+        log("🩹 孤兒狀態對帳: " + ", ".join(f"{k}={v}" for k, v in orph_summ.items() if v)
+            + f" (交易所持倉 {held})")
 
     # ── feat/limit-entry: 限價掛單對帳 (09-16) ─────────────────────────
     # 掛單喺 openOrders → 仲等緊；唔喺 → 查最終狀態 (FILLED → 建 3 段 exit /
@@ -306,6 +325,15 @@ def reconcile_cycle(key, secret):
                                     / abs(fill_px - rec["planned_stop"]), 2)
                               if rec.get("planned_tp1") and fill_px != rec.get("planned_stop")
                               else None)
+            # ── 2026-09-20 fix: 成交即刻寫 log, 唔等成個 loop 行完 ──────────────
+            # 舊寫法: 呢個 for 迴圈行完才一次過 save_log。迴圈內每個成交都要
+            # build_exit_legs (2-3 次 API, 實測 1-2 秒) → 期間 log 完全冇記錄,
+            # 令同 tick 之後嘅 setup (同 tick 之後嘅 reconcile) 見到「冇 live 倉」
+            # 而繞過 same_pattern / same_side / opp_side guard。
+            # 實證 (2026-08-29~08-31): 4 對同 pattern 重疊倉, seeded_time 相隔 1-2 秒,
+            # log 由頭到尾冇一筆 same_pattern skip 記錄。
+            rec["status"] = "ENTRY_FILLED_PENDING_EXITS"
+            save_log(log_d)
             lot_step, _lm, _mn = exchange_filters(key, secret)
             rec, _ = build_exit_legs(rec, key, secret, lot_step)
             changed.append(rec)

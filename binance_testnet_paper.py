@@ -156,10 +156,90 @@ DONE_STATUS = ("CLOSED", "LIMIT_EXPIRED", "LIMIT_CANCELLED", "SKIP_PREFLIGHT")
 # 11 日之中只有 1 日 ≤ -3R → -3R 唔會過度封鎖, 但會截斷最壞嘅日。
 MAX_DAILY_LOSS_R = float(os.environ.get("BTC_MAX_DAILY_LOSS_R", "3.0"))
 
+# 同方向並行上限。XAUUSD 用 3; BTC 維持 1 —— BTC 24/7 + 波動 3.4× 黃金,
+# 3 個同向倉嘅實際風險暴露大好多。用戶 09-04 放寬 XAUUSD 係針對黃金, 唔應自動套去 BTC。
+SAME_DIR_MAX = int(os.environ.get("BTC_SAME_DIR_MAX", "1"))
+
 
 def is_live_rec(o):
-    """呢筆記錄仲佔住倉位嗎? fail-closed: 唔係明確完結就當 live。"""
+    """呢筆記錄仲佔住倉位嗎? fail-closed: 唔係明確完結就當 live。
+
+    ⚠️ fail-closed 嘅代價: 一個「唔喺 DONE_STATUS 但實際已經冇倉」嘅狀態會永久
+    鎖死引擎 (所有新單被 same_side guard 擋)。所以必須有復原路徑 ——
+    見 resolve_orphan_states(): 用 exchange 實際倉位/成交對帳, 有倉就重建 legs,
+    冇倉就歸 CLOSED。2026-09-20 GLM review 指出, 呢個係 fail-closed 嘅必要配套。
+    """
     return str(o.get("status") or "") not in DONE_STATUS
+
+
+# 需要對帳復原嘅「孤兒」狀態: 卡住但可能已經冇倉 (或者冇止損裸掛)
+ORPHAN_STATUS = ("FLATTENED_OCO_FAILED", "OCO_FAILED", "ENTRY_FILLED_PENDING_EXITS",
+                 "FILLED_ENTRY", "LIMIT_FILLED", "WIPED")
+
+
+def resolve_orphan_states(log, held_qty, key=None, secret=None, lot_step=None,
+                          rebuild=None):
+    """對帳孤兒狀態 —— fail-closed 嘅復原路徑。
+
+    held_qty: exchange 上實際持倉數量 (正 = 有倉)。0 = 冇倉。
+    對每個孤兒狀態:
+      - 冇倉 (held_qty <= 0)  → 歸 CLOSED (釋放 cap), 標 resolved_via="no_position"
+      - 有倉                  → 若 rebuild 提供, 重建 exit legs; 否則標 needs_legs=True
+                                令引擎知道呢個倉未被管理 (唔會靜默)
+    回傳 (changed_list, summary dict)。
+    """
+    changed = []
+    summary = {"closed_orphan": 0, "rebuilt": 0, "needs_legs": 0, "skipped": 0}
+    for rec in log.get("orders", []):
+        st = str(rec.get("status") or "")
+        if st not in ORPHAN_STATUS:
+            continue
+        if held_qty is None:
+            summary["skipped"] += 1
+            continue
+        if held_qty <= 0:
+            rec["status"] = "CLOSED"
+            rec["resolved_via"] = "no_position"
+            rec["resolved_ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            rec.setdefault("closed_note", "孤兒狀態復原: exchange 冇倉 → 歸 CLOSED")
+            changed.append(rec)
+            summary["closed_orphan"] += 1
+        else:
+            if rebuild is not None:
+                try:
+                    rebuild(rec)
+                    summary["rebuilt"] += 1
+                except Exception as e:            # noqa: BLE001
+                    rec["rebuild_error"] = f"{type(e).__name__}: {e}"
+                    rec["needs_legs"] = True
+                    summary["needs_legs"] += 1
+                changed.append(rec)
+            else:
+                rec["needs_legs"] = True
+                summary["needs_legs"] += 1
+                changed.append(rec)
+    return changed, summary
+
+
+def guards_allow(log, setup, same_dir_max=1):
+    """落單前 guard 決策 —— 抽成純函數以便測試。
+
+    ⚠️ 2026-09-20 GLM review: 之前 guard 邏輯 inline 喺 main() 裏面, 令 test 只能
+    「喺 test 裏面重新實作一次」→ 測緊自己, mutation 刪走 main() 嘅 check 都捉唔到。
+    抽成函數之後 test 直接 call 呢個, 先算真牙。
+
+    回傳 (allow: bool, reason: str)。
+    """
+    live = [o for o in log.get("orders", []) if is_live_rec(o)]
+    if any(o.get("pattern") == setup.get("pattern") for o in live):
+        return False, f"same_pattern 已 live, 限 {1} 單"
+    if any(o.get("side") != setup.get("btc_side") for o in live):
+        opp = [o for o in live if o.get("side") != setup.get("btc_side")]
+        return False, f"有一邊向 {opp[0].get('side')} live 倉, 唔開反向"
+    same = [o for o in live if o.get("side") == setup.get("btc_side")]
+    if len(same) >= same_dir_max:
+        return False, f"同向 live 已 {len(same)} 單 (cap {same_dir_max})"
+    return True, ""
 
 
 def daily_realized_r(log, day=None):
@@ -671,18 +751,11 @@ def main():
               f"— 每日虧損硬煞停, 今日唔再開新倉")
         return
     for s in todo:
-        live = [o for o in load_log()["orders"] if is_live_rec(o)]
-        same_pattern = [o for o in live if o.get("pattern") == s.get("pattern")]
-        same_side = [o for o in live if o.get("side") == s["btc_side"]]
-        opp_side = [o for o in live if o.get("side") != s["btc_side"]]
-        if same_pattern:
-            print(f"🚫 {s.get('pattern','?')} skip — 同 pattern 已 live, 限 1 單")
-            continue
-        if opp_side:
-            print(f"🚫 {s.get('pattern','?')} skip — 有一邊向 {opp_side[0]['side']} live 倉, 唔開反向")
-            continue
-        if same_side:
-            print(f"🚫 {s.get('pattern','?')} skip — 同向 live 已 1 單 (cap)")
+        # guard 邏輯抽咗去 guards_allow() —— 令 test 可以 call 生產嘅同一份邏輯。
+        # 可用 BTC_SAME_DIR_MAX 覆蓋同向上限 (預設 1)。
+        allow, why = guards_allow(load_log(), s, same_dir_max=SAME_DIR_MAX)
+        if not allow:
+            print(f"🚫 {s.get('pattern','?')} skip — {why}")
             continue
         # RR hard gate — 落單前最後防線 (歷史單 RR<1.2 全部贏細輸大); 冇 TP1 一律拒
         rr = _compute_rr(s)
