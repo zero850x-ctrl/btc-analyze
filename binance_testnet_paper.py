@@ -19,6 +19,7 @@ import hmac
 import json
 import os
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -145,10 +146,8 @@ def load_log():
 
 
 # status 分類 (2026-09-20): guard 一律 fail-closed —— 唔喺明確「已完結」清單就當 still-live。
-# 舊寫法用白名單 (FILLED_ENTRY/OCO_PLACED/LIMIT_PENDING), 令 FLATTENED_OCO_FAILED /
-# OCO_FAILED 呢啲「可能仲喺市場」嘅狀態被當成冇倉 → 反向/同向 guard 全部失效。
-LIVE_STATUS = ("FILLED_ENTRY", "ENTRY_FILLED_PENDING_EXITS", "OCO_PLACED", "LIMIT_PENDING",
-               "LIMIT_FILLED", "FLATTENED_OCO_FAILED", "OCO_FAILED", "WIPED")
+# F5 (GLM 第三輪): 原本仲有一個 LIVE_STATUS tuple 但冇任何消費者 —— 已刪 (死代碼,
+# 而且「WIPED 當 live」呢個政策決定藏喺死 tuple 入面, 會誤導讀者)。
 # 明確「已完結」= 唔再佔用倉位 (其餘一律當 live)
 DONE_STATUS = ("CLOSED", "LIMIT_EXPIRED", "LIMIT_CANCELLED", "SKIP_PREFLIGHT")
 
@@ -177,47 +176,145 @@ ORPHAN_STATUS = ("FLATTENED_OCO_FAILED", "OCO_FAILED", "ENTRY_FILLED_PENDING_EXI
                  "FILLED_ENTRY", "LIMIT_FILLED", "WIPED")
 
 
-def resolve_orphan_states(log, held_qty, key=None, secret=None, lot_step=None,
-                          rebuild=None):
+def estimate_held_for(rec, acct_btc, live_recs):
+    """估算某一筆記錄自己嘅持倉 = 帳戶總額 − 其他 live 記錄嘅 qty (>=0)。
+
+    ⚠️ 2026-09-20 GLM 第三輪 F1: 抽出嚟係為了可測。
+    ⚠️ 2026-09-20 GLM 第四輪 HIGH: 之前 `mine <= 0` 時回**全個帳戶餘額** ——
+       一筆冇 qty 欄位嘅舊孤兒會被估成「持有全帳戶」→ 永遠判定有倉 → rebuild。
+       兩筆咁嘅記錄 = 兩筆都各自「持有全帳戶」。呢個正正係 F1 想消滅嘅
+       aggregate-as-per-record 錯誤, 只係換咗觸發條件。
+       修法: qty 缺失 = 冇法歸因 → 回 None (caller 當「未知」freeze, 唔估)。
+    acct_btc=None → None。
+    """
+    if acct_btc is None:
+        return None
+    try:
+        mine = float(rec.get("qty") or 0.0)
+    except (TypeError, ValueError):
+        mine = 0.0
+    if mine <= 0:
+        return None                 # 冇 qty = 冇法歸因, 唔估 (GLM 第四輪 HIGH)
+    others = 0.0
+    for o in live_recs or []:
+        if o is rec:
+            continue
+        try:
+            others += float(o.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return max(0.0, acct_btc - others)
+
+
+def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None):
     """對帳孤兒狀態 —— fail-closed 嘅復原路徑。
 
-    held_qty: exchange 上實際持倉數量 (正 = 有倉)。0 = 冇倉。
-    對每個孤兒狀態:
-      - 冇倉 (held_qty <= 0)  → 歸 CLOSED (釋放 cap), 標 resolved_via="no_position"
-      - 有倉                  → 若 rebuild 提供, 重建 exit legs; 否則標 needs_legs=True
-                                令引擎知道呢個倉未被管理 (唔會靜默)
-    回傳 (changed_list, summary dict)。
+    held_qty: exchange 上實際持倉數量。需要 per-record 判斷時傳一個 callable
+              `held_qty(rec) -> float|None` (2026-09-20 GLM review B: 一個 scalar
+              對 N 個孤兒記錄係語意錯配 —— 兩個孤兒一個有倉一個冇倉時唔應該同樣處理)。
+              傳純 scalar 亦可 (向後兼容), 但要知道所有孤兒會同樣對待。
+    dust_eps: 低於此數量當「冇倉」(testnet dust / 其他倉嘅 SELL leg 鎖住嘅 BTC)。
+    rebuild:  有倉時嘅補建函數 (通常 build_exit_legs)。冇傳 = 只標記, 唔會靜默。
+
+    回傳 (changed_list, summary)。
     """
     changed = []
-    summary = {"closed_orphan": 0, "rebuilt": 0, "needs_legs": 0, "skipped": 0}
+    summary = {"closed_orphan": 0, "rebuilt": 0, "needs_legs": 0, "skipped": 0,
+               "frozen_unknown": 0, "frozen_ambiguous": 0}
+
+    # ── 模糊歸因前置檢查 (2026-09-20 GLM 第四輪 MEDIUM) ────────────────────
+    # 如果孤兒 qty 總和 > 帳戶餘額, 逐筆估出嚟嘅持倉**唔可能同時啱** (每人各分到
+    # 一部分, 但實際只夠一筆)。呢個情況下自動行動就係賭博 → 整批 freeze。
+    orphans = [r for r in log.get("orders", [])
+               if str(r.get("status") or "") in ORPHAN_STATUS]
+    if isinstance(held_qty, (int, float)) and held_qty is not None:
+        _acct = float(held_qty)
+    else:
+        _acct = None
+    if _acct is not None:
+        try:
+            _sum_orph = sum(float(r.get("qty") or 0.0) for r in orphans)
+        except (TypeError, ValueError):
+            _sum_orph = None
+        if _sum_orph is not None and _sum_orph > _acct + dust_eps and len(orphans) > 1:
+            for rec in orphans:
+                rec["needs_manual_reconcile"] = True
+                rec["needs_legs"] = True
+                rec["ambiguous_reason"] = (
+                    f"孤兒 qty 總和 {_sum_orph:.5f} > 帳戶 {_acct:.5f} — 歸因模糊, freeze")
+                changed.append(rec)
+            summary["frozen_ambiguous"] = len(orphans)
+            summary["needs_legs"] = len(orphans)
+            return changed, summary
+
     for rec in log.get("orders", []):
         st = str(rec.get("status") or "")
         if st not in ORPHAN_STATUS:
             continue
-        if held_qty is None:
+        if callable(held_qty):
+            h = held_qty(rec)
+        else:
+            h = held_qty
+        if h is None:
             summary["skipped"] += 1
             continue
-        if held_qty <= 0:
+        if float(h) <= dust_eps:
             rec["status"] = "CLOSED"
             rec["resolved_via"] = "no_position"
             rec["resolved_ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             rec.setdefault("closed_note", "孤兒狀態復原: exchange 冇倉 → 歸 CLOSED")
             changed.append(rec)
             summary["closed_orphan"] += 1
-        else:
-            if rebuild is not None:
-                try:
-                    rebuild(rec)
-                    summary["rebuilt"] += 1
-                except Exception as e:            # noqa: BLE001
-                    rec["rebuild_error"] = f"{type(e).__name__}: {e}"
-                    rec["needs_legs"] = True
-                    summary["needs_legs"] += 1
-                changed.append(rec)
-            else:
+        elif rebuild is None:
+            # LOW-1 (GLM 第四輪): F3 嘅 freeze 檢查要喺 rebuild 檢查**之前**。
+            # 唔係嘅話 rebuild=None (lot_step 攞唔到) 時, 結果不明嘅
+            # FLATTENED_OCO_FAILED 只會標 needs_legs, 冇 needs_manual_reconcile
+            # → 「結果不明」嘅訊號唔見咗。
+            if st == "FLATTENED_OCO_FAILED" and rec.get("flatten_ok") is None:
+                rec["needs_manual_reconcile"] = True
+            rec["needs_legs"] = True
+            summary["needs_legs"] += 1
+            changed.append(rec)
+        elif rebuild is not None:
+            # F3 (GLM 第三輪): 結果不明嘅記錄唔可以自動行動。
+            # 9 筆 FLATTENED_OCO_FAILED 嘅 flatten_ok 係 None = 唔知 flatten 有冇成交
+            # = 唔知有冇倉。喺「唔知」嘅前提下自動補 SELL legs 可能賣走唔屬於呢筆嘅幣。
+            # 將未知轉成明確 hold + warning, 唔俾自動化路徑估。
+            if st == "FLATTENED_OCO_FAILED" and rec.get("flatten_ok") is None:
+                rec["needs_manual_reconcile"] = True
                 rec["needs_legs"] = True
                 summary["needs_legs"] += 1
+                summary["frozen_unknown"] = summary.get("frozen_unknown", 0) + 1
                 changed.append(rec)
+                continue
+            # 2026-09-20 GLM review A: 有倉孤兒必須真正補建 exit legs,
+            # 唔可以只標 needs_legs (冇消費者 = 死巷 → 倉永久裸掛冇止損)。
+            # F2: contract —— rebuild 必須令 rec 離開 ORPHAN_STATUS, 否則當失敗
+            # (免得每個 cycle 重複補建 → 重複 SELL legs)。
+            try:
+                before = str(rec.get("status") or "")
+                new_rec = rebuild(rec)
+                if isinstance(new_rec, tuple):
+                    new_rec = new_rec[0]
+                if isinstance(new_rec, dict) and new_rec is not rec:
+                    rec.update(new_rec)
+                now_st = str(rec.get("status") or "")
+                if now_st in ORPHAN_STATUS or now_st == before:
+                    raise RuntimeError(
+                        f"rebuild 冇令記錄離開孤兒狀態 (仍為 {now_st!r}) — 拒絕當成功")
+                rec.pop("needs_legs", None)
+                rec.pop("rebuild_error", None)
+                rec["rebuilt_legs_ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                summary["rebuilt"] += 1
+            except Exception as e:                       # noqa: BLE001
+                rec["rebuild_error"] = f"{type(e).__name__}: {e}"
+                rec["needs_legs"] = True
+                summary["needs_legs"] += 1
+            changed.append(rec)
+        else:
+            rec["needs_legs"] = True
+            summary["needs_legs"] += 1
+            changed.append(rec)
     return changed, summary
 
 
@@ -263,9 +360,27 @@ def daily_realized_r(log, day=None):
 
 
 def save_log(log):
+    """原子寫入 —— temp file + os.replace。
+
+    2026-09-20 GLM review: 原本直接 open(w) 寫, crash mid-write → log 爛/空 →
+    下個 tick load_log() 見 0 orders → guards_allow 全部放行 → 重複開倉。
+    加咗多個寫入點之後呢個窗口按比例變大, 所以要 atomic。
+    """
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-    with open(LOG_PATH, "w") as f:
-        json.dump(log, f, ensure_ascii=False, indent=2)
+    fd, tmp = tempfile.mkstemp(prefix=".orders.", suffix=".tmp",
+                               dir=os.path.dirname(LOG_PATH))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(log, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, LOG_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def daily_loss_brake(log, limit=None):
@@ -488,6 +603,17 @@ def place_signal_order(setup, key, secret, atr=None, mode=None):
     return build_exit_legs(rec, key, secret, lot_step)
 
 
+def _exit_cid(rec, tag):
+    """deterministic clientOrderId —— 令 exit legs 落單冪等。
+
+    2026-09-20 GLM 第四輪 BLOCKER 1: 冇冪等 id 嘅話, 「落咗單但 crash 喺
+    _log_upsert 之前」會令重試再落一套 legs (重複 SELL)。用同一 cid 重試時
+    Binance 會 reject (duplicate clientOrderId) → 天然冪等。
+    """
+    oid = rec.get("order_id") or rec.get("oco_id") or "x"
+    return f"EXIT-{oid}-{tag}"[:36]
+
+
 def build_exit_legs(rec, key, secret, lot_step):
     """已成交倉 (rec) → 建 3 段 exit: OCO_A(SL+TP1) / OCO_B(SL+TP2) / L3(尾倉 SL).
 
@@ -516,7 +642,7 @@ def build_exit_legs(rec, key, secret, lot_step):
     exit_orders = []   # (tag, ids) for cleanup
     leg_ids = []
 
-    def _oco_qty(sl_qty, tp_price):
+    def _oco_qty(sl_qty, tp_price, tag="A"):
         if sl_qty <= 0:
             return None
         if exit_side == "SELL":
@@ -527,6 +653,7 @@ def build_exit_legs(rec, key, secret, lot_step):
                 "stopPrice": f"{stop:.2f}",
                 "stopLimitPrice": f"{stop * 0.9985:.2f}",
                 "stopLimitTimeInForce": "GTC",
+                "listClientOrderId": _exit_cid(rec, tag),
             }, key, secret)
         return _signed_request("POST", "/api/v3/order/oco", {
             "symbol": SYMBOL, "side": "BUY",
@@ -535,11 +662,16 @@ def build_exit_legs(rec, key, secret, lot_step):
             "stopPrice": f"{stop:.2f}",
             "stopLimitPrice": f"{stop * 1.0015:.2f}",
             "stopLimitTimeInForce": "GTC",
+            "listClientOrderId": _exit_cid(rec, tag),
         }, key, secret)
 
     def _sl_only_qty(sl_qty):
         if sl_qty <= 0:
             return None
+        # clientOrderId 冪等 (2026-09-20 GLM 第四輪 BLOCKER 1):
+        # 落咗單但 crash 喺 _log_upsert 之前 → 本地唔知。重試時同一 clientOrderId
+        # 會被 exchange reject → 天然冪等, 唔會重複落 legs。
+        cid = _exit_cid(rec, "L3")
         if exit_side == "SELL":
             return _signed_request("POST", "/api/v3/order", {
                 "symbol": SYMBOL, "side": "SELL", "type": "STOP_LOSS_LIMIT",
@@ -547,6 +679,7 @@ def build_exit_legs(rec, key, secret, lot_step):
                 "stopPrice": f"{stop:.2f}",
                 "price": f"{stop * 0.9985:.2f}",
                 "timeInForce": "GTC",
+                "newClientOrderId": cid,
             }, key, secret)
         return _signed_request("POST", "/api/v3/order", {
             "symbol": SYMBOL, "side": "BUY", "type": "STOP_LOSS_LIMIT",
@@ -554,17 +687,18 @@ def build_exit_legs(rec, key, secret, lot_step):
             "stopPrice": f"{stop:.2f}",
             "price": f"{stop * 1.0015:.2f}",
             "timeInForce": "GTC",
+            "newClientOrderId": cid,
         }, key, secret)
 
     try:
-        oco_a = _oco_qty(q1, tp1) if tp1 else None
+        oco_a = _oco_qty(q1, tp1, "A") if tp1 else None
         if oco_a is not None:
             rec["oco_a_id"] = oco_a["orderListId"]
             ids_a = [o["orderId"] for o in oco_a.get("orders", [])]
             rec["oco_a_leg_ids"] = ids_a          # TP1 fill 偵測用 (breakeven trigger)
             leg_ids.extend(ids_a)
             exit_orders.append(("OCO_A", ids_a))
-        oco_b = _oco_qty(q2, tp2) if tp2 else None
+        oco_b = _oco_qty(q2, tp2, "B") if tp2 else None
         if oco_b is not None:
             rec["oco_b_id"] = oco_b["orderListId"]
             ids_b = [o["orderId"] for o in oco_b.get("orders", [])]

@@ -222,7 +222,8 @@ def reconcile_cycle(key, secret):
     from binance_testnet_paper import (_signed_request, load_log, save_log,
                                        build_exit_legs, exchange_filters,
                                        current_price, LIMIT_TTL_HOURS,
-                                       resolve_orphan_states)
+                                       resolve_orphan_states, is_live_rec,
+                                       DONE_STATUS, ORPHAN_STATUS, estimate_held_for)
 
     log_d = load_log()
     changed = []
@@ -233,23 +234,58 @@ def reconcile_cycle(key, secret):
     open_map = {o["orderId"]: o for o in opens}
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # ── fail-closed 復原 (2026-09-20 GLM review #1) ────────────────────────
+    # ── fail-closed 復原 (2026-09-20 GLM review #1 / A / B) ────────────────
     # is_live_rec() 係 fail-closed: 唔喺 DONE_STATUS 就當 live。好處係唔會漏 guard,
-    # 但代價係「實際已經冇倉」嘅孤兒狀態會永久鎖死引擎 (所有新單被 same_side 擋)。
-    # 所以每次 reconcile 都用 exchange 實際持倉對帳: 冇倉 → 歸 CLOSED (解鎖);
-    # 有倉 → 標 needs_legs (唔會靜默裸掛, 亦唔會誤放行)。
+    # 代價係「實際已經冇倉」嘅孤兒狀態會永久鎖死引擎 (所有新單被 same_side 擋)。
+    # 所以每次 reconcile 都對帳:
+    #   冇倉 (低於 dust) → 歸 CLOSED (解鎖)
+    #   有倉             → **真正補建 exit legs** (唔可以只標 needs_legs —— 冇消費者
+    #                      = 死巷, 倉會永久裸掛冇止損, 比原問題更危險)
+    # 用 per-record 持倉判斷 (GLM B/F1): 帳戶總額對 N 個孤兒係語意錯配。
+    # F1 修正: 之前 _held_for 完全冇讀 rec → 假 per-record。而家:
+    #   (1) 帳戶餘額喺 loop 外查**一次** (之前 N 個孤兒 = N 次 API call, rate limit 風險)
+    #   (2) 每筆扣除「其他仍 live 記錄」嘅 qty → 得出該筆自己嘅估算持倉
     try:
-        acct = _signed_request("GET", "/api/v3/account", {}, key, secret)
-        held = next((float(b["free"]) + float(b["locked"])
-                     for b in acct.get("balances", []) if b.get("asset") == "BTC"), 0.0)
+        lot_step, _lm, _mn = exchange_filters(key, secret)
     except Exception:                                   # noqa: BLE001
-        held = None                                     # 查唔到 → resolve 會 skip
-    orph, orph_summ = resolve_orphan_states(log_d, held)
+        lot_step = None
+    dust_eps = (lot_step * 10) if lot_step else 0.0001
+
+    try:
+        _acct = _signed_request("GET", "/api/v3/account", {}, key, secret)
+        _acct_btc = next((float(b["free"]) + float(b["locked"])
+                          for b in _acct.get("balances", []) if b.get("asset") == "BTC"), 0.0)
+    except Exception:                                   # noqa: BLE001
+        _acct_btc = None                                # 查唔到 → resolve 會 skip
+    _live_recs = [r for r in log_d["orders"] if is_live_rec(r)]
+
+    def _held_for(rec):
+        """該筆自己嘅估算持倉 —— 邏輯喺 estimate_held_for() (可測)。"""
+        return estimate_held_for(rec, _acct_btc, _live_recs)
+
+    def _rebuild(rec):
+        if lot_step is None:
+            raise RuntimeError("冇 lot_step, 唔敢建 legs")
+        return build_exit_legs(rec, key, secret, lot_step)
+
+    orph, orph_summ = resolve_orphan_states(
+        log_d, _held_for, dust_eps=dust_eps,
+        rebuild=_rebuild if lot_step is not None else None)
     if orph:
         changed.extend(orph)
         dirty = True
         log("🩹 孤兒狀態對帳: " + ", ".join(f"{k}={v}" for k, v in orph_summ.items() if v)
-            + f" (交易所持倉 {held})")
+            + f" (dust_eps={dust_eps:.5f}, acct_btc={_acct_btc})")
+
+    # ── F4: 未知 status 要出聲 (之前會永久 live 但零 log) ──────────────────
+    _known = set(DONE_STATUS) | set(ORPHAN_STATUS) | {"LIMIT_PENDING", "OCO_PLACED"}
+    _unknown = {}
+    for r in log_d["orders"]:
+        st = str(r.get("status") or "")
+        if st and st not in _known:
+            _unknown[st] = _unknown.get(st, 0) + 1
+    if _unknown:
+        log(f"⚠️ 未見過嘅 status (會被當 live, 永久鎖引擎): {_unknown} — 需人手確認")
 
     # ── feat/limit-entry: 限價掛單對帳 (09-16) ─────────────────────────
     # 掛單喺 openOrders → 仲等緊；唔喺 → 查最終狀態 (FILLED → 建 3 段 exit /

@@ -273,15 +273,75 @@ check(len(changed) == 2 and summ["closed_orphan"] == 2,
 check(any(o.get("order_id") == 13 and o.get("resolved_via") is None for o in lg["orders"]),
       "本來已 CLOSED 嘅單唔會被改")
 
-# 情境 2: exchange 有倉 + 冇 rebuild → 標 needs_legs, 唔會靜默
+# 情境 2 (GLM A 修正後): 有倉 + 有 rebuild → 真正補建 legs, 唔係只標 needs_legs
 reset_log()
 btp._log_upsert({"order_id": 21, "pattern": "A", "side": "BUY",
                  "status": "OCO_FAILED", "entry_fill": 80000.0})
 lg = btp.load_log()
-changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001)
-check(summ["needs_legs"] == 1, "有倉 + 冇 rebuild → needs_legs=1", str(summ))
-check(lg["orders"][0].get("needs_legs") is True, "標記 needs_legs (唔會靜默裸掛)")
-check(btp.is_live_rec(lg["orders"][0]), "有倉嘅孤兒仍然當 live (唔會誤放行)")
+built = []
+
+
+def _fake_rebuild(rec):
+    built.append(rec.get("order_id"))
+    return {**rec, "status": "OCO_PLACED", "exit_leg_ids": [1, 2, 3]}
+
+
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001, rebuild=_fake_rebuild)
+check(summ["rebuilt"] == 1, "有倉 + 有 rebuild → 真正補建 legs", str(summ))
+check(built == [21], "rebuild 收到正確記錄", str(built))
+check(lg["orders"][0].get("status") == "OCO_PLACED",
+      f"狀態更新為 OCO_PLACED (= {lg['orders'][0].get('status')})")
+check(lg["orders"][0].get("needs_legs") is None, "唔會遺留 needs_legs (死巷已消除)")
+check(lg["orders"][0].get("rebuilt_legs_ts") is not None, "有記錄補建時間 (可審計)")
+
+# 情境 2b: rebuild 失敗 → 標 needs_legs + rebuild_error (唔會靜默)
+reset_log()
+btp._log_upsert({"order_id": 22, "pattern": "A", "side": "BUY",
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+
+
+def _failing_rebuild(rec):
+    raise RuntimeError("exchange 拒單")
+
+
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001, rebuild=_failing_rebuild)
+check(summ["needs_legs"] == 1, "rebuild 失敗 → needs_legs=1", str(summ))
+check("RuntimeError" in str(lg["orders"][0].get("rebuild_error")),
+      "有記錄失敗原因", str(lg["orders"][0].get("rebuild_error")))
+check(btp.is_live_rec(lg["orders"][0]), "失敗後仍然當 live (唔會誤放行)")
+
+# 情境 2c (GLM B): 冇 rebuild (lot_step 攞唔到) → 保守標記
+reset_log()
+btp._log_upsert({"order_id": 23, "pattern": "A", "side": "BUY",
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001, rebuild=None)
+check(summ["needs_legs"] == 1, "冇 rebuild 時標 needs_legs", str(summ))
+
+# 情境 2d (GLM B): dust → 當冇倉 (唔會因為 testnet dust 而鎖死)
+reset_log()
+btp._log_upsert({"order_id": 24, "pattern": "A", "side": "BUY",
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.00005, dust_eps=0.0001)
+check(summ["closed_orphan"] == 1,
+      "持倉低於 dust_eps → 當冇倉歸 CLOSED (GLM B)", str(summ))
+check(not btp.is_live_rec(lg["orders"][0]), "dust 情境下引擎解鎖")
+
+# 情境 2e (GLM B): per-record callable —— 兩個孤兒一個有倉一個冇倉
+reset_log()
+btp._log_upsert({"order_id": 25, "pattern": "A", "side": "BUY",
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+btp._log_upsert({"order_id": 26, "pattern": "B", "side": "BUY",
+                 "status": "OCO_FAILED", "entry_fill": 80100.0})
+lg = btp.load_log()
+held_map = {25: 0.0, 26: 0.001}
+changed, summ = btp.resolve_orphan_states(
+    lg, held_qty=lambda r: held_map.get(r.get("order_id")),
+    dust_eps=0.0001, rebuild=_fake_rebuild)
+check(summ["closed_orphan"] == 1 and summ["rebuilt"] == 1,
+      "per-record: 一個歸 CLOSED 一個補建 (唔會同樣對待)", str(summ))
 
 # 情境 3: held_qty 未知 (None) → 一律 skip, 唔改
 reset_log()
@@ -293,7 +353,209 @@ check(summ["skipped"] == 1 and summ["closed_orphan"] == 0,
       "倉位未知時唔會亂改 (skip)", str(summ))
 check(btp.is_live_rec(lg["orders"][0]), "未知時維持 live (fail-closed 保守)")
 
-print("\n=== I. reconcile 路徑時序（GLM #3: 主案發現場喺 btc_auto_trade_cycle）===")
+print("\n=== H2. atomic save_log（GLM #9: crash mid-write 會令 log 爛 → 全部放行）===")
+reset_log()
+big = {"orders": [{"order_id": i, "pattern": f"p{i}", "status": "CLOSED",
+                   "r_multiple": 0.1} for i in range(200)]}
+btp.save_log(big)
+lg = btp.load_log()
+check(len(lg["orders"]) == 200, "正常寫入讀得返", str(len(lg["orders"])))
+# 冇殘留 .tmp 檔
+import glob as _glob
+leftovers = _glob.glob(os.path.join(os.path.dirname(btp.LOG_PATH), ".orders.*.tmp"))
+check(not leftovers, "冇殘留 temp 檔", str(leftovers))
+# atomic: 寫入期間另一讀者永遠見到舊或新 (唔會見到空/半截)
+check(os.path.exists(btp.LOG_PATH), "目標檔存在 (os.replace 生效)")
+src_full = open(os.path.join(REPO, "binance_testnet_paper.py"), encoding="utf-8").read()
+check("os.replace(tmp, LOG_PATH)" in src_full, "save_log 用 os.replace (atomic)")
+
+print("\n=== H3. GLM 第三輪: F1/F2/F3/F5 ===")
+# F2: rebuild 冇轉 status → 必須當失敗 (唔可以每個 cycle 重複補建 → 重複 SELL legs)
+reset_log()
+btp._log_upsert({"order_id": 41, "pattern": "A", "side": "BUY",
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+
+
+def _noop_rebuild(rec):
+    return None          # 冇改 status = 冇真正補建
+
+
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001, rebuild=_noop_rebuild)
+check(summ["rebuilt"] == 0, "rebuild 冇轉 status → 唔計 rebuilt", str(summ))
+check(summ["needs_legs"] == 1, "改為 needs_legs (唔會當成功)", str(summ))
+check("冇令記錄離開孤兒狀態" in str(lg["orders"][0].get("rebuild_error")),
+      "有明確錯誤訊息", str(lg["orders"][0].get("rebuild_error")))
+check(lg["orders"][0].get("rebuilt_legs_ts") is None, "唔會寫 rebuilt_legs_ts (假成功)")
+
+# F2b: rebuild 返 dict 但 status 仍係孤兒 → 一樣要當失敗
+reset_log()
+btp._log_upsert({"order_id": 42, "pattern": "A", "side": "BUY",
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+
+
+def _return_same_status(rec):
+    return {**rec, "status": "OCO_FAILED", "note": "tried"}
+
+
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001, rebuild=_return_same_status)
+check(summ["rebuilt"] == 0, "返 dict 但 status 未轉 → 仍然當失敗", str(summ))
+
+# F2c: 成功 rebuild 要清走舊 rebuild_error
+reset_log()
+btp._log_upsert({"order_id": 43, "pattern": "A", "side": "BUY", "status": "OCO_FAILED",
+                 "entry_fill": 80000.0, "rebuild_error": "舊錯誤"})
+lg = btp.load_log()
+
+
+def _good_rebuild(rec):
+    rec["status"] = "OCO_PLACED"
+    rec["exit_leg_ids"] = [1, 2]
+    return rec
+
+
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001, rebuild=_good_rebuild)
+check(summ["rebuilt"] == 1, "正常 rebuild 成功", str(summ))
+check(lg["orders"][0].get("rebuild_error") is None,
+      "成功後清走舊 rebuild_error (審計唔會誤導)")
+
+# F3: FLATTENED_OCO_FAILED + flatten_ok=None → freeze, 唔可以自動補 legs
+reset_log()
+btp._log_upsert({"order_id": 51, "pattern": "A", "side": "BUY",
+                 "status": "FLATTENED_OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+called = []
+changed, summ = btp.resolve_orphan_states(
+    lg, held_qty=0.001, rebuild=lambda r: called.append(r) or _good_rebuild(r))
+check(not called, "結果不明嘅記錄唔會 call rebuild (唔會亂賣)", str(len(called)))
+check(summ.get("frozen_unknown") == 1, "標記 frozen_unknown", str(summ))
+check(lg["orders"][0].get("needs_manual_reconcile") is True,
+      "標 needs_manual_reconcile (交人手對賬)")
+check(btp.is_live_rec(lg["orders"][0]), "仍然當 live (保守)")
+
+# F3b: flatten_ok=True (明確已平) → 可以正常處理
+reset_log()
+btp._log_upsert({"order_id": 52, "pattern": "A", "side": "BUY",
+                 "status": "FLATTENED_OCO_FAILED", "entry_fill": 80000.0,
+                 "flatten_ok": True})
+lg = btp.load_log()
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001, rebuild=_good_rebuild)
+check(summ["rebuilt"] == 1, "flatten_ok=True 時可以正常補建", str(summ))
+
+# F5: LIVE_STATUS 死代碼已刪 (只可以剩註釋提及, 唔可以有賦值)
+import re as _re2
+bfull = open(os.path.join(REPO, "binance_testnet_paper.py"), encoding="utf-8").read()
+check(not _re2.search(r"^LIVE_STATUS\s*=", bfull, _re2.M),
+      "LIVE_STATUS 死代碼已刪 — 冇 tuple 賦值 (F5)")
+
+# F1: estimate_held_for 必須真 per-record —— 用行為測試 (唔係 source 斷言, 因為
+# source 斷言捉唔到語義被改壞, 例如退回讀 aggregate。GLM 第三輪指明呢個係盲位)。
+r_self = {"order_id": 1, "qty": 0.002}
+r_other = {"order_id": 2, "qty": 0.005}
+# (a) 只有自己一個 live → 自己嘅持倉 = 帳戶總額
+h = btp.estimate_held_for(r_self, 0.002, [r_self])
+check(abs(h - 0.002) < 1e-12, "只有自己一個 live → 持倉 = 帳戶總額", str(h))
+# (a2) 兩個都 live 而帳戶只夠自己 → 扣減其他記錄後 = 0 (正確行為)
+h = btp.estimate_held_for(r_self, 0.002, [r_self, r_other])
+check(abs(h) < 1e-12, "帳戶只夠自己但其他記錄仍 live → 扣減後 0", str(h))
+# (b) 帳戶只有 0.005 = 只有其他嗰筆 → 自己嘅持倉應該係 0 (唔係 0.005)
+h = btp.estimate_held_for(r_self, 0.005, [r_self, r_other])
+check(abs(h) < 1e-12, f"帳戶只夠其他記錄 → 自己持倉 0 (真 per-record)", str(h))
+# (c) 若係假 per-record (讀 aggregate) → 上面 (b) 會回 0.005 → 呢兩條會 FAIL
+h = btp.estimate_held_for(r_other, 0.007, [r_self, r_other])
+check(abs(h - 0.005) < 1e-12, f"扣減其他記錄 (0.007-0.002=0.005)", str(h))
+# (d) 帳戶少過其他記錄 → clamp 到 0, 唔會負數
+h = btp.estimate_held_for(r_other, 0.001, [r_self, r_other])
+check(h == 0.0, "帳戶不足時 clamp 到 0 (唔會負)", str(h))
+# (e) acct 未知 → None (caller skip)
+check(btp.estimate_held_for(r_self, None, [r_self]) is None, "帳戶未知 → None")
+# (f) 兩個孤兒一有倉一冇倉 → 唔會同樣對待 (整合測試)
+reset_log()
+btp._log_upsert({"order_id": 61, "pattern": "A", "side": "BUY", "qty": 0.002,
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+btp._log_upsert({"order_id": 62, "pattern": "B", "side": "BUY", "qty": 0.005,
+                 "status": "OCO_FAILED", "entry_fill": 80100.0})
+lg = btp.load_log()
+live = [r for r in lg["orders"] if btp.is_live_rec(r)]
+# 帳戶只有 0.005 (只夠第二筆) → 61 應該冇倉, 62 應該有倉
+changed, summ = btp.resolve_orphan_states(
+    lg, held_qty=lambda r: btp.estimate_held_for(r, 0.005, live),
+    dust_eps=0.0001, rebuild=_good_rebuild)
+check(summ["closed_orphan"] == 1 and summ["rebuilt"] == 1,
+      f"兩孤兒唔會同樣對待 (61 冇倉→CLOSED, 62 有倉→補建)", str(summ))
+
+# F4: 未知 status warning
+cfull = open(os.path.join(REPO, "btc_auto_trade_cycle.py"), encoding="utf-8").read()
+check("未見過嘅 status" in cfull, "F4: 未知 status 有 warning log")
+
+print("\n=== H4. GLM 第四輪: BLOCKER 1 / HIGH / MEDIUM / LOW ===")
+# HIGH: qty 缺失唔可以估成「持有全帳戶」
+h = btp.estimate_held_for({"order_id": 99}, 0.002, [{"order_id": 99}])
+check(h is None, f"qty 缺失 → None (唔會估成全帳戶) [GLM 第四輪 HIGH]", str(h))
+h = btp.estimate_held_for({"order_id": 99, "qty": 0}, 0.002, [])
+check(h is None, "qty=0 → None (唔會估成全帳戶)", str(h))
+h = btp.estimate_held_for({"order_id": 99, "qty": None}, 0.002, [])
+check(h is None, "qty=None → None", str(h))
+
+# MEDIUM: 模糊歸因 (孤兒 qty 總和 > 帳戶) → 整批 freeze, 唔逐筆估
+reset_log()
+btp._log_upsert({"order_id": 71, "pattern": "A", "side": "BUY", "qty": 0.003,
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+btp._log_upsert({"order_id": 72, "pattern": "B", "side": "BUY", "qty": 0.003,
+                 "status": "OCO_FAILED", "entry_fill": 80100.0})
+lg = btp.load_log()
+called2 = []
+changed, summ = btp.resolve_orphan_states(
+    lg, held_qty=0.0035, dust_eps=0.0001,
+    rebuild=lambda r: called2.append(r) or _good_rebuild(r))
+check(summ.get("frozen_ambiguous") == 2, "模糊歸因 → 整批 freeze (2 筆)", str(summ))
+check(not called2, "模糊歸因時唔會 call rebuild (唔賭)", str(len(called2)))
+check(all(o.get("needs_manual_reconcile") for o in lg["orders"]),
+      "全部標 needs_manual_reconcile")
+check(all(o.get("ambiguous_reason") for o in lg["orders"]), "有記錄模糊原因")
+
+# MEDIUM 對照: 歸因清晰 (總和 <= 帳戶) → 正常處理
+reset_log()
+btp._log_upsert({"order_id": 73, "pattern": "A", "side": "BUY", "qty": 0.002,
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.002, dust_eps=0.0001,
+                                          rebuild=_good_rebuild)
+check(summ.get("frozen_ambiguous", 0) == 0, "歸因清晰時唔會 freeze", str(summ))
+check(summ["rebuilt"] == 1, "歸因清晰時正常補建", str(summ))
+
+# LOW-1: rebuild=None 時結果不明嘅記錄仍要標 needs_manual_reconcile
+reset_log()
+btp._log_upsert({"order_id": 81, "pattern": "A", "side": "BUY", "qty": 0.001,
+                 "status": "FLATTENED_OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001, rebuild=None)
+check(lg["orders"][0].get("needs_manual_reconcile") is True,
+      "rebuild=None 時仍標 needs_manual_reconcile [LOW-1]")
+
+# BLOCKER 1: exit legs 落單要有 deterministic clientOrderId (冪等)
+full = open(os.path.join(REPO, "binance_testnet_paper.py"), encoding="utf-8").read()
+check("def _exit_cid" in full, "有 _exit_cid 函數 (BLOCKER 1)")
+check(full.count("newClientOrderId") >= 2, "STOP_LOSS_LIMIT 有 newClientOrderId",
+      str(full.count("newClientOrderId")))
+check(full.count("listClientOrderId") >= 2, "OCO 有 listClientOrderId",
+      str(full.count("listClientOrderId")))
+# 決定性: 同一 rec 叫兩次要一樣
+c1 = btp._exit_cid({"order_id": 555}, "A")
+c2 = btp._exit_cid({"order_id": 555}, "A")
+c3 = btp._exit_cid({"order_id": 555}, "B")
+check(c1 == c2, f"同 input → 同 cid ({c1})")
+check(c1 != c3, f"唔同 tag → 唔同 cid ({c1} vs {c3})")
+check(len(c1) <= 36, f"cid 長度 <= 36 ({len(c1)})")
+# build_exit_legs 自己改 status + persist (BLOCKER 1 第 2 點)
+check('rec["status"] = "OCO_PLACED"' in full,
+      "build_exit_legs 自己改 status = OCO_PLACED")
+check("_log_upsert(rec)" in full.split("def build_exit_legs")[1][:6000],
+      "build_exit_legs 自己 persist (唔靠 caller)")
+check(cfull.count('_signed_request("GET", "/api/v3/account"') == 1,
+      "F1: 帳戶餘額只查一次 (rate limit 安全)",
+      str(cfull.count('_signed_request("GET", "/api/v3/account"')))
 # 呢個係真正出 08-29 事嘅路徑: btc_auto_trade_cycle.reconcile_cycle 處理 LIMIT 成交。
 # 舊 code: for loop 行完才 save_log → 每個成交 build_exit_legs (1-2 秒) 期間 log 冇記錄。
 import re as _re
