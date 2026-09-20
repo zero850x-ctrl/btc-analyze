@@ -144,10 +144,76 @@ def load_log():
     return {"orders": [], "history": []}
 
 
+# status 分類 (2026-09-20): guard 一律 fail-closed —— 唔喺明確「已完結」清單就當 still-live。
+# 舊寫法用白名單 (FILLED_ENTRY/OCO_PLACED/LIMIT_PENDING), 令 FLATTENED_OCO_FAILED /
+# OCO_FAILED 呢啲「可能仲喺市場」嘅狀態被當成冇倉 → 反向/同向 guard 全部失效。
+LIVE_STATUS = ("FILLED_ENTRY", "ENTRY_FILLED_PENDING_EXITS", "OCO_PLACED", "LIMIT_PENDING",
+               "LIMIT_FILLED", "FLATTENED_OCO_FAILED", "OCO_FAILED", "WIPED")
+# 明確「已完結」= 唔再佔用倉位 (其餘一律當 live)
+DONE_STATUS = ("CLOSED", "LIMIT_EXPIRED", "LIMIT_CANCELLED", "SKIP_PREFLIGHT")
+
+# 每日虧損硬上限 (R)。XAUUSD 用 -3R hard stop; BTC 實測最差單日 -3.59R (09-04, 4 單),
+# 11 日之中只有 1 日 ≤ -3R → -3R 唔會過度封鎖, 但會截斷最壞嘅日。
+MAX_DAILY_LOSS_R = float(os.environ.get("BTC_MAX_DAILY_LOSS_R", "3.0"))
+
+
+def is_live_rec(o):
+    """呢筆記錄仲佔住倉位嗎? fail-closed: 唔係明確完結就當 live。"""
+    return str(o.get("status") or "") not in DONE_STATUS
+
+
+def daily_realized_r(log, day=None):
+    """某日 (UTC, 預設今日) 已實現 R 總和 —— 只計真正平倉嘅單。"""
+    if day is None:
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    tot = 0.0
+    n = 0
+    for o in log.get("orders", []):
+        if str(o.get("status") or "") != "CLOSED":
+            continue
+        ts = str(o.get("closed_time") or o.get("seeded_time") or "")
+        if not ts.startswith(day):
+            continue
+        try:
+            tot += float(o.get("r_multiple") or 0.0)
+            n += 1
+        except (TypeError, ValueError):
+            continue
+    return tot, n
+
+
 def save_log(log):
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     with open(LOG_PATH, "w") as f:
         json.dump(log, f, ensure_ascii=False, indent=2)
+
+
+def daily_loss_brake(log, limit=None):
+    """每日虧損硬煞停決策: (是否煞停, 當日已實現 R, 單數)。
+
+    抽成純函數係為了可測 —— 之前只測 daily_realized_r 嘅算術, 冇測「煞停會唔會真係停」。
+    """
+    if limit is None:
+        limit = MAX_DAILY_LOSS_R
+    tot, n = daily_realized_r(log)
+    return (tot <= -limit), tot, n
+
+
+def _log_upsert(rec):
+    """插入或更新一筆記錄 (以 order_id 對照)。
+
+    用嚟令「成交」同「exit legs 建好」兩個階段共用同一筆記錄, 而成交一刻就
+    已經喺 log 見到 (封死 guard 睇唔到倉嘅 1-2 秒窗口)。
+    """
+    log = load_log()
+    oid = rec.get("order_id")
+    for i, o in enumerate(log["orders"]):
+        if oid is not None and o.get("order_id") == oid:
+            log["orders"][i] = rec
+            save_log(log)
+            return
+    log["orders"].append(rec)
+    save_log(log)
 
 
 def account_status(key, secret):
@@ -305,6 +371,15 @@ def place_signal_order(setup, key, secret, atr=None, mode=None):
         "rr_px": round(abs(tp1 - px) / abs(px - stop), 2) if (tp1 and px != stop) else None,
     }
 
+    # ── 2026-09-20 fix: 成交即刻寫 log, 唔等 build_exit_legs ──────────────────
+    # 舊寫法: 成交後一路唔寫, 直到 build_exit_legs 建完所有 OCO legs 才 append。
+    # 建 OCO 要 call 2-3 次 API, 需時 1-2 秒 → 呢段窗口 log 完全冇記錄, 令下一個
+    # setup 嘅 same_pattern / same_side / opp_side guard 見到「冇 live 倉」而全部放行。
+    # 實證 (2026-08-29~08-31): 4 對同 pattern 重疊倉, seeded_time 全部相隔 1-2 秒,
+    # 而 log 由頭到尾冇一筆 same_pattern skip 記錄。
+    rec["status"] = "ENTRY_FILLED_PENDING_EXITS"
+    _log_upsert(rec)
+
     # ── fix 2 (09-13): 成交後 RR 覆核 ─────────────────────────────
     # MARKET 一定有滑價, 落單前估嘅 RR 同實際成交可以差好遠 (09-12 單: 計劃 1.35 → 實際 0.51)。
     # 未建 exit legs 就發現 → 即刻市價平倉 (唔使 cancel 任何 order, 成本 = spread)。
@@ -326,9 +401,8 @@ def place_signal_order(setup, key, secret, atr=None, mode=None):
             rec["flatten_ok"] = False
             rec["flatten_error"] = e2.read().decode()[:200]
         rec["flatten_ts"] = time.time()
-        log = load_log()
-        log["orders"].append(rec)
-        save_log(log)
+        rec["status"] = "FLATTENED_OCO_FAILED"
+        _log_upsert(rec)
         return rec, None
 
     return build_exit_legs(rec, key, secret, lot_step)
@@ -453,9 +527,7 @@ def build_exit_legs(rec, key, secret, lot_step):
         rec["status"] = "OCO_FAILED"
         rec["oco_error"] = "no exit legs built"
 
-    log = load_log()
-    log["orders"].append(rec) if rec not in log["orders"] else None
-    save_log(log)
+    _log_upsert(rec)
     return rec, None
 
 
@@ -588,10 +660,18 @@ def main():
     todo = cooled
     if not todo:
         return
-    # 風控 (fix/btc-exit-symmetry): 同 pattern 限 1 單 + 同方向限 1 單 + 相反方向鎖
+    # 風控 (fix/btc-exit-symmetry, 2026-09-20 改 fail-closed):
+    #   同 pattern 限 1 單 + 同方向限 1 單 + 相反方向鎖。
+    #   live 判定改用 is_live_rec() (唔係白名單) —— FLATTENED_OCO_FAILED / OCO_FAILED
+    #   呢啲「可能仲喺市場」嘅狀態以前被當成冇倉, 令 guard 失效。
+    #   每日 -MAX_DAILY_LOSS_R 硬煞停: 用當日已實現 R 計 (封頂後唔再開新倉)。
+    day_tot, day_n = daily_realized_r(log)
+    if daily_loss_brake(log)[0]:
+        print(f"🛑 當日已實現 {day_tot:+.2f}R ({day_n} 單) ≤ -{MAX_DAILY_LOSS_R}R "
+              f"— 每日虧損硬煞停, 今日唔再開新倉")
+        return
     for s in todo:
-        live = [o for o in load_log()["orders"]
-                if o.get("status") in ("FILLED_ENTRY", "OCO_PLACED", "LIMIT_PENDING")]
+        live = [o for o in load_log()["orders"] if is_live_rec(o)]
         same_pattern = [o for o in live if o.get("pattern") == s.get("pattern")]
         same_side = [o for o in live if o.get("side") == s["btc_side"]]
         opp_side = [o for o in live if o.get("side") != s["btc_side"]]
