@@ -46,7 +46,48 @@ MIN_RR = 1.2                # RR gate: TP1/risk >= 1.2 (RR<1.2 單贏細輸大 �
 MAX_MA50_EXT_PCT = 2.0      # Flag extended gate: 離 MA50(m30) > ±2% 唔開 Flag
                             # (09-04 實證: 3 單 Bull Flag entry 離 MA50 +2.0~3.8% 全部 SL;
                             #  歷史 15 單 Flag: 呢個 gate 擋 -2.50R、誤殺正R $0.00)
-ALLOWED_PATTERNS = ("Flag",)  # Pattern gate: 只做 Bull/Bear Flag (backtest +0.59/+0.66R; AT/雙頂負 EV)
+# ── Pattern gate (2026-09-20 重寫) ─────────────────────────────────────────────
+# 舊寫法 `any(k in pattern for k in ("Flag",))` 用**顯示標籤 substring** 判斷, 會靜默
+# drop 任何未量度嘅 setup 家族。實例: fib0786/fib 嘅 pattern 標籤係
+# "0.786 深度回調 ($…)", 唔含 "Flag" → 永遠過唔到, 而且冇任何 consumer 讀 _gate_skip,
+# 所以完全靜默。證據:
+#   - gate (e8bf635, 2026-08-30 20:24) 上線前 12 小時內有 12 筆 fib 單; 上線後 0 筆
+#   - justify 個 gate 嘅 83 樣本實驗 (bt_gate_results.json) 裏面**完全冇** fib/0.786
+#   ⇒ 排除 0.786 係未經評估嘅副作用, 唔係測過嘅決定。
+#
+# 政策**不變** (0.786 / fib / boundary 仍然唔開) —— 但改成明示對照表, 每個家族嘅
+# 去留都寫死喺呢度; 新家族會帶 "UNKNOWN" 標記 fail-closed, 唔會再靜默。
+ALLOWED_PATTERN_FAMILIES = ("Flag",)
+
+# entry_mode → 家族。fib0786/fib 係**獨立於 pattern 產生**, 唔可以靠 pattern 標籤分辨。
+_ENTRY_MODE_FAMILY = {
+    "fib0786": "fib0786",
+    "fib": "fib",
+    "boundary": "boundary",
+}
+
+# pattern 顯示標籤 → 家族 (順序有意義: 先配對較具體嘅)
+_PATTERN_FAMILY_KEYS = (
+    ("Flag", "Flag"), ("旗", "Flag"),
+    ("Double Top", "DoubleTop"), ("雙頂", "DoubleTop"),
+    ("Double Bottom", "DoubleBottom"), ("雙底", "DoubleBottom"),
+    ("Wedge", "Wedge"), ("楔", "Wedge"),
+    ("Triangle", "Triangle"), ("三角", "Triangle"),
+    ("Channel", "Channel"),
+)
+
+
+def setup_family(s):
+    """setup → 明示家族名。認唔到就回 "UNKNOWN:<label>" (唔會默認當合格)。"""
+    mode = str(s.get("entry_mode") or "").strip().lower()
+    if mode in _ENTRY_MODE_FAMILY:
+        return _ENTRY_MODE_FAMILY[mode]
+    pat = str(s.get("pattern", ""))
+    for key, fam in _PATTERN_FAMILY_KEYS:
+        if key in pat:
+            return fam
+    return "UNKNOWN:" + (pat[:24] if pat else "?")
+
 BTC_MIN_BARS_M30 = 240      # M30 最少 5 日數據
 BTC_MIN_BARS_H1 = 240
 BTC_MIN_BARS_DAY = 120
@@ -188,7 +229,9 @@ def btc_filter_setups(setups, atr, px, diff_check, ma50=None):
     引擎 setup 欄位: direction/pattern/entry_zone/stop_loss/tp1/tp2/tp3/risk_amount (字串格式).
     Gate (backtest 68 樣本 + testnet 9 筆實證 2026-08-30):
       - RR >= 1.2: TP(pattern 高度) 細過 SL floor 嘅單贏都贏唔起 (AT/fib live RR 0.1-0.4)
-      - Pattern: 只做 Bull/Bear Flag (+0.59/+0.66R); AT 33.3% -0.25R、雙頂負 EV 全 live 實證
+      - Family: 只做 Flag (見 ALLOWED_PATTERN_FAMILIES)。用明示家族對照表, 唔用標籤
+        substring —— 舊寫法會靜默 drop fib0786/fib。被擋嘅 setup 一律帶 _gate_skip,
+        由 summarize_gate_skips() 匯報, 唔會再靜默。
       - MA50 extended (09-04): Flag = trend continuation; entry 離 MA50(m30) 太遠 = 追火棒,
         假突破風險高 (今日 3 單 Bull Flag 離 MA50 +2~3.8% 全 SL)
     """
@@ -196,11 +239,13 @@ def btc_filter_setups(setups, atr, px, diff_check, ma50=None):
     for s in setups:
         side = "SELL" if "SELL" in str(s.get("direction", "")) else "BUY"
         pattern = str(s.get("pattern", "?"))
-        # Pattern gate: 負 EV pattern 直接 skip (保留 setup 字串方便 debug)
-        if ALLOWED_PATTERNS is not None:
-            if not any(k in pattern for k in ALLOWED_PATTERNS):
-                s["_gate_skip"] = "pattern_not_allowed"
-                continue
+        # Pattern gate (2026-09-20): 用**明示家族**判斷, 唔再用顯示標籤 substring。
+        # 舊寫法會靜默 drop fib0786/fib (標籤 "0.786 深度回調 …" 唔含 "Flag")。
+        fam = setup_family(s)
+        s["_family"] = fam
+        if ALLOWED_PATTERN_FAMILIES is not None and fam not in ALLOWED_PATTERN_FAMILIES:
+            s["_gate_skip"] = f"family_{fam}_not_allowed"
+            continue
         entry = _parse_setup_level(s.get("entry_zone"))
         if entry is None:
             entry = _parse_setup_level(s.get("entry_trigger"))
@@ -262,6 +307,26 @@ def btc_filter_setups(setups, atr, px, diff_check, ma50=None):
             s["verified"] = True
         out.append(s)
     return out
+
+
+def summarize_gate_skips(raw_setups):
+    """匯報每個 setup 被擋嘅原因 —— 令 gate 出聲 (舊版完全靜默)。
+
+    回傳 {"n_raw": int, "n_kept": int, "reasons": {reason: count},
+          "families_seen": {family: count}}
+    """
+    import collections
+
+    reasons = collections.Counter()
+    fams = collections.Counter()
+    for s in raw_setups:
+        fams[str(s.get("_family") or setup_family(s))] += 1
+        sk = s.get("_gate_skip")
+        if sk:
+            reasons[str(sk)] += 1
+    n_kept = sum(1 for s in raw_setups if not s.get("_gate_skip"))
+    return {"n_raw": len(raw_setups), "n_kept": n_kept,
+            "reasons": dict(reasons), "families_seen": dict(fams)}
 
 
 def pick_best_setup(setups):
@@ -337,8 +402,12 @@ def main():
     patterns = av3.detect_all_patterns(df, pts, atr=atr)
     daily_trend = av3.analyze_daily_trend(data["day"]) if data["day"] is not None else {"trend": "NEUTRAL"}
     h1_trend = av3.analyze_h1_trend(data["h1"]) if data["h1"] is not None else {"trend": "NEUTRAL"}
-    setups = av3.generate_trade_setups(df, patterns, pts, daily_trend, px, atr, h1_trend=h1_trend)
-    setups = btc_filter_setups(setups, atr, px, diff_check, ma50=ma50)
+    raw_setups = av3.generate_trade_setups(df, patterns, pts, daily_trend, px, atr, h1_trend=h1_trend)
+    setups = btc_filter_setups(raw_setups, atr, px, diff_check, ma50=ma50)
+    gate_skips = summarize_gate_skips(raw_setups)
+    if gate_skips["reasons"]:
+        _log(f"[gate] raw={gate_skips['n_raw']} kept={gate_skips['n_kept']} "
+             f"skipped={gate_skips['reasons']} families={gate_skips['families_seen']}")
     best = pick_best_setup(setups)
     report = build_btc_report(data, patterns, setups, daily_trend, h1_trend, diff_check, best, ma50=ma50)
 
@@ -357,16 +426,23 @@ def main():
             "h1_trend": h1_trend["trend"] if isinstance(h1_trend, dict) else str(h1_trend),
             "patterns": len(patterns),
             "setups": setups,
+            "gate_skips": gate_skips,
             "best": best,
         }
         print(json.dumps(payload, ensure_ascii=False, default=str))
     else:
         print(report)
+        if gate_skips["reasons"]:
+            print(f"\n## Gate 擋咗 ({gate_skips['n_raw'] - gate_skips['n_kept']}/"
+                  f"{gate_skips['n_raw']})")
+            for r, n in sorted(gate_skips["reasons"].items(), key=lambda x: -x[1]):
+                print(f"- {r} × {n}")
         # 保存 JSON 供 paper_trade 用
         out = os.path.join(REPO, "btc_last_analysis.json")
         with open(out, "w") as f:
             json.dump({"generated_at": now_iso(), "price": px, "atr": atr,
                        "exchange_diff": diff_check, "setups": setups, "best": best,
+                       "gate_skips": gate_skips,
                        "daily_trend": str(daily_trend), "h1_trend": str(h1_trend)},
                       f, ensure_ascii=False, default=str)
         _log(f"[*] JSON saved {out}")
