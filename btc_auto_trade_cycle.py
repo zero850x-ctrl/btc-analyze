@@ -257,7 +257,13 @@ def reconcile_cycle(key, secret):
                           for b in _acct.get("balances", []) if b.get("asset") == "BTC"), 0.0)
     except Exception:                                   # noqa: BLE001
         _acct_btc = None                                # 查唔到 → resolve 會 skip
-    _live_recs = [r for r in log_d["orders"] if is_live_rec(r)]
+    # LOW-4 (GLM 第五輪): 只扣「持貨類」status 嘅 qty。
+    # LIMIT_PENDING 買單未成交、冇鎖 BTC, 照扣會低估孤兒持倉 → 可能 spurious
+    # CLOSED (no_position) 放走真有貨嘅倉。
+    _HOLDING_STATUS = ("ENTRY_FILLED_PENDING_EXITS", "OCO_PLACED", "FILLED_ENTRY",
+                       "LIMIT_FILLED", "OCO_FAILED", "FLATTENED_OCO_FAILED", "WIPED")
+    _live_recs = [r for r in log_d["orders"]
+                  if is_live_rec(r) and str(r.get("status") or "") in _HOLDING_STATUS]
 
     def _held_for(rec):
         """該筆自己嘅估算持倉 —— 邏輯喺 estimate_held_for() (可測)。"""
@@ -270,7 +276,8 @@ def reconcile_cycle(key, secret):
 
     orph, orph_summ = resolve_orphan_states(
         log_d, _held_for, dust_eps=dust_eps,
-        rebuild=_rebuild if lot_step is not None else None)
+        rebuild=_rebuild if lot_step is not None else None,
+        acct_btc=_acct_btc)          # HIGH-1: freeze-on-ambiguity 要用帳戶總額
     if orph:
         changed.extend(orph)
         dirty = True

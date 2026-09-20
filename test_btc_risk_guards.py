@@ -485,6 +485,151 @@ changed, summ = btp.resolve_orphan_states(
 check(summ["closed_orphan"] == 1 and summ["rebuilt"] == 1,
       f"兩孤兒唔會同樣對待 (61 冇倉→CLOSED, 62 有倉→補建)", str(summ))
 
+full = open(os.path.join(REPO, "binance_testnet_paper.py"), encoding="utf-8").read()
+print("\n=== H5. GLM 第五輪: HIGH-1 / HIGH-2 / MEDIUM-3 / LOW-4 / LOW-5 / LOW-6 ===")
+# HIGH-1: freeze-on-ambiguity 必須喺**生產形狀** (held_qty 係 callable) 之下都觸發。
+# 之前歧義檢查只認 scalar → 生產傳 callable → 永遠唔行 = 死代碼。
+reset_log()
+btp._log_upsert({"order_id": 91, "pattern": "A", "side": "BUY", "qty": 0.003,
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+btp._log_upsert({"order_id": 92, "pattern": "B", "side": "BUY", "qty": 0.003,
+                 "status": "OCO_FAILED", "entry_fill": 80100.0})
+lg = btp.load_log()
+called3 = []
+changed, summ = btp.resolve_orphan_states(
+    lg, held_qty=lambda r: 0.001, dust_eps=0.0001, acct_btc=0.0035,
+    rebuild=lambda r: called3.append(r) or _good_rebuild(r))
+check(summ.get("frozen_ambiguous") == 2,
+      "HIGH-1: callable 形狀 (生產) 之下 freeze 都會觸發", str(summ))
+check(not called3, "HIGH-1: 生產形狀下唔會 call rebuild", str(len(called3)))
+
+# HIGH-1b: 生產路徑真嘅傳 acct_btc
+cfull2 = open(os.path.join(REPO, "btc_auto_trade_cycle.py"), encoding="utf-8").read()
+check("acct_btc=_acct_btc" in cfull2, "HIGH-1: reconcile_cycle 有傳 acct_btc")
+check("_HOLDING_STATUS" in cfull2, "LOW-4: 只扣持貨類 status")
+
+# LOW-4: LIMIT_PENDING (未成交買單) 唔應該被扣
+HOLD = ("ENTRY_FILLED_PENDING_EXITS", "OCO_PLACED", "FILLED_ENTRY",
+        "LIMIT_FILLED", "OCO_FAILED", "FLATTENED_OCO_FAILED", "WIPED")
+mine_r = {"order_id": 93, "pattern": "A", "side": "BUY", "qty": 0.002,
+          "status": "OCO_FAILED", "entry_fill": 80000.0}
+pending_r = {"order_id": 94, "pattern": "B", "side": "BUY", "qty": 0.005,
+             "status": "LIMIT_PENDING"}
+# 生產同款過濾 (_HOLDING_STATUS): LIMIT_PENDING 唔入 live_recs → 唔會被扣
+live_hold = [r for r in [mine_r, pending_r]
+             if btp.is_live_rec(r) and r.get("status") in HOLD]
+h = btp.estimate_held_for(mine_r, 0.002, live_hold)
+check(abs(h - 0.002) < 1e-12,
+      "LOW-4: LIMIT_PENDING 唔會被扣 (孤兒持倉唔會低估)", f"{h} (live_hold={len(live_hold)})")
+# 對照: 若錯把 LIMIT_PENDING 也計入 (舊行為) → 會低估
+live_bad = [r for r in [mine_r, pending_r] if btp.is_live_rec(r)]
+h_bad = btp.estimate_held_for(mine_r, 0.002, live_bad)
+check(abs(h_bad) < 1e-12, "LOW-4 對照: 錯誤做法會低估到 0", str(h_bad))
+
+# MEDIUM-3: h is None 要出聲, 唔可以靜默
+reset_log()
+btp._log_upsert({"order_id": 95, "pattern": "A", "side": "BUY", "qty": 0.002,
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+changed, summ = btp.resolve_orphan_states(lg, held_qty=None)
+check(summ["skipped"] == 1, "MEDIUM-3: 倉位未知 → skipped", str(summ))
+check(lg["orders"][0].get("needs_manual_reconcile") is True,
+      "MEDIUM-3: 標 needs_manual_reconcile (唔再靜默)")
+check(lg["orders"][0].get("unknown_holding_reason") is not None, "有記錄原因")
+check(bool(changed), "MEDIUM-3: 有入 changed (caller 會 save + log)", str(len(changed)))
+
+# LOW-5: _exit_cid 冇 id 要拋異常 (唔可以撞 cid)
+try:
+    btp._exit_cid({"pattern": "x"}, "A")
+    check(False, "LOW-5: 冇 order_id 應該拋異常")
+except ValueError:
+    check(True, "LOW-5: 冇 order_id 拋異常 (唔會撞 cid)")
+# LOW-5: tag 放頭
+c = btp._exit_cid({"order_id": 999999999}, "B")
+check(c.startswith("B-"), f"LOW-5: tag 放頭 ({c})")
+check(len(c) <= 36, f"LOW-5: 長度 <= 36 ({len(c)})")
+
+# LOW-6: fsync 目錄
+check("os.fsync(dfd)" in full, "LOW-6: save_log 有 fsync 目錄")
+
+# HIGH-2: duplicate-cid adopt —— 行為測試 (source 斷言捉唔到, mutation 證實)
+# 模擬: openOrders 已有同 prefix 嘅 legs → build_exit_legs 應該 adopt 而唔係再落單
+reset_log()
+adopt_rec = {"order_id": 777, "side": "BUY", "qty": 0.001,
+             "planned_stop": 79600.0, "planned_tp1": 80400.0, "planned_tp2": 80800.0,
+             "atr": 200.0, "status": "OCO_FAILED"}
+posted = []
+
+
+def fake_signed2(method, path, params, key, secret):
+    if method == "GET" and path.endswith("/openOrders"):
+        # 只有一條已存在 leg, clientOrderId 有正確 prefix
+        return [{"orderId": 9001, "clientOrderId": "A-EXIT-777"}]
+    posted.append((method, path))
+    return {"orderId": 999, "orderListId": 999,
+            "orders": [{"orderId": 1}, {"orderId": 2}]}
+
+
+orig_signed = btp._signed_request
+btp._signed_request = fake_signed2
+try:
+    out, err = btp.build_exit_legs(dict(adopt_rec), "k", "s", 0.00001)
+finally:
+    btp._signed_request = orig_signed
+check(out.get("adopted_existing_legs") is True,
+      "HIGH-2: adopt 已存在 legs (行為測試)", str(out.get("adopted_existing_legs")))
+check(out.get("exit_leg_ids") == [9001], "HIGH-2: adopt 正確 leg id", str(out.get("exit_leg_ids")))
+check(out.get("status") == "OCO_PLACED", "HIGH-2: adopt 後狀態 OCO_PLACED",
+      str(out.get("status")))
+check(not [p for p in posted if p[1].endswith("/order/oco")],
+      "HIGH-2: adopt 之後冇再落 OCO (唔會重複)", str(posted))
+
+# 對照: 冇已存在 legs → 正常落單
+reset_log()
+posted.clear()
+adopt_rec2 = dict(adopt_rec, order_id=888)
+
+
+def fake_signed3(method, path, params, key, secret):
+    if method == "GET" and path.endswith("/openOrders"):
+        return []
+    posted.append((method, path))
+    return {"orderId": 999, "orderListId": 999,
+            "orders": [{"orderId": 1}, {"orderId": 2}]}
+
+
+btp._signed_request = fake_signed3
+try:
+    out2, _ = btp.build_exit_legs(dict(adopt_rec2), "k", "s", 0.00001)
+finally:
+    btp._signed_request = orig_signed
+check(not out2.get("adopted_existing_legs"), "對照: 冇存在 legs 時唔會 adopt")
+check(any(p[1].endswith("/order/oco") for p in posted),
+      "對照: 冇存在 legs 時正常落 OCO", str(posted))
+
+# LOW-4: 生產 _HOLDING_STATUS 過濾 —— 行為驗證 (用生產嘅實際 tuple)
+cf_hold = open(os.path.join(REPO, "btc_auto_trade_cycle.py"), encoding="utf-8").read()
+m_hold = _re2.search(r"_HOLDING_STATUS = \((.*?)\)", cf_hold, _re2.S)
+check(m_hold is not None, "LOW-4: 找到 _HOLDING_STATUS 定義")
+if m_hold:
+    names = _re2.findall(r'"([^"]+)"', m_hold.group(1))
+    check("LIMIT_PENDING" not in names,
+          f"LOW-4: _HOLDING_STATUS 唔包含 LIMIT_PENDING", str(names))
+    check("OCO_FAILED" in names and "FLATTENED_OCO_FAILED" in names,
+          "LOW-4: 包含 OCO_FAILED / FLATTENED_OCO_FAILED", str(names))
+    # 用生產 tuple 真嘅過濾一次
+    mine_r2 = {"order_id": 93, "qty": 0.002, "status": "OCO_FAILED"}
+    pend_r2 = {"order_id": 94, "qty": 0.005, "status": "LIMIT_PENDING"}
+    filt = [r for r in [mine_r2, pend_r2]
+            if btp.is_live_rec(r) and r.get("status") in tuple(names)]
+    h2 = btp.estimate_held_for(mine_r2, 0.002, filt)
+    check(abs(h2 - 0.002) < 1e-12,
+          "LOW-4: 用生產 tuple 過濾 → LIMIT_PENDING 唔扣", str(h2))
+    # 斷言使用處真嘅用咗 _HOLDING_STATUS (唔止定義存在 —— mutation 改使用處
+    # 而 tuple 定義不變嘅話, 只檢查定義會捉唔到)
+    check(_re2.search(r"in _HOLDING_STATUS\]", cf_hold) is not None,
+          "LOW-4: _live_recs 真嘅用 _HOLDING_STATUS 過濾 (唔止定義存在)")
+
 # F4: 未知 status warning
 cfull = open(os.path.join(REPO, "btc_auto_trade_cycle.py"), encoding="utf-8").read()
 check("未見過嘅 status" in cfull, "F4: 未知 status 有 warning log")

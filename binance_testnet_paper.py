@@ -206,17 +206,15 @@ def estimate_held_for(rec, acct_btc, live_recs):
     return max(0.0, acct_btc - others)
 
 
-def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None):
+def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=None):
     """對帳孤兒狀態 —— fail-closed 嘅復原路徑。
 
-    held_qty: exchange 上實際持倉數量。需要 per-record 判斷時傳一個 callable
-              `held_qty(rec) -> float|None` (2026-09-20 GLM review B: 一個 scalar
-              對 N 個孤兒記錄係語意錯配 —— 兩個孤兒一個有倉一個冇倉時唔應該同樣處理)。
-              傳純 scalar 亦可 (向後兼容), 但要知道所有孤兒會同樣對待。
-    dust_eps: 低於此數量當「冇倉」(testnet dust / 其他倉嘅 SELL leg 鎖住嘅 BTC)。
-    rebuild:  有倉時嘅補建函數 (通常 build_exit_legs)。冇傳 = 只標記, 唔會靜默。
-
-    回傳 (changed_list, summary)。
+    held_qty: 每筆持倉。callable(rec) -> float|None, 或 scalar。
+    acct_btc: **帳戶總額** —— 獨立參數 (2026-09-20 GLM 第五輪 HIGH-1)。
+              之前歧義檢查只認 scalar held_qty, 而生產傳 callable → 檢查永遠唔行
+              = 死代碼。freeze-on-ambiguity 必須用呢個參數做。
+    dust_eps: 低於此當「冇倉」。
+    rebuild:  有倉時補建函數。
     """
     changed = []
     summary = {"closed_orphan": 0, "rebuilt": 0, "needs_legs": 0, "skipped": 0,
@@ -227,10 +225,10 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None):
     # 一部分, 但實際只夠一筆)。呢個情況下自動行動就係賭博 → 整批 freeze。
     orphans = [r for r in log.get("orders", [])
                if str(r.get("status") or "") in ORPHAN_STATUS]
-    if isinstance(held_qty, (int, float)) and held_qty is not None:
-        _acct = float(held_qty)
-    else:
-        _acct = None
+    # acct_btc 優先; 向後兼容: 若冇傳而 held_qty 係 scalar 就當佢係帳戶總額
+    if acct_btc is None and isinstance(held_qty, (int, float)):
+        acct_btc = float(held_qty)
+    _acct = float(acct_btc) if acct_btc is not None else None
     if _acct is not None:
         try:
             _sum_orph = sum(float(r.get("qty") or 0.0) for r in orphans)
@@ -256,7 +254,13 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None):
         else:
             h = held_qty
         if h is None:
+            # MEDIUM-3 (GLM 第五輪): 之前靜默 continue → 連 log 都冇。
+            # 一個可能真有倉嘅記錄永久裸掛但零 observability。改為標記 + 出聲。
+            rec["needs_manual_reconcile"] = True
+            rec["needs_legs"] = True
+            rec["unknown_holding_reason"] = "冇法判斷持倉 (qty 缺失或帳戶查唔到)"
             summary["skipped"] += 1
+            changed.append(rec)
             continue
         if float(h) <= dust_eps:
             rec["status"] = "CLOSED"
@@ -375,6 +379,16 @@ def save_log(log):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, LOG_PATH)
+        # LOW-6 (GLM 第五輪): fsync 目錄 —— 否則 crash 時 rename 唔保證持久
+        # (可能彈返舊檔)。open dir + fsync 係 POSIX rename durability 嘅標準做法。
+        try:
+            dfd = os.open(os.path.dirname(LOG_PATH), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass                # 某啲 FS 唔支援 dir fsync — 唔應該因此失敗
     except Exception:
         try:
             os.unlink(tmp)
@@ -606,12 +620,20 @@ def place_signal_order(setup, key, secret, atr=None, mode=None):
 def _exit_cid(rec, tag):
     """deterministic clientOrderId —— 令 exit legs 落單冪等。
 
-    2026-09-20 GLM 第四輪 BLOCKER 1: 冇冪等 id 嘅話, 「落咗單但 crash 喺
-    _log_upsert 之前」會令重試再落一套 legs (重複 SELL)。用同一 cid 重試時
-    Binance 會 reject (duplicate clientOrderId) → 天然冪等。
+    2026-09-20 GLM 第四輪 BLOCKER 1 / 第五輪 LOW-5:
+      - 冇冪等 id 嘅話, 「落咗單但 crash 喺 _log_upsert 之前」會令重試再落一套
+        legs (重複 SELL)。
+      - LOW-5: fallback "x" 會令兩筆都冇 order_id 嘅記錄撞同一 cid → 互相 reject。
+        改為拋異常 (冇 id 就唔應該自動落 legs)。
+      - LOW-5: tag 放**頭**, 避免 oid 異常長時截尾把 tag 切走 (A/B 撞 cid)。
     """
-    oid = rec.get("order_id") or rec.get("oco_id") or "x"
-    return f"EXIT-{oid}-{tag}"[:36]
+    oid = rec.get("order_id") or rec.get("oco_id")
+    if not oid:
+        raise ValueError("_exit_cid: 記錄冇 order_id/oco_id — 唔應該自動落 exit legs")
+    cid = f"{tag}-EXIT-{oid}"
+    if len(cid) > 36:
+        raise ValueError(f"_exit_cid: clientOrderId 太長 ({len(cid)} > 36): {cid}")
+    return cid
 
 
 def build_exit_legs(rec, key, secret, lot_step):
@@ -689,6 +711,43 @@ def build_exit_legs(rec, key, secret, lot_step):
             "timeInForce": "GTC",
             "newClientOrderId": cid,
         }, key, secret)
+
+    # ── HIGH-2 (GLM 第五輪): duplicate-cid 要 adopt 而唔係當失敗 ─────────────
+    # 若之前一次 attempt 已經落過 legs (EXIT-<oid>-* prefix), 重試時 duplicate
+    # reject 會令整個 rebuild 當失敗 → 永久 retry loop, 而且舊 attempt 嘅 legs
+    # 喺 exchange 上 untracked (OCO_B/L3 永遠補唔上 = 1/3 倉裸掛)。
+    # 修: rebuild 前先查 openOrders 有冇同 prefix 嘅 legs, 有就直接 adopt。
+    def _adopt_existing():
+        try:
+            opens_now = _signed_request("GET", "/api/v3/openOrders",
+                                        {"symbol": SYMBOL}, key, secret)
+        except Exception:                               # noqa: BLE001
+            return False
+        # prefix 要同 _exit_cid 一致: <tag>-EXIT-<oid>
+        # OCO 落單用 listClientOrderId, 但 openOrders 回報嘅 leg 層欄位係
+        # clientOrderId; 兩者都要查 (OCO list id 會出現喺 leg 嘅 clientOrderId 後綴
+        # 或者獨立 list 查詢, 所以用 "EXIT-<oid>" 子串匹配最穩)。
+        oid_s = str(rec.get("order_id") or rec.get("oco_id") or "")
+        if not oid_s:
+            return False
+        needle = f"-EXIT-{oid_s}"
+        got = []
+        for o in opens_now:
+            cid = str(o.get("clientOrderId") or "")
+            lid = str(o.get("listClientOrderId") or "")
+            if needle in cid or needle in lid:
+                got.append(o.get("orderId"))
+        if not got:
+            return False
+        rec["exit_leg_ids"] = got
+        rec["adopted_existing_legs"] = True
+        rec["status"] = "OCO_PLACED"
+        rec["adopt_note"] = f"重試時 adopt 咗 {len(got)} 條已存在 exit legs (避免重複)"
+        _log_upsert(rec)
+        return True
+
+    if _adopt_existing():
+        return rec, None
 
     try:
         oco_a = _oco_qty(q1, tp1, "A") if tp1 else None
