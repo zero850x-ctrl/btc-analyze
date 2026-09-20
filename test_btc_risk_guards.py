@@ -781,8 +781,11 @@ check("order_id" in str(out_f3.get("adopt_error") or ""),
 # 明確斷言兩層都存在, 免得日後有人以為只靠一層而刪走另一層。
 check("唔可以靠 cid 匹配 adopt" in full, "FINDING 3: _adopt_existing 有 early guard")
 check("唔應該自動落 exit legs" in full, "FINDING 3: _exit_cid 亦有 raise (第二層)")
-check(out_f3.get("adopt_fail_count") == 1,
-      "FINDING 3/4: 有記 adopt_fail_count", str(out_f3.get("adopt_fail_count")))
+check(out_f3.get("adopt_fail_count") is None,
+      "NEW-1: 資料缺失唔當查詢失敗 (counter 唔加)",
+      str(out_f3.get("adopt_fail_count")))
+check("資料缺失" in str(out_f3.get("adopt_error")),
+      "NEW-1: 錯誤分類為資料缺失", str(out_f3.get("adopt_error")))
 
 # FINDING 4 + LOW-H: adopt_error 要真嘅寫入 log + 含 traceback 尾幾行
 reset_log()
@@ -846,6 +849,84 @@ check(lg["orders"][0].get("unknown_holding_reason") is None,
       "FINDING 5b: 恢復正常後清走 unknown_holding_reason")
 check(lg["orders"][0].get("needs_manual_reconcile") is None,
       "FINDING 5b: 清走 needs_manual_reconcile")
+
+# NEW-2 (第八輪): pop 必須真嘅 persist (唔止 in-memory) —— 用 load_log 斷言,
+# 覆蓋「持倉正常 (非 CLOSED) 且 rebuild 成功」嗰條路徑。
+reset_log()
+btp.save_log({"orders": [{"order_id": 201, "pattern": "A", "side": "BUY", "qty": 0.002,
+                          "status": "OCO_FAILED", "entry_fill": 80000.0,
+                          "needs_manual_reconcile": True,
+                          "unknown_holding_reason": "舊原因"}]})
+lg = btp.load_log()
+_ch, _sm = btp.resolve_orphan_states(lg, held_qty=0.002, dust_eps=0.0001,
+                                     acct_btc=0.002, rebuild=_good_rebuild)
+btp.save_log(lg)
+_disk = [o for o in btp.load_log()["orders"] if o.get("order_id") == 201][0]
+check(_disk.get("needs_manual_reconcile") is None,
+      "NEW-2: pop 真嘅 persist 落 disk (持倉正常路徑)", str(_disk.get("needs_manual_reconcile")))
+check(_disk.get("unknown_holding_reason") is None,
+      "NEW-2: unknown_holding_reason 亦 persist 清走",
+      str(_disk.get("unknown_holding_reason")))
+check(len(_ch) >= 1, "NEW-2: 該記錄有入 changed (所以 caller 會 save)", str(len(_ch)))
+
+# NEW-4: adopt miss → 落新 OCO 成功 → transient flags 清走
+reset_log()
+posted.clear()
+
+
+def fake_miss(method, path, params, key, secret):
+    if method == "GET" and path.endswith("/openOrders"):
+        return []                       # 冇已存在 legs
+    posted.append((method, path))
+    return {"orderId": 999, "orderListId": 999, "orders": [{"orderId": 1}, {"orderId": 2}]}
+
+
+r_n4 = dict(r77, order_id=606, needs_manual_reconcile=True, adopt_error="舊錯誤",
+            adopt_fail_count=2)
+btp._signed_request = fake_miss
+try:
+    out_n4, _e = btp.build_exit_legs(dict(r_n4), "k", "s", 0.00001)
+finally:
+    btp._signed_request = orig_signed
+check(out_n4.get("status") == "OCO_PLACED", "NEW-4: 落新 OCO 成功",
+      str(out_n4.get("status")))
+check(out_n4.get("needs_manual_reconcile") is None,
+      "NEW-4: 新 OCO 成功清走 needs_manual_reconcile", str(out_n4.get("needs_manual_reconcile")))
+check(out_n4.get("adopt_error") is None, "NEW-4: 清走 adopt_error")
+check(out_n4.get("adopt_fail_count") is None, "NEW-4: 清走 adopt_fail_count")
+
+# NEW-1: ValueError 走「資料缺失」路徑, 唔混入「查詢失敗」counter
+reset_log()
+r_n1 = {"side": "BUY", "qty": 0.001, "planned_stop": 79600.0, "planned_tp1": 80400.0,
+        "atr": 200.0, "status": "OCO_FAILED"}
+btp._signed_request = fake_any_leg
+try:
+    out_n1, err_n1 = btp.build_exit_legs(dict(r_n1), "k", "s", 0.00001)
+finally:
+    btp._signed_request = orig_signed
+check("資料缺失" in str(out_n1.get("adopt_error")),
+      "NEW-1: ValueError 標「資料缺失」(唔混入查詢失敗)", str(out_n1.get("adopt_error")))
+check(out_n1.get("adopt_fail_count") is None,
+      "NEW-1: 資料缺失唔 increment 查詢失敗 counter", str(out_n1.get("adopt_fail_count")))
+
+# NEW-3: partial 要入 alert 範圍
+check("partial_count" in full, "NEW-3: partial 有獨立 counter (alert 唔會盲)")
+reset_log()
+def fake_partial_n3(method, path, params, key, secret):
+    if method == "GET" and path.endswith("/openOrders"):
+        return [{"orderId": 8301, "clientOrderId": btp._exit_cid({"order_id": 607}, "B")}]
+    posted.append((method, path))
+    return {"orderId": 999, "orderListId": 999, "orders": [{"orderId": 1}]}
+
+
+r_n3 = dict(r77, order_id=607)
+btp._signed_request = fake_partial_n3
+try:
+    out_n3, _e3 = btp.build_exit_legs(dict(r_n3), "k", "s", 0.00001)
+finally:
+    btp._signed_request = orig_signed
+check(out_n3.get("partial_count") == 1, "NEW-3: partial 會計數", str(out_n3.get("partial_count")))
+check(out_n3.get("adopt_error") is not None, "NEW-3: partial 有 adopt_error 摘要")
 
 # FINDING 2a: 下游冇 skip flagged 記錄 (否則 fail-closed 會變永久)
 cf2a = open(os.path.join(REPO, "btc_auto_trade_cycle.py"), encoding="utf-8").read()

@@ -788,6 +788,11 @@ def build_exit_legs(rec, key, secret, lot_step):
             rec["needs_manual_reconcile"] = True
             rec["adopt_note"] = (f"只 adopt 到 {sorted(tags_found)} 條 leg, 冇 stop leg "
                                  f"— fail-closed, 唔落新 legs, 需人手確認")
+            # NEW-3 (GLM 第八輪): partial 係最危險嘅一種 (半覆蓋倉), 一定要入 alert
+            # 範圍 —— 否則 ops 只 alert adopt_fail_count/adopt_error 會盲咗。
+            rec["partial_count"] = int(rec.get("partial_count") or 0) + 1
+            rec["adopt_error"] = (f"partial adopt: 只有 {sorted(tags_found)}, 冇 stop leg "
+                                  f"(第 {rec['partial_count']} 次)")
             _log_upsert(rec)
             return "partial"
         # FINDING 5a: 成功時清走上一輪嘅 transient flags
@@ -806,6 +811,13 @@ def build_exit_legs(rec, key, secret, lot_step):
     _adopt_res = None
     try:
         _adopt_res = _adopt_existing()
+    except ValueError as e:
+        # NEW-1 (GLM 第八輪): 資料缺失 (缺 order_id 等) 同網絡失敗要分流 ——
+        # 否則 counter 混埋, FINDING 4 想達到嘅「分得出網絡 vs 代碼/資料 bug」失效。
+        rec["needs_manual_reconcile"] = True
+        rec["adopt_error"] = f"資料缺失 (ValueError): {e} — 拒絕 adopt/落新 legs"
+        _log_upsert(rec)
+        return rec, "exit 記錄缺 oid — 拒絕 adopt/落新 legs (fail-closed)"
     except Exception as e:                              # noqa: BLE001
         # FINDING 2b/4 (GLM 第七輪): 記 traceback 尾幾行, 令 log 分得出「網絡」定
         # 「代碼 bug」。加 adopt_fail_count 令連續失敗可被外部 alert 監測。
@@ -871,6 +883,11 @@ def build_exit_legs(rec, key, secret, lot_step):
     if leg_ids and rec.get("status") != "FLATTENED_OCO_FAILED":
         rec["exit_leg_ids"] = leg_ids
         rec["status"] = "OCO_PLACED"
+        # NEW-4 (GLM 第八輪): 落新 OCO 成功 = 倉已有完整 legs → 清走上一輪嘅
+        # transient flags (否則 flag 話要人手 reconcile, 但其實已經 OK)。
+        for _k in ("needs_manual_reconcile", "adopt_error", "adopt_fail_count",
+                   "partial_count", "partial_adopt_ids", "unknown_holding_reason"):
+            rec.pop(_k, None)
     elif not leg_ids and rec.get("status") in ("FILLED_ENTRY", "LIMIT_FILLED"):
         rec["status"] = "OCO_FAILED"
         rec["oco_error"] = "no exit legs built"
