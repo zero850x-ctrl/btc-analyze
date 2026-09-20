@@ -728,6 +728,21 @@ check("_HOLDING_STATUS = (" not in cfull2, "LOW-I: cycle 冇重複定義")
 # LOW-H: adopt-miss 要 observable
 check("adopt_error" in full, "LOW-H: adopt 查詢失敗有記錄 (observable)")
 
+print("\n=== H0. 實測揪出: FLATTENED_LOW_FILL_RR 唔應該佔 cap ===")
+# 08-20 靜江實跑時, F4 warning 報「未見過嘅 status: FLATTENED_LOW_FILL_RR x3」。
+# 查實: 該狀態 = 成交後 RR < MIN_RR_EXEC → 即刻市價平倉, log 有 flatten_ok=True
+# → 真嘅平咗 → 必須當 done。之前 fail-closed 將佢當 live → 3 筆殭屍永久佔 cap。
+check(btp.is_live_rec({"status": "FLATTENED_LOW_FILL_RR"}) is False,
+      "FLATTENED_LOW_FILL_RR 唔算 live (唔佔 cap)")
+check(btp.is_live_rec({"status": "FLATTENED_OCO_FAILED"}) is True,
+      "FLATTENED_OCO_FAILED 仍然算 live (flatten 未確認成功)")
+check("FLATTENED_LOW_FILL_RR" in btp.DONE_STATUS,
+      "FLATTENED_LOW_FILL_RR 喺 DONE_STATUS")
+# 該狀態唔應該再觸發「未見過」warning
+_known = set(btp.DONE_STATUS) | set(btp.ORPHAN_STATUS) | {"LIMIT_PENDING", "OCO_PLACED"}
+check("FLATTENED_LOW_FILL_RR" in _known,
+      "F4 warning 唔會再報 FLATTENED_LOW_FILL_RR (已知)")
+
 print("\n=== H7. GLM 第七輪: FINDING 1/2/3/4/5/6 ===")
 # FINDING 1: partial adopt 必須 fail-closed —— 唔可以 fall through 落新 OCO
 reset_log()

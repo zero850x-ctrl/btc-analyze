@@ -149,7 +149,12 @@ def load_log():
 # F5 (GLM 第三輪): 原本仲有一個 LIVE_STATUS tuple 但冇任何消費者 —— 已刪 (死代碼,
 # 而且「WIPED 當 live」呢個政策決定藏喺死 tuple 入面, 會誤導讀者)。
 # 明確「已完結」= 唔再佔用倉位 (其餘一律當 live)
-DONE_STATUS = ("CLOSED", "LIMIT_EXPIRED", "LIMIT_CANCELLED", "SKIP_PREFLIGHT")
+# FLATTENED_LOW_FILL_RR: 成交後 RR < MIN_RR_EXEC → 即刻市價平倉。log 有 flatten_ok=True
+#   = 真嘅平咗 → 必須當 done, 否則 3 筆殭屍記錄永久佔 cap (新 code 實測揪出, 因為
+#   fail-closed 會將佢當 live)。注意: FLATTENED_OCO_FAILED 唔同 —— 佢係 flatten
+#   **未確認成功**, 所以仍然要當 live / 交人手。
+DONE_STATUS = ("CLOSED", "LIMIT_EXPIRED", "LIMIT_CANCELLED", "SKIP_PREFLIGHT",
+               "FLATTENED_LOW_FILL_RR")
 
 # 每日虧損硬上限 (R)。XAUUSD 用 -3R hard stop; BTC 實測最差單日 -3.59R (09-04, 4 單),
 # 11 日之中只有 1 日 ≤ -3R → -3R 唔會過度封鎖, 但會截斷最壞嘅日。
