@@ -175,6 +175,12 @@ def is_live_rec(o):
 ORPHAN_STATUS = ("FLATTENED_OCO_FAILED", "OCO_FAILED", "ENTRY_FILLED_PENDING_EXITS",
                  "FILLED_ENTRY", "LIMIT_FILLED", "WIPED")
 
+# 持貨類 status —— 佔住實際 BTC 嘅狀態 (用嚟做持倉歸因扣減, LOW-4/LOW-I)。
+# 注意: 唔包括 LIMIT_PENDING (掛單未成交、冇鎖 BTC)。
+# WIPED / FLATTENED_OCO_FAILED 保守當「可能仲有貨」(flatten 結果可能未確認)。
+HOLDING_STATUS = ("ENTRY_FILLED_PENDING_EXITS", "OCO_PLACED", "FILLED_ENTRY",
+                  "LIMIT_FILLED", "OCO_FAILED", "FLATTENED_OCO_FAILED", "WIPED")
+
 
 def estimate_held_for(rec, acct_btc, live_recs):
     """估算某一筆記錄自己嘅持倉 = 帳戶總額 − 其他 live 記錄嘅 qty (>=0)。
@@ -225,9 +231,9 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
     # 一部分, 但實際只夠一筆)。呢個情況下自動行動就係賭博 → 整批 freeze。
     orphans = [r for r in log.get("orders", [])
                if str(r.get("status") or "") in ORPHAN_STATUS]
-    # acct_btc 優先; 向後兼容: 若冇傳而 held_qty 係 scalar 就當佢係帳戶總額
-    if acct_btc is None and isinstance(held_qty, (int, float)):
-        acct_btc = float(held_qty)
+    # LOW-G (GLM 第六輪): 刪走「scalar held_qty 當帳戶總額」嘅向後兼容分支 ——
+    # 同一個參數兩代唔同意思, 靠 silent reinterpretation 銜接 = 另一種隱式歧義
+    # (同 HIGH-1 同款)。生產唯一 caller 已改傳 acct_btc, 冇人需要兼容。
     _acct = float(acct_btc) if acct_btc is not None else None
     if _acct is not None:
         try:
@@ -255,12 +261,14 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
             h = held_qty
         if h is None:
             # MEDIUM-3 (GLM 第五輪): 之前靜默 continue → 連 log 都冇。
-            # 一個可能真有倉嘅記錄永久裸掛但零 observability。改為標記 + 出聲。
-            rec["needs_manual_reconcile"] = True
-            rec["needs_legs"] = True
-            rec["unknown_holding_reason"] = "冇法判斷持倉 (qty 缺失或帳戶查唔到)"
+            # MEDIUM-C (第六輪): 但唔可以每 cycle 重複 flag + 重複入 changed
+            # (status 唔變 → 下個 cycle 又 append → dirty=True → 每 cycle rewrite)。
+            # 亦唔應該用 needs_legs —— 我唔知有冇倉, 唔係「需要 legs」。
             summary["skipped"] += 1
-            changed.append(rec)
+            if not rec.get("needs_manual_reconcile"):
+                rec["needs_manual_reconcile"] = True
+                rec["unknown_holding_reason"] = "冇法判斷持倉 (qty 缺失或帳戶查唔到)"
+                changed.append(rec)
             continue
         if float(h) <= dust_eps:
             rec["status"] = "CLOSED"
@@ -382,7 +390,7 @@ def save_log(log):
         # LOW-6 (GLM 第五輪): fsync 目錄 —— 否則 crash 時 rename 唔保證持久
         # (可能彈返舊檔)。open dir + fsync 係 POSIX rename durability 嘅標準做法。
         try:
-            dfd = os.open(os.path.dirname(LOG_PATH), os.O_RDONLY)
+            dfd = os.open(os.path.dirname(LOG_PATH) or ".", os.O_RDONLY)
             try:
                 os.fsync(dfd)
             finally:
@@ -718,36 +726,76 @@ def build_exit_legs(rec, key, secret, lot_step):
     # 喺 exchange 上 untracked (OCO_B/L3 永遠補唔上 = 1/3 倉裸掛)。
     # 修: rebuild 前先查 openOrders 有冇同 prefix 嘅 legs, 有就直接 adopt。
     def _adopt_existing():
-        try:
-            opens_now = _signed_request("GET", "/api/v3/openOrders",
-                                        {"symbol": SYMBOL}, key, secret)
-        except Exception:                               # noqa: BLE001
-            return False
-        # prefix 要同 _exit_cid 一致: <tag>-EXIT-<oid>
-        # OCO 落單用 listClientOrderId, 但 openOrders 回報嘅 leg 層欄位係
-        # clientOrderId; 兩者都要查 (OCO list id 會出現喺 leg 嘅 clientOrderId 後綴
-        # 或者獨立 list 查詢, 所以用 "EXIT-<oid>" 子串匹配最穩)。
-        oid_s = str(rec.get("order_id") or rec.get("oco_id") or "")
-        if not oid_s:
-            return False
-        needle = f"-EXIT-{oid_s}"
-        got = []
+        """重試時 adopt 已存在嘅 legs —— 精確匹配, fail-closed。
+
+        GLM 第五輪 HIGH-2 加, 第六輪 HIGH-A/B/D 修正:
+          HIGH-A: 原本用 substring needle "-EXIT-<oid>" → oid=77 會匹配到
+                  "A-EXIT-777" (冇邊界) → adopt 錯倉。改為**精確**比對 _exit_cid
+                  產生嘅完整 cid 集合。
+          HIGH-B: 原本 except → return False 係 fail-open (一次網絡抖動就繞過
+                  成個冪等保護) → 改為 raise, 交由 caller 當失敗 (下個 cycle 重試)。
+          MEDIUM-D: 原本只搵到部分 legs 都標 OCO_PLACED → 半覆蓋倉 (可能缺 stop
+                  leg)。改為要求 A/B 齊 (或者起碼搵到 >=1 而 caller 知係部分)。
+        """
+        opens_now = _signed_request("GET", "/api/v3/openOrders",
+                                    {"symbol": SYMBOL}, key, secret)
+        # 精確 cid 集合 (同落單時完全一致)
+        wanted = {}
+        for tag in ("A", "B", "L3"):
+            wanted[_exit_cid(rec, tag)] = tag
+        got, seen, tags_found = [], set(), set()
         for o in opens_now:
             cid = str(o.get("clientOrderId") or "")
             lid = str(o.get("listClientOrderId") or "")
-            if needle in cid or needle in lid:
-                got.append(o.get("orderId"))
+            hit_tag = None
+            if cid in wanted:
+                hit_tag = wanted[cid]
+            else:
+                for w, tg in wanted.items():
+                    # list id 層: OCO 嘅 listClientOrderId === 落單時嘅 cid
+                    if lid == w:
+                        hit_tag = tg
+                        break
+            if hit_tag is None:
+                continue
+            oid = o.get("orderId")
+            if oid in seen:                       # MEDIUM-D: dedupe
+                continue
+            seen.add(oid)
+            got.append(oid)
+            tags_found.add(hit_tag)
         if not got:
+            return False
+        # MEDIUM-D: 唔可以只搵到一部分就宣告成功 (可能缺 stop leg = 裸露)
+        if "A" not in tags_found and "L3" not in tags_found:
+            # 冇任何帶 stop 嘅段 → 唔算成功, 交人手。
+            # 注意: 唔可以喺判斷之前就標 adopted_existing_legs (否則 caller 見 True
+            # 會以為成功, 測試亦捉到呢個 bug)。
+            rec["partial_adopt_ids"] = got
+            rec["adopt_tags_found"] = sorted(tags_found)
+            rec["needs_manual_reconcile"] = True
+            rec["adopt_note"] = (f"只 adopt 到 {sorted(tags_found)} 條 leg, 冇 stop leg "
+                                 f"— 唔宣告成功, 需人手確認")
+            _log_upsert(rec)
             return False
         rec["exit_leg_ids"] = got
         rec["adopted_existing_legs"] = True
+        rec["adopt_tags_found"] = sorted(tags_found)
         rec["status"] = "OCO_PLACED"
-        rec["adopt_note"] = f"重試時 adopt 咗 {len(got)} 條已存在 exit legs (避免重複)"
+        rec["adopt_note"] = (f"重試時 adopt 咗 {len(got)} 條已存在 exit legs "
+                             f"(tags={sorted(tags_found)}) — 避免重複")
         _log_upsert(rec)
         return True
 
-    if _adopt_existing():
-        return rec, None
+    try:
+        if _adopt_existing():
+            return rec, None
+    except Exception as e:                              # noqa: BLE001
+        # HIGH-B: 唔可以 fail-open。查唔到 = 唔知有冇 legs = 唔應該落新單。
+        rec["needs_manual_reconcile"] = True
+        rec["adopt_error"] = f"{type(e).__name__}: {e} — 查詢失敗, 拒絕落新 legs"
+        _log_upsert(rec)
+        return rec, f"adopt 查詢失敗 ({type(e).__name__}) — 拒絕落新 legs (fail-closed)"
 
     try:
         oco_a = _oco_qty(q1, tp1, "A") if tp1 else None

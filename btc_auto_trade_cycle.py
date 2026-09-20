@@ -223,7 +223,8 @@ def reconcile_cycle(key, secret):
                                        build_exit_legs, exchange_filters,
                                        current_price, LIMIT_TTL_HOURS,
                                        resolve_orphan_states, is_live_rec,
-                                       DONE_STATUS, ORPHAN_STATUS, estimate_held_for)
+                                       DONE_STATUS, ORPHAN_STATUS, estimate_held_for,
+                                       HOLDING_STATUS)
 
     log_d = load_log()
     changed = []
@@ -258,12 +259,10 @@ def reconcile_cycle(key, secret):
     except Exception:                                   # noqa: BLE001
         _acct_btc = None                                # 查唔到 → resolve 會 skip
     # LOW-4 (GLM 第五輪): 只扣「持貨類」status 嘅 qty。
-    # LIMIT_PENDING 買單未成交、冇鎖 BTC, 照扣會低估孤兒持倉 → 可能 spurious
-    # CLOSED (no_position) 放走真有貨嘅倉。
-    _HOLDING_STATUS = ("ENTRY_FILLED_PENDING_EXITS", "OCO_PLACED", "FILLED_ENTRY",
-                       "LIMIT_FILLED", "OCO_FAILED", "FLATTENED_OCO_FAILED", "WIPED")
+    # LOW-I (第六輪): tuple 由 binance_testnet_paper 定義 (HOLDING_STATUS),
+    #   唔喺呢度重複一份 —— 兩份會 drift, 而 LOW-4 正正就係食過呢個虧。
     _live_recs = [r for r in log_d["orders"]
-                  if is_live_rec(r) and str(r.get("status") or "") in _HOLDING_STATUS]
+                  if is_live_rec(r) and str(r.get("status") or "") in HOLDING_STATUS]
 
     def _held_for(rec):
         """該筆自己嘅估算持倉 —— 邏輯喺 estimate_held_for() (可測)。"""

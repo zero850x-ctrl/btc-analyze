@@ -506,7 +506,7 @@ check(not called3, "HIGH-1: 生產形狀下唔會 call rebuild", str(len(called3
 # HIGH-1b: 生產路徑真嘅傳 acct_btc
 cfull2 = open(os.path.join(REPO, "btc_auto_trade_cycle.py"), encoding="utf-8").read()
 check("acct_btc=_acct_btc" in cfull2, "HIGH-1: reconcile_cycle 有傳 acct_btc")
-check("_HOLDING_STATUS" in cfull2, "LOW-4: 只扣持貨類 status")
+check("HOLDING_STATUS" in cfull2, "LOW-4: 只扣持貨類 status")
 
 # LOW-4: LIMIT_PENDING (未成交買單) 唔應該被扣
 HOLD = ("ENTRY_FILLED_PENDING_EXITS", "OCO_PLACED", "FILLED_ENTRY",
@@ -564,7 +564,7 @@ posted = []
 def fake_signed2(method, path, params, key, secret):
     if method == "GET" and path.endswith("/openOrders"):
         # 只有一條已存在 leg, clientOrderId 有正確 prefix
-        return [{"orderId": 9001, "clientOrderId": "A-EXIT-777"}]
+        return [{"orderId": 9001, "clientOrderId": btp._exit_cid({"order_id": 777}, "A")}]
     posted.append((method, path))
     return {"orderId": 999, "orderListId": 999,
             "orders": [{"orderId": 1}, {"orderId": 2}]}
@@ -609,26 +609,124 @@ check(any(p[1].endswith("/order/oco") for p in posted),
 
 # LOW-4: 生產 _HOLDING_STATUS 過濾 —— 行為驗證 (用生產嘅實際 tuple)
 cf_hold = open(os.path.join(REPO, "btc_auto_trade_cycle.py"), encoding="utf-8").read()
-m_hold = _re2.search(r"_HOLDING_STATUS = \((.*?)\)", cf_hold, _re2.S)
-check(m_hold is not None, "LOW-4: 找到 _HOLDING_STATUS 定義")
-if m_hold:
-    names = _re2.findall(r'"([^"]+)"', m_hold.group(1))
+names = list(btp.HOLDING_STATUS)
+check(len(names) > 0, "LOW-4: 讀到 module-level HOLDING_STATUS")
+if names:
     check("LIMIT_PENDING" not in names,
           f"LOW-4: _HOLDING_STATUS 唔包含 LIMIT_PENDING", str(names))
     check("OCO_FAILED" in names and "FLATTENED_OCO_FAILED" in names,
           "LOW-4: 包含 OCO_FAILED / FLATTENED_OCO_FAILED", str(names))
-    # 用生產 tuple 真嘅過濾一次
+    # 用生產 tuple 真嘅過濾一次 (直接 import module-level HOLDING_STATUS)
     mine_r2 = {"order_id": 93, "qty": 0.002, "status": "OCO_FAILED"}
     pend_r2 = {"order_id": 94, "qty": 0.005, "status": "LIMIT_PENDING"}
     filt = [r for r in [mine_r2, pend_r2]
-            if btp.is_live_rec(r) and r.get("status") in tuple(names)]
+            if btp.is_live_rec(r) and r.get("status") in btp.HOLDING_STATUS]
     h2 = btp.estimate_held_for(mine_r2, 0.002, filt)
     check(abs(h2 - 0.002) < 1e-12,
           "LOW-4: 用生產 tuple 過濾 → LIMIT_PENDING 唔扣", str(h2))
     # 斷言使用處真嘅用咗 _HOLDING_STATUS (唔止定義存在 —— mutation 改使用處
     # 而 tuple 定義不變嘅話, 只檢查定義會捉唔到)
-    check(_re2.search(r"in _HOLDING_STATUS\]", cf_hold) is not None,
-          "LOW-4: _live_recs 真嘅用 _HOLDING_STATUS 過濾 (唔止定義存在)")
+    check(_re2.search(r"in HOLDING_STATUS\]", cf_hold) is not None,
+          "LOW-4/LOW-I: _live_recs 用 module-level HOLDING_STATUS 過濾")
+    check('_HOLDING_STATUS = (' not in cf_hold,
+          "LOW-I: cycle 冇再重複定義一份 tuple (避免 drift)")
+
+print("\n=== H6. GLM 第六輪: HIGH-A / HIGH-B / MEDIUM-C/D/E / LOW-G/H/I ===")
+# HIGH-A: oid 前綴碰撞唔可以 adopt 錯倉 (oid=77 vs 777)
+reset_log()
+posted.clear()
+
+
+def fake_collide(method, path, params, key, secret):
+    if method == "GET" and path.endswith("/openOrders"):
+        # 只有 777 嘅 leg; 記錄 77 唔應該 adopt 佢
+        return [{"orderId": 7001, "clientOrderId": btp._exit_cid({"order_id": 777}, "A")}]
+    posted.append((method, path))
+    return {"orderId": 999, "orderListId": 999, "orders": [{"orderId": 1}, {"orderId": 2}]}
+
+
+r77 = {"order_id": 77, "side": "BUY", "qty": 0.001, "planned_stop": 79600.0,
+       "planned_tp1": 80400.0, "planned_tp2": 80800.0, "atr": 200.0, "status": "OCO_FAILED"}
+btp._signed_request = fake_collide
+try:
+    out77, _ = btp.build_exit_legs(dict(r77), "k", "s", 0.00001)
+finally:
+    btp._signed_request = orig_signed
+check(not out77.get("adopted_existing_legs"),
+      "HIGH-A: oid=77 唔會 adopt oid=777 嘅 leg (冇 substring 碰撞)",
+      str(out77.get("adopted_existing_legs")))
+check(7001 not in (out77.get("exit_leg_ids") or []),
+      "HIGH-A: 77 嘅 exit_leg_ids 唔包含 7001", str(out77.get("exit_leg_ids")))
+
+# HIGH-B: openOrders 查詢失敗要 fail-closed (唔可以照落單)
+reset_log()
+posted.clear()
+
+
+def fake_fail(method, path, params, key, secret):
+    if method == "GET" and path.endswith("/openOrders"):
+        raise RuntimeError("network timeout")
+    posted.append((method, path))
+    return {"orderId": 999, "orderListId": 999, "orders": [{"orderId": 1}]}
+
+
+r_hb = dict(r77, order_id=601)
+btp._signed_request = fake_fail
+try:
+    out_hb, err_hb = btp.build_exit_legs(dict(r_hb), "k", "s", 0.00001)
+finally:
+    btp._signed_request = orig_signed
+check(err_hb is not None and "fail-closed" in str(err_hb),
+      "HIGH-B: 查詢失敗 → 報錯 (fail-closed)", str(err_hb))
+check(not [p for p in posted if p[1].endswith("/order/oco")],
+      "HIGH-B: 查詢失敗時冇落新 OCO", str(posted))
+check(out_hb.get("needs_manual_reconcile") is True, "HIGH-B: 標 needs_manual_reconcile")
+
+# MEDIUM-D: partial adopt (只有 B tag, 冇 stop leg) → 唔可以宣告成功
+reset_log()
+posted.clear()
+
+
+def fake_partial(method, path, params, key, secret):
+    if method == "GET" and path.endswith("/openOrders"):
+        return [{"orderId": 8001, "clientOrderId": btp._exit_cid({"order_id": 602}, "B")}]
+    posted.append((method, path))
+    return {"orderId": 999, "orderListId": 999, "orders": [{"orderId": 1}]}
+
+
+r_mp = dict(r77, order_id=602)
+btp._signed_request = fake_partial
+try:
+    out_mp, _ = btp.build_exit_legs(dict(r_mp), "k", "s", 0.00001)
+finally:
+    btp._signed_request = orig_signed
+check(not out_mp.get("adopted_existing_legs"),
+      "MEDIUM-D: 只有 B tag (冇 stop leg) → 唔宣告成功")
+check(out_mp.get("needs_manual_reconcile") is True, "MEDIUM-D: 標 needs_manual_reconcile")
+
+# MEDIUM-C: h is None 唔可以每 cycle 重複 flag + 重複入 changed
+reset_log()
+btp._log_upsert({"order_id": 96, "pattern": "A", "side": "BUY", "qty": 0.002,
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+c1, s1_ = btp.resolve_orphan_states(lg, held_qty=None)
+c2, s2_ = btp.resolve_orphan_states(lg, held_qty=None)
+check(len(c1) == 1, "MEDIUM-C: 第一次會標記 + 入 changed", str(len(c1)))
+check(len(c2) == 0, "MEDIUM-C: 第二次唔會再入 changed (唔 spam)", str(len(c2)))
+check(lg["orders"][0].get("needs_legs") is None,
+      "MEDIUM-C: 唔用誤導性 needs_legs (我唔知有冇倉)")
+
+# MEDIUM-E: dirname 空字串要用 "."
+check('os.path.dirname(LOG_PATH) or "."' in full, "MEDIUM-E: dirname 空 → 用 '.'")
+# LOW-G: 冇再用手法兼容分支
+check("isinstance(held_qty, (int, float))" not in full,
+      "LOW-G: 刪走 scalar→acct_btc 隱式兼容分支")
+# LOW-I: tuple 抽去 module level, cycle 唔重複定義
+check("HOLDING_STATUS" in full and "HOLDING_STATUS = (" in full,
+      "LOW-I: HOLDING_STATUS 定義喺 module level")
+check("_HOLDING_STATUS = (" not in cfull2, "LOW-I: cycle 冇重複定義")
+# LOW-H: adopt-miss 要 observable
+check("adopt_error" in full, "LOW-H: adopt 查詢失敗有記錄 (observable)")
 
 # F4: 未知 status warning
 cfull = open(os.path.join(REPO, "btc_auto_trade_cycle.py"), encoding="utf-8").read()
@@ -652,7 +750,7 @@ btp._log_upsert({"order_id": 72, "pattern": "B", "side": "BUY", "qty": 0.003,
 lg = btp.load_log()
 called2 = []
 changed, summ = btp.resolve_orphan_states(
-    lg, held_qty=0.0035, dust_eps=0.0001,
+    lg, held_qty=0.0035, dust_eps=0.0001, acct_btc=0.0035,
     rebuild=lambda r: called2.append(r) or _good_rebuild(r))
 check(summ.get("frozen_ambiguous") == 2, "模糊歸因 → 整批 freeze (2 筆)", str(summ))
 check(not called2, "模糊歸因時唔會 call rebuild (唔賭)", str(len(called2)))
@@ -666,7 +764,7 @@ btp._log_upsert({"order_id": 73, "pattern": "A", "side": "BUY", "qty": 0.002,
                  "status": "OCO_FAILED", "entry_fill": 80000.0})
 lg = btp.load_log()
 changed, summ = btp.resolve_orphan_states(lg, held_qty=0.002, dust_eps=0.0001,
-                                          rebuild=_good_rebuild)
+                                          acct_btc=0.002, rebuild=_good_rebuild)
 check(summ.get("frozen_ambiguous", 0) == 0, "歸因清晰時唔會 freeze", str(summ))
 check(summ["rebuilt"] == 1, "歸因清晰時正常補建", str(summ))
 
