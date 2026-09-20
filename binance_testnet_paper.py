@@ -270,6 +270,9 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
                 rec["unknown_holding_reason"] = "冇法判斷持倉 (qty 缺失或帳戶查唔到)"
                 changed.append(rec)
             continue
+        # FINDING 5b: 恢復正常時清走上一輪嘅 transient flag
+        rec.pop("needs_manual_reconcile", None)
+        rec.pop("unknown_holding_reason", None)
         if float(h) <= dust_eps:
             rec["status"] = "CLOSED"
             rec["resolved_via"] = "no_position"
@@ -737,6 +740,12 @@ def build_exit_legs(rec, key, secret, lot_step):
           MEDIUM-D: 原本只搵到部分 legs 都標 OCO_PLACED → 半覆蓋倉 (可能缺 stop
                   leg)。改為要求 A/B 齊 (或者起碼搵到 >=1 而 caller 知係部分)。
         """
+        # FINDING 3 (GLM 第七輪): 恢復 empty-oid guard —— 兩筆都冇 order_id 嘅記錄
+        # 會產生完全相同嘅 cid 集合 (A-EXIT-None), 喺 openOrders 碰面就 cross-adopt
+        # (HIGH-A 嘅 missing-id 版本)。_exit_cid 本身已 raise, 但呢度要早退而唔係
+        # 被當「查詢失敗」。
+        if not (rec.get("order_id") or rec.get("oco_id")):
+            raise ValueError("冇 order_id/oco_id — 唔可以靠 cid 匹配 adopt")
         opens_now = _signed_request("GET", "/api/v3/openOrders",
                                     {"symbol": SYMBOL}, key, secret)
         # 精確 cid 集合 (同落單時完全一致)
@@ -750,12 +759,15 @@ def build_exit_legs(rec, key, secret, lot_step):
             hit_tag = None
             if cid in wanted:
                 hit_tag = wanted[cid]
-            else:
-                for w, tg in wanted.items():
-                    # list id 層: OCO 嘅 listClientOrderId === 落單時嘅 cid
-                    if lid == w:
-                        hit_tag = tg
-                        break
+            elif lid in wanted:
+                # FINDING 6 (GLM 第七輪): listClientOrderId === 落單時嘅 cid,
+                # 而 OCO 落單用 tag A 或 B。但 leg-level cid 可能係 exchange 自家
+                # 亂數, 所以 lid 命中時只可以當「呢條 leg 屬於該 OCO 段」——
+                # 若該段係 B (TP2+SL) 或 A (TP1+SL), 兩者都帶 stop, 所以 A/B 都算
+                # 有 stop。真正嘅 risk 係 L3 (尾倉 SL) 要分開認。
+                # 直接由 wanted 拎 tag, 唔靠 dict 迭代 (dict 順序雖則有保證, 但
+                # 明確 lookup 更清楚)。
+                hit_tag = wanted[lid]
             if hit_tag is None:
                 continue
             oid = o.get("orderId")
@@ -768,16 +780,20 @@ def build_exit_legs(rec, key, secret, lot_step):
             return False
         # MEDIUM-D: 唔可以只搵到一部分就宣告成功 (可能缺 stop leg = 裸露)
         if "A" not in tags_found and "L3" not in tags_found:
-            # 冇任何帶 stop 嘅段 → 唔算成功, 交人手。
-            # 注意: 唔可以喺判斷之前就標 adopted_existing_legs (否則 caller 見 True
-            # 會以為成功, 測試亦捉到呢個 bug)。
+            # FINDING 1 (GLM 第七輪): 唔可以只 return False —— caller 會 fall through
+            # 落新 OCO → 舊 partial leg + 新完整 OCO = 兩套 exits (賣出 qty 可能超過
+            # 持倉)。partial 同查詢失敗一樣要 fail-closed: 交人手, 唔落新單。
             rec["partial_adopt_ids"] = got
             rec["adopt_tags_found"] = sorted(tags_found)
             rec["needs_manual_reconcile"] = True
             rec["adopt_note"] = (f"只 adopt 到 {sorted(tags_found)} 條 leg, 冇 stop leg "
-                                 f"— 唔宣告成功, 需人手確認")
+                                 f"— fail-closed, 唔落新 legs, 需人手確認")
             _log_upsert(rec)
-            return False
+            return "partial"
+        # FINDING 5a: 成功時清走上一輪嘅 transient flags
+        rec.pop("needs_manual_reconcile", None)
+        rec.pop("adopt_error", None)
+        rec.pop("adopt_fail_count", None)
         rec["exit_leg_ids"] = got
         rec["adopted_existing_legs"] = True
         rec["adopt_tags_found"] = sorted(tags_found)
@@ -787,15 +803,26 @@ def build_exit_legs(rec, key, secret, lot_step):
         _log_upsert(rec)
         return True
 
+    _adopt_res = None
     try:
-        if _adopt_existing():
-            return rec, None
+        _adopt_res = _adopt_existing()
     except Exception as e:                              # noqa: BLE001
-        # HIGH-B: 唔可以 fail-open。查唔到 = 唔知有冇 legs = 唔應該落新單。
+        # FINDING 2b/4 (GLM 第七輪): 記 traceback 尾幾行, 令 log 分得出「網絡」定
+        # 「代碼 bug」。加 adopt_fail_count 令連續失敗可被外部 alert 監測。
+        import traceback as _tb
+        rec["adopt_fail_count"] = int(rec.get("adopt_fail_count") or 0) + 1
         rec["needs_manual_reconcile"] = True
-        rec["adopt_error"] = f"{type(e).__name__}: {e} — 查詢失敗, 拒絕落新 legs"
+        rec["adopt_error"] = (f"{type(e).__name__}: {e} — 查詢失敗, 拒絕落新 legs "
+                              f"(第 {rec['adopt_fail_count']} 次)\n"
+                              + "\n".join(_tb.format_exc().strip().splitlines()[-3:]))
         _log_upsert(rec)
-        return rec, f"adopt 查詢失敗 ({type(e).__name__}) — 拒絕落新 legs (fail-closed)"
+        return rec, (f"adopt 查詢失敗 ({type(e).__name__}) — 拒絕落新 legs (fail-closed), "
+                     f"連續 {rec['adopt_fail_count']} 次")
+    if _adopt_res == "partial":
+        # FINDING 1: partial adopt 都要 fail-closed
+        return rec, "adopt 只搵到部分 legs — 拒絕落新 legs (fail-closed, 需人手)"
+    if _adopt_res:
+        return rec, None
 
     try:
         oco_a = _oco_qty(q1, tp1, "A") if tp1 else None

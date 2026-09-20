@@ -728,6 +728,134 @@ check("_HOLDING_STATUS = (" not in cfull2, "LOW-I: cycle 冇重複定義")
 # LOW-H: adopt-miss 要 observable
 check("adopt_error" in full, "LOW-H: adopt 查詢失敗有記錄 (observable)")
 
+print("\n=== H7. GLM 第七輪: FINDING 1/2/3/4/5/6 ===")
+# FINDING 1: partial adopt 必須 fail-closed —— 唔可以 fall through 落新 OCO
+reset_log()
+posted.clear()
+
+
+def fake_partial2(method, path, params, key, secret):
+    if method == "GET" and path.endswith("/openOrders"):
+        return [{"orderId": 8001, "clientOrderId": btp._exit_cid({"order_id": 603}, "B")}]
+    posted.append((method, path))
+    return {"orderId": 999, "orderListId": 999, "orders": [{"orderId": 1}]}
+
+
+r_f1 = dict(r77, order_id=603)
+btp._signed_request = fake_partial2
+try:
+    out_f1, err_f1 = btp.build_exit_legs(dict(r_f1), "k", "s", 0.00001)
+finally:
+    btp._signed_request = orig_signed
+check(not [p for p in posted if p[1].endswith("/order/oco")],
+      "FINDING 1: partial adopt 時**冇落新 OCO** (fail-closed)", str(posted))
+check(err_f1 is not None, "FINDING 1: partial 會回報錯誤 (唔係靜默 fall through)", str(err_f1))
+check(out_f1.get("status") != "OCO_PLACED",
+      "FINDING 1: partial 唔會標 OCO_PLACED", str(out_f1.get("status")))
+
+# FINDING 3: empty-oid guard 恢復 (兩筆冇 id 唔可以 cross-adopt)
+reset_log()
+posted.clear()
+
+
+def fake_any_leg(method, path, params, key, secret):
+    if method == "GET" and path.endswith("/openOrders"):
+        return [{"orderId": 9001, "clientOrderId": "A-EXIT-None"}]
+    posted.append((method, path))
+    return {"orderId": 999, "orderListId": 999, "orders": [{"orderId": 1}]}
+
+
+r_f3 = {"side": "BUY", "qty": 0.001, "planned_stop": 79600.0, "planned_tp1": 80400.0,
+        "atr": 200.0, "status": "OCO_FAILED"}   # 冇 order_id / oco_id
+btp._signed_request = fake_any_leg
+try:
+    out_f3, err_f3 = btp.build_exit_legs(dict(r_f3), "k", "s", 0.00001)
+finally:
+    btp._signed_request = orig_signed
+check(not out_f3.get("adopted_existing_legs"),
+      "FINDING 3: 冇 order_id 唔會 adopt (唔會 cross-adopt)", str(out_f3.get("adopted_existing_legs")))
+check("order_id" in str(out_f3.get("adopt_error") or ""),
+      "FINDING 3: 錯誤訊息指名 order_id 缺失", str(out_f3.get("adopt_error")))
+# FINDING 3 係**雙重保護**: _adopt_existing 有 early guard, _exit_cid 內部亦 raise。
+# 所以移除任一層行為都不變 (mutation 捉唔到) —— 呢個係防禦冗餘, 唔係缺口。
+# 明確斷言兩層都存在, 免得日後有人以為只靠一層而刪走另一層。
+check("唔可以靠 cid 匹配 adopt" in full, "FINDING 3: _adopt_existing 有 early guard")
+check("唔應該自動落 exit legs" in full, "FINDING 3: _exit_cid 亦有 raise (第二層)")
+check(out_f3.get("adopt_fail_count") == 1,
+      "FINDING 3/4: 有記 adopt_fail_count", str(out_f3.get("adopt_fail_count")))
+
+# FINDING 4 + LOW-H: adopt_error 要真嘅寫入 log + 含 traceback 尾幾行
+reset_log()
+
+
+def fake_net_fail(method, path, params, key, secret):
+    if method == "GET" and path.endswith("/openOrders"):
+        raise RuntimeError("network timeout")
+    return {}
+
+
+r_f4 = dict(r77, order_id=604)
+btp._signed_request = fake_net_fail
+try:
+    out_f4, err_f4 = btp.build_exit_legs(dict(r_f4), "k", "s", 0.00001)
+finally:
+    btp._signed_request = orig_signed
+saved = [o for o in btp.load_log()["orders"] if o.get("order_id") == 604]
+check(len(saved) == 1, "LOW-H: 錯誤有寫入 log (行為斷言, 唔係 grep)")
+check(saved and saved[0].get("adopt_error") is not None,
+      "FINDING 4: log 內有 adopt_error", str(saved[0].get("adopt_error") if saved else None))
+check(saved and "RuntimeError" in str(saved[0].get("adopt_error")),
+      "FINDING 4: adopt_error 含異常類型 (分得出網絡/代碼)")
+check(saved and "traceback" not in str(saved[0].get("adopt_error")).lower(),
+      "FINDING 4: 放 traceback 尾幾行而非全文")
+check(saved and saved[0].get("adopt_fail_count") == 1, "FINDING 2b: 有 fail count")
+
+# FINDING 5a: adopt 成功要清走 transient flags
+reset_log()
+posted.clear()
+
+
+def fake_ok(method, path, params, key, secret):
+    if method == "GET" and path.endswith("/openOrders"):
+        return [{"orderId": 9101, "clientOrderId": btp._exit_cid({"order_id": 605}, "A")}]
+    posted.append((method, path))
+    return {"orderId": 999, "orderListId": 999, "orders": [{"orderId": 1}]}
+
+
+r_f5 = dict(r77, order_id=605, needs_manual_reconcile=True,
+            adopt_error="舊錯誤", adopt_fail_count=3)
+btp._signed_request = fake_ok
+try:
+    out_f5, _ = btp.build_exit_legs(dict(r_f5), "k", "s", 0.00001)
+finally:
+    btp._signed_request = orig_signed
+check(out_f5.get("adopted_existing_legs") is True, "FINDING 5a: 成功 adopt")
+check(out_f5.get("needs_manual_reconcile") is None,
+      "FINDING 5a: 成功後清走 needs_manual_reconcile (transient)")
+check(out_f5.get("adopt_error") is None, "FINDING 5a: 成功後清走 adopt_error")
+check(out_f5.get("adopt_fail_count") is None, "FINDING 5a: 成功後清走 adopt_fail_count")
+
+# FINDING 5b: orphan 恢復正常時清走 unknown_holding_reason
+reset_log()
+btp._log_upsert({"order_id": 97, "pattern": "A", "side": "BUY", "qty": 0.002,
+                 "status": "OCO_FAILED", "entry_fill": 80000.0,
+                 "needs_manual_reconcile": True, "unknown_holding_reason": "舊原因"})
+lg = btp.load_log()
+btp.resolve_orphan_states(lg, held_qty=0.0, dust_eps=0.0001)
+check(lg["orders"][0].get("unknown_holding_reason") is None,
+      "FINDING 5b: 恢復正常後清走 unknown_holding_reason")
+check(lg["orders"][0].get("needs_manual_reconcile") is None,
+      "FINDING 5b: 清走 needs_manual_reconcile")
+
+# FINDING 2a: 下游冇 skip flagged 記錄 (否則 fail-closed 會變永久)
+cf2a = open(os.path.join(REPO, "btc_auto_trade_cycle.py"), encoding="utf-8").read()
+check("needs_manual_reconcile" not in cf2a,
+      "FINDING 2a: 下游冇用 needs_manual_reconcile 做 skip 過濾 (唔會永久封鎖)")
+
+# FINDING 6: listClientOrderId 命中時明確 lookup, 唔靠迭代
+check("elif lid in wanted:" in full and "hit_tag = wanted[lid]" in full,
+      "FINDING 6: lid 命中用明確 lookup")
+
 # F4: 未知 status warning
 cfull = open(os.path.join(REPO, "btc_auto_trade_cycle.py"), encoding="utf-8").read()
 check("未見過嘅 status" in cfull, "F4: 未知 status 有 warning log")
@@ -794,8 +922,9 @@ check(len(c1) <= 36, f"cid 長度 <= 36 ({len(c1)})")
 # build_exit_legs 自己改 status + persist (BLOCKER 1 第 2 點)
 check('rec["status"] = "OCO_PLACED"' in full,
       "build_exit_legs 自己改 status = OCO_PLACED")
-check("_log_upsert(rec)" in full.split("def build_exit_legs")[1][:6000],
-      "build_exit_legs 自己 persist (唔靠 caller)")
+_bel = full.split("def build_exit_legs")[1].split("\ndef ")[0]   # 整個函數體
+check("_log_upsert(rec)" in _bel,
+      "build_exit_legs 自己 persist (唔靠 caller)", str(len(_bel)))
 check(cfull.count('_signed_request("GET", "/api/v3/account"') == 1,
       "F1: 帳戶餘額只查一次 (rate limit 安全)",
       str(cfull.count('_signed_request("GET", "/api/v3/account"')))
