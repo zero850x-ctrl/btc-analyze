@@ -80,6 +80,7 @@ def reconcile_alerts(summary, acct_btc):
         def _fmt(d):
             return ", ".join(f"{k}={v}" for k, v in sorted(d.items()))
 
+        _fired = False
         if cur != prev:
             if cur and prev:
                 msgs.append(f"⚠️ 孤兒對帳狀態變化: {_fmt(cur)} (之前: {_fmt(prev)})")
@@ -88,11 +89,19 @@ def reconcile_alerts(summary, acct_btc):
             elif prev:
                 msgs.append(f"✅ 孤兒對帳已清空 (之前: {_fmt(prev)})")
             st["alert_ts"] = now_ts
+            _fired = True
         elif cur and now_ts - float(st.get("alert_ts") or 0.0) >= ALERT_REMIND_SEC:
             # GLM 09-27 #3: 狀態長期唔變 (e.g. freeze 後) 都要定期重提 ——
             # 一次性警報冇人理 = 永遠靜默 (7 日事故核心教訓)。
             msgs.append(f"⏰ 孤兒對帳仍未處理 (每 {ALERT_REMIND_SEC // 3600}h 重提): {_fmt(cur)}")
             st["alert_ts"] = now_ts
+            _fired = True
+        # 2B (office R1-B, 2026-09-27): freeze 要有專屬醒目訊號 —— 唔可以只靠
+        # summary 數字變化。有警報出 (變化/重提) 時, freeze 記錄附加 🚨 一行。
+        _frozen = int(cur.get("frozen_rebuild") or 0)
+        if _frozen and _fired:
+            msgs.append(f"🚨 對帳重建已凍結 (需人手): {_frozen} 筆 — 倉位可能冇止損, "
+                        f"檢查 rebuild_frozen_note (清 rebuild_frozen 可恢復)")
         st["orphan_summary"] = cur
         if acct_btc is not None:
             hw = st.get("balance_hw")
@@ -122,19 +131,10 @@ def find_unmatched_sells(trades, log_d, since_ms=None):
     不變量, 冇 archive/rotation)。若日後加 log rotation, 要改為掃埋 archive,
     否則舊記錄嘅 leg 成交會誤報。
     """
+    from binance_testnet_paper import record_known_ids   # 單一來源 (btp), 唔重複維護
     known = set()
     for r in (log_d or {}).get("orders", []):
-        for f in ("order_id", "oco_id", "l3_id", "flatten_order_id"):
-            v = r.get(f)
-            if v is not None:
-                known.add(str(v))
-        # 所有 leg id 欄位: 新格式 exit_leg_ids + 舊格式 oco_leg_ids / OCO_A/B 分段 /
-        # 已消耗 closed_leg_ids。GLM round-3 核實 + 2026-09-27 真 myTrades 對證:
-        # 舊記錄只有 oco_leg_ids (冇 exit_leg_ids), 唔包會令正常 leg 成交誤報。
-        for f in ("exit_leg_ids", "oco_leg_ids", "oco_a_leg_ids", "oco_b_leg_ids",
-                  "closed_leg_ids"):
-            for i in (r.get(f) or []):
-                known.add(str(i))
+        known |= record_known_ids(r)
     out = []
     for t in trades or []:
         if t.get("isBuyer"):
@@ -449,7 +449,8 @@ def reconcile_cycle(key, secret):
     orph, orph_summ = resolve_orphan_states(
         log_d, _held_for, dust_eps=dust_eps,
         rebuild=_rebuild if lot_step is not None else None,
-        acct_btc=_acct_btc)          # HIGH-1: freeze-on-ambiguity 要用帳戶總額
+        acct_btc=_acct_btc,          # HIGH-1: freeze-on-ambiguity 要用帳戶總額
+        trades_getter=_get_trades)   # P1: 歸零判 CLOSED 前覆核賣出證據 (共用 fetch)
     if orph:
         changed.extend(orph)
         dirty = True

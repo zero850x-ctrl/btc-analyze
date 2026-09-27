@@ -197,9 +197,10 @@ ORPHAN_STATUS = ("FLATTENED_OCO_FAILED", "OCO_FAILED", "ENTRY_FILLED_PENDING_EXI
 # 持貨類 status —— 佔住實際 BTC 嘅狀態 (用嚟做持倉歸因扣減, LOW-4/LOW-I)。
 # 注意: 唔包括 LIMIT_PENDING (掛單未成交、冇鎖 BTC)。
 # FLATTENED_OCO_FAILED 保守當「可能仲有貨」(flatten 結果可能未確認)。
-# WIPED 保留喺 tuple 只為歷史審計 — 佢而家係 DONE, 唔會 live, 唔會入扣減。
+# WIPED 已移出 (2026-09-27 office R2): 佢係 DONE 終態, 永遠唔 live — 之前留住
+# 只係隱式依賴 call site 嘅 is_live_rec 過濾; 移走少一個坑。
 HOLDING_STATUS = ("ENTRY_FILLED_PENDING_EXITS", "OCO_PLACED", "FILLED_ENTRY",
-                  "LIMIT_FILLED", "OCO_FAILED", "FLATTENED_OCO_FAILED", "WIPED")
+                  "LIMIT_FILLED", "OCO_FAILED", "FLATTENED_OCO_FAILED")
 
 
 def estimate_held_for(rec, acct_btc, live_recs):
@@ -232,7 +233,47 @@ def estimate_held_for(rec, acct_btc, live_recs):
     return max(0.0, acct_btc - others)
 
 
-def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=None):
+def record_known_ids(rec):
+    """記錄嘅所有已知 order id (落單 / legs / flatten) —— 賣出對帳 + 賣出證據共用。
+
+    包含舊格式 (oco_leg_ids / OCO_A/B / closed_leg_ids)。2026-09-27 實證: 舊記錄
+    只有 oco_leg_ids; 唔包會令正常 leg 成交誤報 (GLM round-3 核實)。
+    """
+    ids = set()
+    for f in ("order_id", "oco_id", "l3_id", "flatten_order_id"):
+        v = rec.get(f)
+        if v is not None:
+            ids.add(str(v))
+    for f in ("exit_leg_ids", "oco_leg_ids", "oco_a_leg_ids", "oco_b_leg_ids",
+              "closed_leg_ids"):
+        for i in (rec.get(f) or []):
+            ids.add(str(i))
+    return ids
+
+
+def _rec_remaining(rec):
+    """記錄未實現剩餘量 (qty − realized_qty/parts)。qty 缺失 → None (判斷唔到)。"""
+    q = rec.get("qty")
+    if q is None:
+        return None
+    try:
+        r = rec.get("realized_qty")
+        if r is None:
+            r = sum(float(p.get("qty") or 0.0) for p in (rec.get("realized_parts") or []))
+        return max(0.0, float(q) - float(r))
+    except (TypeError, ValueError):
+        return None
+
+
+def clear_transient_flags(rec):
+    """轉終態時清走 transient 旗 (office R1-C, 2026-09-27) —— 殘留旗會誤導
+    「有幾多筆需人手」查詢 (實測 10 筆 FLATTENED_LOW_FILL_RR 帶 needs_manual)。"""
+    for k in ("needs_manual_reconcile", "unknown_holding_reason", "rebuild_frozen"):
+        rec.pop(k, None)
+
+
+def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=None,
+                          trades_getter=None):
     """對帳孤兒狀態 —— fail-closed 嘅復原路徑。
 
     held_qty: 每筆持倉。callable(rec) -> float|None, 或 scalar。
@@ -241,11 +282,13 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
               = 死代碼。freeze-on-ambiguity 必須用呢個參數做。
     dust_eps: 低於此當「冇倉」。
     rebuild:  有倉時補建函數。
+    trades_getter: 可選 callable() -> list[myTrades] — 「歸零判 CLOSED」前覆核
+                   賣出證據 (P1, GLM round-2); None = 跳過覆核 (舊行為)。
     """
     changed = []
     summary = {"closed_orphan": 0, "rebuilt": 0, "needs_legs": 0, "skipped": 0,
-               "frozen_unknown": 0, "frozen_ambiguous": 0,
-               "resolved_flattened": 0, "rebuild_failed": 0}
+               "skipped_evidence": 0, "frozen_unknown": 0, "frozen_ambiguous": 0,
+               "frozen_rebuild": 0, "resolved_flattened": 0, "rebuild_failed": 0}
 
     # ── 模糊歸因前置檢查 (2026-09-20 GLM 第四輪 MEDIUM) ────────────────────
     # 如果孤兒 qty 總和 > 帳戶餘額, 逐筆估出嚟嘅持倉**唔可能同時啱** (每人各分到
@@ -291,7 +334,45 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
                 rec["unknown_holding_reason"] = "冇法判斷持倉 (qty 缺失或帳戶查唔到)"
                 changed.append(rec)
             continue
+        # P1 (GLM round-2, 2026-09-27): 估算唔可以多過記錄剩餘量 —— cap 防高估
+        # 搶倉 (legs 觸發時賣走唔屬於呢筆嘅幣)。低估方向由下面賣出證據覆核擋。
+        _rem = _rec_remaining(rec)
+        if _rem is not None and float(h) > _rem:
+            h = _rem
+        if float(h) <= dust_eps:
+            # P1: 「歸零 → CLOSED」前必須有賣出證據 —— myTrades 有本記錄嘅 sell
+            # 成交 (legs / flatten / entry-sell orderId)。冇證據 = 可能未對帳賣出
+            # (phantom 同類) 或幽靈 → 降級 needs_manual, 唔自動 CLOSED。
+            # trades_getter=None (直接 caller / 舊測試) → 跳過覆核, 保持舊行為。
+            _blocked = None
+            if trades_getter is not None:
+                try:
+                    _tl = trades_getter()
+                except Exception as _e:              # noqa: BLE001
+                    _tl = None
+                    _blocked = f"myTrades 查唔到 ({type(_e).__name__}), 唔敢自動 CLOSED"
+                if _blocked is None:
+                    if not isinstance(_tl, list):
+                        # contract: getter 只回 list 或 raise; None/其他 = 唔可靠 →
+                        # fail-closed (GLM round-4 MEDIUM: 唔可以靜默跳過覆核)
+                        _blocked = (f"myTrades getter 回 {type(_tl).__name__} (唔係 list), "
+                                    f"唔敢自動 CLOSED")
+                    else:
+                        _ids = record_known_ids(rec)
+                        if not any((not t.get("isBuyer")) and str(t.get("orderId")) in _ids
+                                   for t in _tl):
+                            _blocked = "持倉歸零但冇本記錄嘅賣出成交 (可能未對帳賣出) — 交人手"
+            if _blocked:
+                summary["skipped"] += 1
+                summary["skipped_evidence"] = summary.get("skipped_evidence", 0) + 1
+                if (not rec.get("needs_manual_reconcile")
+                        or rec.get("unknown_holding_reason") != _blocked):
+                    rec["needs_manual_reconcile"] = True
+                    rec["unknown_holding_reason"] = _blocked
+                    changed.append(rec)
+                continue
         # FINDING 5b: 恢復正常時清走上一輪嘅 transient flag
+        # (放喺證據覆核之後 —— 唔可以清走上面啱啱落嘅訊號)
         rec.pop("needs_manual_reconcile", None)
         rec.pop("unknown_holding_reason", None)
         if float(h) <= dust_eps:
@@ -299,6 +380,7 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
             rec["resolved_via"] = "no_position"
             rec["resolved_ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             rec.setdefault("closed_note", "孤兒狀態復原: exchange 冇倉 → 歸 CLOSED")
+            clear_transient_flags(rec)        # office R1-C: 終態清 transient 旗
             changed.append(rec)
             summary["closed_orphan"] += 1
         elif st == "FLATTENED_OCO_FAILED" and rec.get("flatten_ok") is True:
@@ -311,6 +393,7 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
             rec["resolved_ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             rec.setdefault("resolved_note",
                            "flatten 已確認成功 (flatten_ok=True) → 對帳判定冇倉 (終態)")
+            clear_transient_flags(rec)        # office R1-C: 終態清 transient 旗
             changed.append(rec)
             summary["resolved_flattened"] += 1
         elif rebuild is None:
@@ -339,9 +422,21 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
             # 唔可以只標 needs_legs (冇消費者 = 死巷 → 倉永久裸掛冇止損)。
             # F2: contract —— rebuild 必須令 rec 離開 ORPHAN_STATUS, 否則當失敗
             # (免得每個 cycle 重複補建 → 重複 SELL legs)。
-            if int(rec.get("rebuild_fail_count") or 0) >= REBUILD_FAIL_FREEZE:
-                # 已連續失敗達門檻 → 停手交人手 (唔重試、唔重複入 changed)
+            if rec.get("rebuild_frozen") or int(rec.get("rebuild_fail_count") or 0) >= REBUILD_FAIL_FREEZE:
+                # 已 freeze → 停手交人手 (唔重試)。2A (office, 2026-09-27):
+                # rebuild_frozen 係獨立終態欄位, 唔靠會被 pop 嘅 needs_manual_reconcile
+                # → 訊號持續 + 警報可以消費 (frozen_rebuild)。
+                if not rec.get("rebuild_frozen"):
+                    rec["rebuild_frozen"] = True
+                    rec["rebuild_frozen_note"] = (
+                        f"重建連續失敗 {int(rec.get('rebuild_fail_count') or 0)} 次 → "
+                        f"停止自動重建, 交人手對帳 (清 rebuild_frozen/rebuild_fail_count 可恢復)")
+                    changed.append(rec)
+                # GLM round-4 MEDIUM: FINDING 5b 每 tick 會 pop needs_manual —
+                # frozen 記錄要 re-assert, 唔係「需人手」查詢會漏計 (rebuild_frozen 係主旗)。
+                rec["needs_manual_reconcile"] = True
                 summary["needs_legs"] += 1
+                summary["frozen_rebuild"] = summary.get("frozen_rebuild", 0) + 1
                 continue
             try:
                 before = str(rec.get("status") or "")
@@ -357,6 +452,7 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
                 rec.pop("needs_legs", None)
                 rec.pop("rebuild_error", None)
                 rec.pop("rebuild_fail_count", None)
+                rec.pop("rebuild_frozen", None)
                 rec.pop("rebuild_frozen_note", None)
                 rec["rebuilt_legs_ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 summary["rebuilt"] += 1
@@ -368,9 +464,11 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
                 rec["rebuild_fail_count"] = int(rec.get("rebuild_fail_count") or 0) + 1
                 if rec["rebuild_fail_count"] >= REBUILD_FAIL_FREEZE:
                     rec["needs_manual_reconcile"] = True
+                    rec["rebuild_frozen"] = True          # 2A: 獨立終態欄位 (唔會被 pop)
                     rec["rebuild_frozen_note"] = (
                         f"重建連續失敗 {rec['rebuild_fail_count']} 次 → 停止自動重建, "
                         f"交人手對帳 (清 rebuild_frozen/rebuild_fail_count 可恢復)")
+                    summary["frozen_rebuild"] = summary.get("frozen_rebuild", 0) + 1
                 summary["rebuild_failed"] += 1
             changed.append(rec)
         else:

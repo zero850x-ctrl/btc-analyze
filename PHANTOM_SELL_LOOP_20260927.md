@@ -52,7 +52,9 @@
   建議 P1 (`estimate_held_for` 語意) / P2 (異常賣出偵測)。
 - **Round-3** (P2 diff): **APPROVE** — 要求核實 `exit_leg_ids` 覆蓋 (✅ 真 myTrades
   對證: 靠 leg 成交收口嘅記錄 100% 命中) + 補狀態機測試 (✅ R9d-g) + 細項 (✅)。
-- 最終: guards 222 / limit_entry 39 / rr_gates 17 + 其餘 5 suite 全綠;
+- **Round-4** (1+2 diff): **APPROVE** — 2 個防禦性 MEDIUM 即場修埋 (getter contract
+  fail-closed / frozen needs_manual re-assert) + skipped_evidence 分離。
+- 最終: guards 231 / limit_entry 41 / rr_gates 17 + 其餘 5 suite 全綠;
   integration_check 真 testnet ALL PASS; heartbeat 零污染。
 
 ## 遺留 / 後續
@@ -63,9 +65,15 @@
   `sell_reconcile_alerts` — 24h 窗 ≥2 筆唔對應本地記錄 → ⚠️ 推 TG (12h dedupe);
   flatten 記 `flatten_order_id`; `sell_scan_since` 錨點 (唔為歷史響)。
   實測: anchor 後 0 筆; 24h 全窗 27 筆 (事故遺留) — 即當時會喺第一小時內捉到。
-- **P1 `estimate_held_for` 語意** (待批): 高估方向已有 myTrades ghost 防護擋;
-  低估→誤判 CLOSED 方向, GLM 建議 `min(est, rec_remaining)` + 關閉前 myTrades 覆核。
-- 本分支 merge 前 cron 行 worktree 現時分支 (未 merge 都行到新 code); merge 後還原。
+- ~~P1 `estimate_held_for` 語意~~ ✅ 已做 (1+2 批次): 估算 cap `min(est, rec_remaining)`
+  + 歸零判 CLOSED 前 myTrades 賣出證據覆核 (冇證據/查唔到 → needs_manual, fail-closed)。
+  測試 F3i/F3j。
+- ~~office 提案: freeze 訊號強化~~ ✅ 已做 (1+2 批次): `rebuild_frozen` 獨立終態欄位 +
+  `frozen_rebuild` summary + 🚨 專屬警報 (NOTABLE_KEYS 已加) + 終態清 transient 旗;
+  生產 10 筆殘留旗已清 (備份 `...bak-20260927-flagcleanup`)。測試 F3c 擴/F3h/F3k + R10。
+- office review 其他 (backlog): P3 裸倉窗口 (設計取捨, 可議 balance-gated flatten) /
+  P4 myTrades 1000 窗 / P5 flatten 成交核實 / P6 integration 沙盒。
+- 本分支已 merge 入 main (2026-09-27); cron BRANCH_PIN 還原 main。
 
 ## 備份
 

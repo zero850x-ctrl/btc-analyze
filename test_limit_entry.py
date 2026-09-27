@@ -352,6 +352,14 @@ _m7 = cyc.sell_reconcile_alerts(None, {"orders": []})
 result("R9g myTrades 失敗: 出一次聲 (6h dedupe)", bool(_m6) and not _m7,
        f"(m6={len(_m6)}, m7={len(_m7)})")
 
+# R10 (2026-09-27 1+2 office R1-B): freeze 專屬警報 —— summary 有 frozen_rebuild
+# → 除咗 ⚠️/⏰ 之外多一條 🚨 (唔使靠數字變化先見到)
+_state_patch(orphan_summary={}, alert_ts=0)
+_m10 = cyc.reconcile_alerts({"needs_legs": 1, "frozen_rebuild": 1}, None)
+result("R10 freeze 專屬警報 🚨", any("🚨" in m and "凍結" in m for m in _m10), f"({_m10})")
+_m11 = cyc.reconcile_alerts({"needs_legs": 1}, None)
+result("R10b 冇 frozen 就唔會出 🚨", not any("🚨" in m for m in _m11), f"({_m11})")
+
 cyc.HISTORY = HIST_PATH
 
 print(f"\n{sum(1 for _, ok in RESULTS if ok)}/{len(RESULTS)} PASS")

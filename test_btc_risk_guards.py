@@ -481,6 +481,10 @@ _ch4, s4 = btp.resolve_orphan_states(lg, held_qty=0.001,
                                      rebuild=lambda r: calls_after.append(r) or _fail_rebuild(r))
 check(not calls_after, "freeze 後唔再重試 rebuild (停手交人手)", str(len(calls_after)))
 check(s4.get("needs_legs") == 1, "freeze 記錄仍計入 needs_legs (審計可見)", str(s4))
+check(lg["orders"][0].get("rebuild_frozen") is True,
+      "2A: freeze 用獨立 rebuild_frozen 欄位 (唔會被 pop)",
+      str(lg["orders"][0].get("rebuild_frozen")))
+check(s4.get("frozen_rebuild") == 1, "2B: summary 有 frozen_rebuild (警報可消費)", str(s4))
 
 # F3d (2026-09-27): 對帳 rebuild 路徑禁止市價平倉 —— build_exit_legs(allow_flatten=False)
 # OCO 落單失敗時**唔可以**出 MARKET 單 (會賣走唔屬於呢筆嘅幣)。
@@ -571,6 +575,55 @@ check(not any(v for v in summ.values()), "WIPED 唔入對帳 summary", str(summ)
 check(lg["orders"][0]["status"] == "WIPED", "WIPED 保持原狀")
 check(not btp.is_live_rec(lg["orders"][0]), "WIPED 唔佔 cap")
 check("WIPED" not in btp.ORPHAN_STATUS, "WIPED 已移出 ORPHAN_STATUS (唔再當孤兒)")
+
+# F3h (2026-09-27 1+2 office R1-C): 轉終態要清走 transient 旗 —— frozen 記錄
+# 經 flatten 確認轉 FLATTENED_LOW_FILL_RR 時, needs_manual/unknown/frozen 全清
+# (生產曾殘留 10 筆帶旗嘅終態記錄, 會誤導「有幾多筆需人手」查詢)
+reset_log()
+btp._log_upsert({"order_id": 63, "pattern": "A", "side": "BUY", "qty": 0.0026,
+                 "status": "FLATTENED_OCO_FAILED", "entry_fill": 80000.0,
+                 "flatten_ok": True, "needs_manual_reconcile": True,
+                 "rebuild_frozen": True, "rebuild_fail_count": 3,
+                 "rebuild_frozen_note": "x", "unknown_holding_reason": "y"})
+lg = btp.load_log()
+btp.resolve_orphan_states(lg, held_qty=0.001, acct_btc=1.0)
+o = lg["orders"][0]
+check(o["status"] == "FLATTENED_LOW_FILL_RR", "F3h: 轉終態", str(o.get("status")))
+check(o.get("needs_manual_reconcile") is None and o.get("rebuild_frozen") is None
+      and o.get("unknown_holding_reason") is None,
+      "F3h: 終態清走 transient 旗 (needs_manual/unknown/frozen)",
+      str({k: o.get(k) for k in ("needs_manual_reconcile", "unknown_holding_reason",
+                                 "rebuild_frozen")}))
+
+# F3i (2026-09-27 1+2 P1): 剩餘歸零 + myTrades 有賣出證據 → CLOSED (正常收口)
+reset_log()
+btp._log_upsert({"order_id": 64, "pattern": "A", "side": "BUY", "qty": 0.0026,
+                 "status": "OCO_FAILED", "entry_fill": 80000.0,
+                 "realized_qty": 0.0026, "exit_leg_ids": [881001]})
+lg = btp.load_log()
+_tg = lambda: [{"orderId": 881001, "isBuyer": False, "time": 0}]      # noqa: E731
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001, acct_btc=1.0,
+                                          trades_getter=_tg)
+o = lg["orders"][0]
+check(o["status"] == "CLOSED" and o.get("resolved_via") == "no_position",
+      "F3i P1: 剩餘歸零 + 有賣出證據 → CLOSED", str(o.get("status")))
+
+# F3j (2026-09-27 1+2 P1): 剩餘歸零但冇賣出證據 → 降 needs_manual (唔靜靜 CLOSED)
+reset_log()
+btp._log_upsert({"order_id": 65, "pattern": "A", "side": "BUY", "qty": 0.0026,
+                 "status": "OCO_FAILED", "entry_fill": 80000.0, "realized_qty": 0.0026})
+lg = btp.load_log()
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001, acct_btc=1.0,
+                                          trades_getter=_tg)
+o = lg["orders"][0]
+check(o.get("needs_manual_reconcile") is True and o["status"] == "OCO_FAILED",
+      "F3j P1: 剩餘歸零 + 冇賣出證據 → needs_manual (唔自動 CLOSED)",
+      f"({o.get('status')}, {o.get('unknown_holding_reason')})")
+check(summ.get("skipped") == 1, "F3j: 計入 skipped", str(summ))
+check(summ.get("skipped_evidence") == 1, "F3j: skipped_evidence 分開計 (語義唔混)", str(summ))
+
+# F3k (2026-09-27 1+2 office R2): WIPED 已移出 HOLDING_STATUS (冇隱式依賴)
+check("WIPED" not in btp.HOLDING_STATUS, "F3k: WIPED 已移出 HOLDING_STATUS")
 
 # F5: LIVE_STATUS 死代碼已刪 (只可以剩註釋提及, 唔可以有賦值)
 import re as _re2
