@@ -52,14 +52,28 @@ for lab in ("TRAIN", "TEST"):
 
 print("\n=== 樣本密度 ===")
 n, days = len(rows), 730
-print(f"  共 {n} 個 setup / {days} 日 = {n/days:.2f} 個/日")
+import os as _os
+_src = _os.path.basename(P)
+print(f"  來源: {_src}")
+print(f"  共 {n} 個 setup = {n/days:.2f} 個/日")
 print(f"  完整 gate 只有 {sum(1 for r in rows if r['GATE_FULL'])} 個 "
       f"= {sum(1 for r in rows if r['GATE_FULL'])/days*2:.2f} 個/週")
 
-print("\n=== 對照 baseline: 純 buy&hold (同期 BTC) ===")
-print("  (見 research_premium.py: 2 年 BTC 大致倍升; 559 setup sumR +34R)")
+print("\n=== severity 分層 (gate 真正喺度做咩) ===")
+sev = {}
+for r in rows:
+    sev.setdefault(r["sev"], []).append(r["pnl_r"])
+for s in sorted(sev, key=lambda k: -len(sev[k])):
+    v = sev[s]
+    m = sum(v) / len(v)
+    sd = (sum((x - m) ** 2 for x in v) / (len(v) - 1)) ** 0.5 if len(v) > 1 else 0
+    t = m / (sd / len(v) ** 0.5) if sd else 0.0
+    print(f"  {s:10} n={len(v):4}  meanR {m:+.3f}  t {t:+5.2f}")
 
 print("\n=== Bonferroni 修正 ===")
 print(f"  測咗 {len(GATES)} 個 gate 層 → 門檻 |t| > 2.5 (0.05/4 雙尾近似)")
-best = max(st([r["pnl_r"] for r in rows if r[g]]) for g in GATES)
-print(f"  最佳層 |t| = {abs(best[3]):.2f} → {'過' if abs(best[3]) > 2.5 else '唔過'}")
+cand = [st([r["pnl_r"] for r in rows if r[g]]) for g in GATES]
+cand = [c for c in cand if c]
+if cand:
+    best = max(cand, key=lambda c: abs(c[3]))
+    print(f"  最佳層 |t| = {abs(best[3]):.2f} → {'過' if abs(best[3]) > 2.5 else '唔過'}")

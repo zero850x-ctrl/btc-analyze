@@ -64,19 +64,19 @@ def parse_lvl(val):
     return float(m.group()) if m else None
 
 
-def load_bars(period="730d", interval="1h", csv_path=None):
+def load_bars(period="730d", interval="1h", csv_path=None, ticker="BTC-USD"):
     """同 walkforward_btc.load_bars 一致: 保留原大寫欄 + 加小寫別名.
 
-    ⚠️ av3.analyze_h1_trend / add_indicators 要 Open/High/Low/Close (大寫),
+    ⚠️ av3.analyze_h1_trend / add_indicators 要 Open/High/Low/Close/Volume (大寫),
     只留小寫會令每個窗口都 raise (而 except 會靜默食掉 → 0 樣本假象)。
 
-    csv_path 有值 → 讀 Binance CSV (yfinance 30m 只 60 日唔夠做統計)。
+    csv_path 有值 → 讀 CSV (yfinance 30m 只 60 日唔夠做統計)。
     """
     if csv_path:
         df = pd.read_csv(csv_path)
         df["datetime"] = pd.to_datetime(df["datetime"])
     else:
-        df = yf.Ticker("BTC-USD").history(period=period, interval=interval)
+        df = yf.Ticker(ticker).history(period=period, interval=interval)
         if df.empty:
             raise SystemExit("冇數據")
         df = df.reset_index()
@@ -86,10 +86,14 @@ def load_bars(period="730d", interval="1h", csv_path=None):
             df = df.rename(columns={"Date": "datetime"})
         if df["datetime"].dt.tz is not None:
             df["datetime"] = df["datetime"].dt.tz_convert("UTC").dt.tz_localize(None)
-    # 大寫欄名 — av3 內部要 Close/High/Low/Open/Volume (CSV 同 yf 兩路都要)
+    # 兩向都要: yfinance 出大寫 (Open..Volume), CSV 出小寫.
+    # av3 內部要 Close/High/Low/Open/Volume; sim 要 open/high/low/close/volume.
     for col in ("close", "high", "low", "open", "volume"):
-        if col.capitalize() not in df.columns:
-            df[col.capitalize()] = df[col]
+        cap = col.capitalize()
+        if col not in df.columns and cap in df.columns:
+            df[col] = df[cap]
+        if cap not in df.columns and col in df.columns:
+            df[cap] = df[col]
     return df.reset_index(drop=True)
 
 
@@ -268,10 +272,11 @@ def main():
     period = sys.argv[1] if len(sys.argv) > 1 else "730d"
     interval = sys.argv[2] if len(sys.argv) > 2 else "1h"
     csv_path = sys.argv[3] if len(sys.argv) > 3 else None
-    tag = f"csv:{os.path.basename(csv_path)}" if csv_path else f"{period}@{interval}"
-    print(f"=== XAUUSD 主力方法 → BTC ({tag}) ===\n")
+    ticker = sys.argv[4] if len(sys.argv) > 4 else "BTC-USD"
+    tag = (f"csv:{os.path.basename(csv_path)}" if csv_path else f"{ticker} {period}@{interval}")
+    print(f"=== XAUUSD 主力方法 → {ticker} ({tag}) ===\n")
     apply_interval_scaling(interval)
-    bars = load_bars(period, interval, csv_path)
+    bars = load_bars(period, interval, csv_path, ticker)
     print(f"bars: {len(bars)}  {bars['datetime'].iloc[0]} → {bars['datetime'].iloc[-1]}\n")
 
     mid = len(bars) // 2
@@ -282,6 +287,9 @@ def main():
     op = out_path(interval)
     if csv_path:
         op = op.replace(f"_{interval}.json", f"_{interval}_binance.json")
+    elif ticker != "BTC-USD":
+        safe = ticker.replace("=", "").replace("/", "")
+        op = op.replace(".json", f"_{safe}_{interval}.json")
     with open(op, "w") as f:
         json.dump(all_rows, f)
     print(f"\n已存 {len(all_rows)} 筆 → {op}\n")
