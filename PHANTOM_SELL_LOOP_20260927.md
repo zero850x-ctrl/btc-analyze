@@ -44,12 +44,27 @@
   (fake /account 無 BTC balance) — 已加固 (cyc.HEARTBEAT/RECONCILE_STATE redirect)，
   實際餘額 0.32669 完好。
 
+## Review rounds (GLM 5.3 Flash 獨立 review, 2026-09-27)
+
+- **Round-1** (commit 08954e5): NEEDS_FIX 14 findings → 8 修 + 3 反駁(附代碼證據:
+  tuple 拆包已有 / 限價路徑 default allow_flatten / L651 顯式終態) + 2 接受 → `30c075f`。
+- **Round-2** (full diff + 交代): **APPROVE** — 核實 round-1 處理正確、無新 blocker;
+  建議 P1 (`estimate_held_for` 語意) / P2 (異常賣出偵測)。
+- **Round-3** (P2 diff): **APPROVE** — 要求核實 `exit_leg_ids` 覆蓋 (✅ 真 myTrades
+  對證: 靠 leg 成交收口嘅記錄 100% 命中) + 補狀態機測試 (✅ R9d-g) + 細項 (✅)。
+- 最終: guards 222 / limit_entry 39 / rr_gates 17 + 其餘 5 suite 全綠;
+  integration_check 真 testnet ALL PASS; heartbeat 零污染。
+
 ## 遺留 / 後續
 
-- **WIPED 狀態**: `WIPED` 唔喺 DONE_STATUS 但註釋/log 訊息都話「cap 1 已釋放」—
-  下次 testnet 重置時 WIPED 記錄會仍然 live + 入 rebuild (同今次同類)。
-  建議 one-liner: WIPED 加入 DONE_STATUS + 移出 ORPHAN_STATUS/HOLDING_STATUS (待批)。
-- `estimate_held_for` 嘅「帳戶總額」語意 (孤兒 vs 未入 log 持倉) — 未在本次範圍。
+- ~~WIPED 狀態~~ ✅ 已修 (round-2): WIPED 入 DONE_STATUS + 移出 ORPHAN_STATUS;
+  測試鎖死 (F3g)。WIPED = 確認終態 (帳戶重置), 唔再殭屍佔 cap。
+- ~~更快嘅異常賣出偵測~~ ✅ 已做 (P2): 每 tick 賣出對帳 `find_unmatched_sells` /
+  `sell_reconcile_alerts` — 24h 窗 ≥2 筆唔對應本地記錄 → ⚠️ 推 TG (12h dedupe);
+  flatten 記 `flatten_order_id`; `sell_scan_since` 錨點 (唔為歷史響)。
+  實測: anchor 後 0 筆; 24h 全窗 27 筆 (事故遺留) — 即當時會喺第一小時內捉到。
+- **P1 `estimate_held_for` 語意** (待批): 高估方向已有 myTrades ghost 防護擋;
+  低估→誤判 CLOSED 方向, GLM 建議 `min(est, rec_remaining)` + 關閉前 myTrades 覆核。
 - 本分支 merge 前 cron 行 worktree 現時分支 (未 merge 都行到新 code); merge 後還原。
 
 ## 備份

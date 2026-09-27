@@ -538,6 +538,8 @@ check(out_e.get("status") == "FLATTENED_LOW_FILL_RR",
       "平倉確認 → 終態", str(out_e.get("status")))
 check(out_e.get("flatten_ok") is True, "flatten_ok=True 有記錄")
 check(not btp.is_live_rec(out_e), "終態唔佔 cap")
+check(out_e.get("flatten_order_id") == 77, "flatten_order_id 有記錄 (P2 賣出對帳)",
+      str(out_e.get("flatten_order_id")))
 
 # F3f (2026-09-27 GLM review #1 核實): 生產 _rebuild 經 build_exit_legs 回傳
 # (rec, err) **tuple** → resolve_orphan_states 必須正確拆包。呢度直接鎖死

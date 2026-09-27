@@ -659,11 +659,14 @@ def place_signal_order(setup, key, secret, atr=None, mode=None):
         rec["flatten_note"] = (f"成交後 RR {rr_fill:.2f} < {MIN_RR_EXEC} "
                                f"(entry_fill={fill_px:.2f}, 計劃 RR {rr:.2f}) — 即刻市價平倉")
         try:
-            _signed_request("POST", "/api/v3/order", {
+            _fl_resp = _signed_request("POST", "/api/v3/order", {
                 "symbol": SYMBOL, "side": exit_side, "type": "MARKET",
                 "quantity": f"{fill_qty:.5f}",
             }, key, secret)
             rec["flatten_ok"] = True
+            # 2026-09-27 GLM round-2 P2: 記低平倉 orderId → 賣出對帳可以結構性匹配
+            # (否則緊急平倉嘅 sell 會永遠當「唔對應記錄」= false positive)。
+            rec["flatten_order_id"] = (_fl_resp or {}).get("orderId")
         except urllib.error.HTTPError as e2:
             rec["flatten_ok"] = False
             rec["flatten_error"] = e2.read().decode()[:200]
@@ -925,11 +928,13 @@ def build_exit_legs(rec, key, secret, lot_step, allow_flatten=True):
                     pass
         if allow_flatten:
             try:
-                _signed_request("POST", "/api/v3/order", {
+                _fl_resp = _signed_request("POST", "/api/v3/order", {
                     "symbol": SYMBOL, "side": exit_side, "type": "MARKET",
                     "quantity": f"{fill_qty:.5f}",
                 }, key, secret)
                 rec["flatten_ok"] = True
+                # 2026-09-27 GLM round-2 P2: 記低平倉 orderId (賣出對帳結構性匹配)
+                rec["flatten_order_id"] = (_fl_resp or {}).get("orderId")
                 # 確認平倉 → 終態 (唔佔 cap、唔再入對帳 rebuild)
                 rec["status"] = "FLATTENED_LOW_FILL_RR"
                 rec["flatten_note"] = (f"exit order 建立失敗 ({type(e).__name__}) → "

@@ -56,6 +56,8 @@ def _restore_log():
         cur_orders = cur.get("orders", [])
         kept = [r for r in cur_orders if r.get("order_id") not in _test_ids]
         have = {r.get("order_id") for r in kept}
+        # 極端情況先會補回 (cron 唔會刪記錄); 若補返嘅係已完成記錄, 下輪對帳會再處理
+        # (GLM round-2 #7 註記)。
         readded = [r for r in orig_log["orders"] if r.get("order_id") not in have]
         cur["orders"] = kept + readded
         with open(LOG_PATH, "w") as f:

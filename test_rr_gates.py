@@ -132,6 +132,8 @@ result("T3f 記低 rr_planned / rr_px / rr_fill",
        rec3.get("rr_planned") is not None and rec3.get("rr_px") is not None
        and rec3.get("rr_fill") == 0.51,
        f"(planned={rec3.get('rr_planned')}, px={rec3.get('rr_px')}, fill={rec3.get('rr_fill')})")
+result("T3g flatten_order_id 有記錄 (P2 賣出對帳匹配用)",
+       rec3.get("flatten_order_id") == 999003, f"({rec3.get('flatten_order_id')})")
 
 # T4: 成交價好過計劃 → RR 過關, 唔應該 flat
 placed.clear()

@@ -49,6 +49,10 @@ BALANCE_DROP_ALERT_BTC = float(os.environ.get("BTC_BALANCE_DROP_ALERT", "0.05"))
 # 孤兒狀態長期唔變都要定期重提 (GLM 09-27 #3): 一次性警報冇人理 = 永遠靜默,
 # 正正係 7 日 phantom 事故嘅教訓。每 N 小時重提未處理嘅孤兒對帳。
 ALERT_REMIND_SEC = int(os.environ.get("BTC_ALERT_REMIND_HOURS", "6")) * 3600
+# 異常賣出偵測 (2026-09-27 GLM round-2 P2): 24h 窗內「賣出成交唔對應任何本地記錄」
+# ≥ N 筆 → ⚠️ (dedupe)。事故當時靠餘額跌 0.05 要 ~5h 先響; 呢個 detector 幾分鐘內揪到。
+UNMATCHED_SELL_MIN = int(os.environ.get("BTC_UNMATCHED_SELL_MIN", "2"))
+UNMATCHED_SELL_DEDUPE = int(os.environ.get("BTC_UNMATCHED_SELL_DEDUPE_H", "12")) * 3600
 
 
 def reconcile_alerts(summary, acct_btc):
@@ -104,6 +108,87 @@ def reconcile_alerts(summary, acct_btc):
             json.dump(st, f, ensure_ascii=False, indent=1)
     except Exception as e:                    # noqa: BLE001
         msgs.append(f"⚠️ reconcile alert 出錯 (唔影響交易): {type(e).__name__}: {e}")
+    return msgs
+
+
+def find_unmatched_sells(trades, log_d, since_ms=None):
+    """賣出成交 (isBuyer=False) 但 orderId 唔對應任何本地記錄 → list[orderId]。
+
+    2026-09-27 GLM round-2 P2 (phantom 同類偵測): 本地「已知 order」= 所有記錄嘅
+    order_id / oco_id / l3_id / flatten_order_id + 全部 leg id 欄位。任何其他賣出
+    成交都係未對帳賣出 —— 今次事故嘅 270 筆市價平倉正正全部係咁 (冇入 log)。
+
+    假設 (GLM round-3 LOW 註明): 已完成記錄會一直留喺 log_d["orders"] (現行
+    不變量, 冇 archive/rotation)。若日後加 log rotation, 要改為掃埋 archive,
+    否則舊記錄嘅 leg 成交會誤報。
+    """
+    known = set()
+    for r in (log_d or {}).get("orders", []):
+        for f in ("order_id", "oco_id", "l3_id", "flatten_order_id"):
+            v = r.get(f)
+            if v is not None:
+                known.add(str(v))
+        # 所有 leg id 欄位: 新格式 exit_leg_ids + 舊格式 oco_leg_ids / OCO_A/B 分段 /
+        # 已消耗 closed_leg_ids。GLM round-3 核實 + 2026-09-27 真 myTrades 對證:
+        # 舊記錄只有 oco_leg_ids (冇 exit_leg_ids), 唔包會令正常 leg 成交誤報。
+        for f in ("exit_leg_ids", "oco_leg_ids", "oco_a_leg_ids", "oco_b_leg_ids",
+                  "closed_leg_ids"):
+            for i in (r.get(f) or []):
+                known.add(str(i))
+    out = []
+    for t in trades or []:
+        if t.get("isBuyer"):
+            continue
+        if since_ms is not None and int(t.get("time") or 0) < int(since_ms):
+            continue
+        oid = t.get("orderId")
+        if str(oid) not in known:
+            out.append(oid)
+    return out
+
+
+def sell_reconcile_alerts(trades, log_d):
+    """異常賣出警報 (24h 窗 ≥ UNMATCHED_SELL_MIN, dedupe UNMATCHED_SELL_DEDUPE)。
+
+    首次執行只掃描之後嘅賣出 (sell_scan_since = now) —— 唔會一 deploy 就為歷史
+    賣出 (含事故遺留) 響。sell_scan_since 係「deploy 錨點」唔係 cursor: 佢唔會
+    前推, window = max(錨點, now−24h) (GLM round-3 LOW)。
+    trades=None (myTrades 查詢失敗) → 盲點提醒, 6h dedupe (GLM round-3 LOW)。
+    回傳 list[str]; caller 用 log() 輸出 (⚠️ → TG)。
+    """
+    msgs = []
+    try:
+        st = {}
+        if os.path.exists(RECONCILE_STATE):
+            with open(RECONCILE_STATE) as f:
+                st = json.load(f) or {}
+        now = time.time()
+        since = st.get("sell_scan_since")
+        if since is None:
+            since = now
+        if trades is None:
+            last_f = float(st.get("trades_fail_alert_ts") or 0.0)
+            if now - last_f >= 6 * 3600:
+                msgs.append("⚠️ myTrades 查詢失敗 — 賣出對帳今次跳過 (連續失敗每 6h 提醒)")
+                st["trades_fail_alert_ts"] = now
+            st["sell_scan_since"] = since
+            with open(RECONCILE_STATE, "w") as f:
+                json.dump(st, f, ensure_ascii=False, indent=1)
+            return msgs
+        window_start_ms = int(max(float(since), now - 24 * 3600) * 1000)
+        unmatched = find_unmatched_sells(trades, log_d, since_ms=window_start_ms)
+        if len(unmatched) >= UNMATCHED_SELL_MIN:
+            last = float(st.get("unmatched_sell_alert_ts") or 0.0)
+            if now - last >= UNMATCHED_SELL_DEDUPE:
+                msgs.append(
+                    f"⚠️ 24h 內 {len(unmatched)} 筆賣出成交唔對應任何本地記錄 "
+                    f"(orderIds={unmatched[:8]}) — 可能有未對帳賣出 (phantom 同類), 查 myTrades")
+                st["unmatched_sell_alert_ts"] = now
+        st["sell_scan_since"] = since
+        with open(RECONCILE_STATE, "w") as f:
+            json.dump(st, f, ensure_ascii=False, indent=1)
+    except Exception as e:                    # noqa: BLE001
+        msgs.append(f"⚠️ sell alert 出錯 (唔影響交易): {type(e).__name__}: {e}")
     return msgs
 
 
@@ -332,6 +417,17 @@ def reconcile_cycle(key, secret):
         """該筆自己嘅估算持倉 —— 邏輯喺 estimate_held_for() (可測)。"""
         return estimate_held_for(rec, _acct_btc, _live_recs)
 
+    _trades_cache = {"data": None}
+
+    def _get_trades():
+        """每 tick 共用嘅 myTrades (limit 1000) —— rebuild entry 驗證 + 賣出對帳共用,
+        唔使每個孤兒各查一次 (GLM round-2 #2 建議)。帳戶 lifetime ~360 筆, 遠離窗口上限。
+        """
+        if _trades_cache["data"] is None:
+            _trades_cache["data"] = _signed_request(
+                "GET", "/api/v3/myTrades", {"symbol": "BTCUSDT", "limit": 1000}, key, secret)
+        return _trades_cache["data"]
+
     def _rebuild(rec):
         if lot_step is None:
             raise RuntimeError("冇 lot_step, 唔敢建 legs")
@@ -340,8 +436,7 @@ def reconcile_cycle(key, secret):
         # legs → SL 遲啲觸發 = 延遲版市價平倉。驗證唔到 entry → 拒建, 交人手
         # (行同一條 rebuild-fail → freeze 路徑, 3 tick 後停手; 全程唔會落任何單)。
         entry_id = rec.get("order_id")
-        trades_all = _signed_request("GET", "/api/v3/myTrades",
-                                     {"symbol": "BTCUSDT", "limit": 1000}, key, secret)
+        trades_all = _get_trades()
         if not entry_id or not any(str(x.get("orderId")) == str(entry_id)
                                    for x in trades_all):
             raise RuntimeError(
@@ -363,6 +458,14 @@ def reconcile_cycle(key, secret):
     # 2026-09-27 phantom loop: 對帳狀態變化 / 餘額異常警報 (⚠️ = cron 會推送 TG;
     # 狀態唔變 = 完全靜默)。呼叫喺 orphan 處理之後, 攞到最新 summary + 餘額。
     for _m in reconcile_alerts(orph_summ, _acct_btc):
+        log(_m)
+    # 2026-09-27 GLM round-2 P2: 異常賣出偵測 (每 tick; 同 _rebuild 共用 _get_trades fetch)。
+    # myTrades 失敗 → trades=None → sell_reconcile_alerts 出盲點提醒 (6h dedupe)。
+    try:
+        _trades_now = _get_trades()
+    except Exception:                           # noqa: BLE001
+        _trades_now = None
+    for _m in sell_reconcile_alerts(_trades_now, log_d):
         log(_m)
 
     # ── F4: 未知 status 要出聲 (之前會永久 live 但零 log) ──────────────────
