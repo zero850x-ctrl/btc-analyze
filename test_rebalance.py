@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """test_rebalance.py — btc_rebalance.py 單元測試 (mock, 唔掂真 API)."""
+import json
 import os
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import btc_rebalance as rb  # noqa: E402
+
+# 帳本用 temp file — 測試唔可以碰真實 ~/.hermes/reports/btc_rebalance_ledger.json
+_fd, LEDGER_PATH = tempfile.mkstemp(suffix="_ledger.json")
+os.close(_fd)
+rb.LEDGER_PATH = LEDGER_PATH
 
 PASS = FAIL = 0
 def ok(name, cond, extra=""):
@@ -18,11 +24,22 @@ def ok(name, cond, extra=""):
         print(f"  ❌ {name}  {extra}")
 
 
-def mock_env(btc=1.00061, usdt=9951.02, px=78002.0, patch_post=None):
-    """把 read_account / current_price / exchange_filters / _signed_request 換成假嘅."""
+def set_ledger(btc, usdt):
+    with open(LEDGER_PATH, "w") as f:
+        json.dump({"created": "test", "btc": btc, "usdt": usdt, "trades": []}, f)
+
+
+def mock_env(btc=1.00061, usdt=9951.02, px=78002.0, patch_post=None,
+             led_btc=None, led_usdt=None):
+    """設定 mock 環境: 實際帳戶 + 虛擬帳本.
+
+    led_* 唔指定 = 帳本同實際一樣 (方便舊 case); 指定 = 模擬兩者唔同。
+    """
     rb.current_price = lambda: px
     rb.read_account = lambda k, s: (btc, usdt)
     rb.exchange_filters = lambda k, s: (0.00001, 0.00001, 10.0)
+    set_ledger(btc if led_btc is None else led_btc,
+               usdt if led_usdt is None else led_usdt)
     calls = []
 
     def fake_signed(method, path, params, key, secret):
@@ -132,6 +149,57 @@ post = [c for c in calls if c[0] == "POST"][0]
 ok("side = BUY", post[2].get("side") == "BUY", post[2])
 ok("有 quoteOrderQty", "quoteOrderQty" in post[2], post[2])
 ok("冇 quantity (BUY 用 quote)", "quantity" not in post[2], post[2])
+
+print("\n=== T11: 虛擬帳本 — 隔離馬丁格爾干擾 ===")
+rb.BAND = 0.0001
+# 帳本 88.7% BTC 要賣 0.3237 BTC, 但實際(被馬丁佔用)只有 0.20 → 應該 cap
+calls = mock_env(btc=0.20, usdt=42451.04, px=78002.0,
+                 led_btc=1.00061, led_usdt=9951.02)
+act, det = rb.rebalance("k", "s", dry=True)
+ok("ledger 話要賣 (88.7% > 60%)", act == "sell", act)
+ok("賣出量 cap 到實際可用 (<=0.20)", det["quantity"] <= 0.20, det.get("quantity"))
+ok("有標記 capped", det["state"].get("capped") is True, det["state"].get("capped"))
+
+print("\n=== T12: 帳本唔受實際帳戶影響 (核心隔離) ===")
+# 實際帳戶 BTC 大減 (馬丁賣咗), 帳本應該照自己嘅配置判斷
+mock_env(btc=0.40, usdt=60000.0, px=78002.0, led_btc=0.67689, led_usdt=35211.66)
+act, det = rb.rebalance("k", "s", dry=True)
+st = det["state"]
+ok("帳本 BTC 仍係 0.67689", abs(st["btc"] - 0.67689) < 1e-9, st["btc"])
+ok("帳本 BTC% 用帳本計 (~60%)", abs(st["btc_pct"] - 0.6) < 1e-3, st["btc_pct"])
+ok("有記錄實際倉位 (可審計)", st.get("actual_btc") == 0.40, st.get("actual_btc"))
+ok("有記錄帳本 vs 實際差距",
+   abs(st.get("drift_to_actual_btc", 0) - (0.40 - 0.67689)) < 1e-9,
+   st.get("drift_to_actual_btc"))
+
+print("\n=== T13: BUY capped 到實際 USDT ===")
+mock_env(btc=0.10, usdt=500.0, px=78002.0, led_btc=0.10, led_usdt=70000.0)
+act, det = rb.rebalance("k", "s", dry=True)
+ok("帳本話要買", act == "buy", act)
+ok("買入額 cap 到 ~$500", det["quoteOrderQty"] <= 500.0, det.get("quoteOrderQty"))
+ok("有標記 capped", det["state"].get("capped") is True, det["state"].get("capped"))
+
+print("\n=== T14: 實際唔夠錢 (< minNotional) → 唔做 ===")
+mock_env(btc=0.10, usdt=5.0, px=78002.0, led_btc=0.10, led_usdt=70000.0)
+act, det = rb.rebalance("k", "s", dry=True)
+ok("action = none", act == "none", act)
+ok("訊息提馬丁佔用", "馬丁" in det.get("msg", ""), det.get("msg"))
+
+print("\n=== T15: 交易後 snapshot 記帳本狀態 ===")
+calls = mock_env(btc=1.00061, usdt=9951.02, px=78002.0,
+                 patch_post=lambda m, p, q: {"orderId": 1, "fills": [
+                     {"qty": "0.32369", "price": "78002.00"}]})
+p3 = tmp_log()
+act, det = rb.rebalance("k", "s", dry=False)
+lg3 = json.load(open(p3))
+ok("snapshot 記 post_trade", lg3["snapshots"][-1].get("post_trade") is True,
+   lg3["snapshots"][-1].get("post_trade"))
+ok("snapshot BTC = 交易後 (0.67692)",
+   abs(lg3["snapshots"][-1]["btc"] - 0.67692) < 1e-4, lg3["snapshots"][-1]["btc"])
+led3 = json.load(open(LEDGER_PATH))
+ok("帳本 BTC 已更新", abs(led3["btc"] - 0.67692) < 1e-4, led3["btc"])
+ok("帳本有 trades 記錄", len(led3["trades"]) == 1, len(led3["trades"]))
+rb.BAND = 0.05
 
 print(f"\n{'=' * 60}\n結果: {PASS} PASS / {FAIL} FAIL\n{'=' * 60}")
 sys.exit(1 if FAIL else 0)

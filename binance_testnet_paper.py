@@ -149,12 +149,20 @@ def load_log():
 # F5 (GLM 第三輪): 原本仲有一個 LIVE_STATUS tuple 但冇任何消費者 —— 已刪 (死代碼,
 # 而且「WIPED 當 live」呢個政策決定藏喺死 tuple 入面, 會誤導讀者)。
 # 明確「已完結」= 唔再佔用倉位 (其餘一律當 live)
-# FLATTENED_LOW_FILL_RR: 成交後 RR < MIN_RR_EXEC → 即刻市價平倉。log 有 flatten_ok=True
-#   = 真嘅平咗 → 必須當 done, 否則 3 筆殭屍記錄永久佔 cap (新 code 實測揪出, 因為
-#   fail-closed 會將佢當 live)。注意: FLATTENED_OCO_FAILED 唔同 —— 佢係 flatten
-#   **未確認成功**, 所以仍然要當 live / 交人手。
+# FLATTENED_LOW_FILL_RR: 緊急平倉單**已獲交易所接受**嘅終態 —— 觸發原因可以係
+#   (a) 成交後 RR < MIN_RR_EXEC 即刻市價平倉, 或 (b) exit legs 建立失敗後 emergency
+#   market close 成功。log 有 flatten_ok=True = MARKET 單已 accepted (未做 fill
+#   二次核實; 如 accepted 但未成交, 之後嘅交易所對帳/餘額警報會再捕捉 — GLM 09-27 #5)。
+#   當 done 處理, 否則殭屍記錄永久佔 cap (fail-closed 會將佢當 live)。
+#   注意: FLATTENED_OCO_FAILED 唔同 —— 佢係 flatten **未確認成功** (flatten_ok None/False),
+#   所以仍然要當 live / 交人手。resolve_orphan_states 見到 flatten_ok=True 嘅
+#   FLATTENED_OCO_FAILED 會直接轉做 FLATTENED_LOW_FILL_RR (2026-09-27 phantom loop 修正)。
+# WIPED (2026-09-27 GLM review #9): testnet 帳戶重置後 entry 成交 + 全部 legs 都消失
+#   + 冇 open orders → 一定唔係我哋嘅倉 → 終態。舊寫法唔喺 DONE_STATUS 但又喺
+#   ORPHAN_STATUS: 永遠當 live 佔 cap + 每 tick 入 rebuild (同 phantom 同類殭屍,
+#   而 🧹 訊息一路聲稱「cap 已釋放」= code 同訊息唔一致)。
 DONE_STATUS = ("CLOSED", "LIMIT_EXPIRED", "LIMIT_CANCELLED", "SKIP_PREFLIGHT",
-               "FLATTENED_LOW_FILL_RR")
+               "FLATTENED_LOW_FILL_RR", "WIPED")
 
 # 每日虧損硬上限 (R)。XAUUSD 用 -3R hard stop; BTC 實測最差單日 -3.59R (09-04, 4 單),
 # 11 日之中只有 1 日 ≤ -3R → -3R 唔會過度封鎖, 但會截斷最壞嘅日。
@@ -163,6 +171,11 @@ MAX_DAILY_LOSS_R = float(os.environ.get("BTC_MAX_DAILY_LOSS_R", "3.0"))
 # 同方向並行上限。XAUUSD 用 3; BTC 維持 1 —— BTC 24/7 + 波動 3.4× 黃金,
 # 3 個同向倉嘅實際風險暴露大好多。用戶 09-04 放寬 XAUUSD 係針對黃金, 唔應自動套去 BTC。
 SAME_DIR_MAX = int(os.environ.get("BTC_SAME_DIR_MAX", "1"))
+
+# 對帳 rebuild 連續失敗 N 次 → 停止自動重建 + 標人手對帳。
+# 2026-09-27 phantom loop: 無限重試係 7 日 270 筆幻影賣出嘅放大器 —— 停手交人手,
+# 好過每 tick 重試。清除 rebuild_frozen / rebuild_fail_count 可恢復自動重建。
+REBUILD_FAIL_FREEZE = int(os.environ.get("BTC_REBUILD_FAIL_FREEZE", "3"))
 
 
 def is_live_rec(o):
@@ -176,15 +189,18 @@ def is_live_rec(o):
     return str(o.get("status") or "") not in DONE_STATUS
 
 
-# 需要對帳復原嘅「孤兒」狀態: 卡住但可能已經冇倉 (或者冇止損裸掛)
+# 需要對帳復原嘅「孤兒」狀態: 卡住但可能已經冇倉 (或者冇止損裸掛)。
+# WIPED 唔喺度 (2026-09-27 GLM #9): 佢已經係確認咗嘅終態 (帳戶重置), 唔使再對帳。
 ORPHAN_STATUS = ("FLATTENED_OCO_FAILED", "OCO_FAILED", "ENTRY_FILLED_PENDING_EXITS",
-                 "FILLED_ENTRY", "LIMIT_FILLED", "WIPED")
+                 "FILLED_ENTRY", "LIMIT_FILLED")
 
 # 持貨類 status —— 佔住實際 BTC 嘅狀態 (用嚟做持倉歸因扣減, LOW-4/LOW-I)。
 # 注意: 唔包括 LIMIT_PENDING (掛單未成交、冇鎖 BTC)。
-# WIPED / FLATTENED_OCO_FAILED 保守當「可能仲有貨」(flatten 結果可能未確認)。
+# FLATTENED_OCO_FAILED 保守當「可能仲有貨」(flatten 結果可能未確認)。
+# WIPED 已移出 (2026-09-27 office R2): 佢係 DONE 終態, 永遠唔 live — 之前留住
+# 只係隱式依賴 call site 嘅 is_live_rec 過濾; 移走少一個坑。
 HOLDING_STATUS = ("ENTRY_FILLED_PENDING_EXITS", "OCO_PLACED", "FILLED_ENTRY",
-                  "LIMIT_FILLED", "OCO_FAILED", "FLATTENED_OCO_FAILED", "WIPED")
+                  "LIMIT_FILLED", "OCO_FAILED", "FLATTENED_OCO_FAILED")
 
 
 def estimate_held_for(rec, acct_btc, live_recs):
@@ -217,7 +233,47 @@ def estimate_held_for(rec, acct_btc, live_recs):
     return max(0.0, acct_btc - others)
 
 
-def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=None):
+def record_known_ids(rec):
+    """記錄嘅所有已知 order id (落單 / legs / flatten) —— 賣出對帳 + 賣出證據共用。
+
+    包含舊格式 (oco_leg_ids / OCO_A/B / closed_leg_ids)。2026-09-27 實證: 舊記錄
+    只有 oco_leg_ids; 唔包會令正常 leg 成交誤報 (GLM round-3 核實)。
+    """
+    ids = set()
+    for f in ("order_id", "oco_id", "l3_id", "flatten_order_id"):
+        v = rec.get(f)
+        if v is not None:
+            ids.add(str(v))
+    for f in ("exit_leg_ids", "oco_leg_ids", "oco_a_leg_ids", "oco_b_leg_ids",
+              "closed_leg_ids"):
+        for i in (rec.get(f) or []):
+            ids.add(str(i))
+    return ids
+
+
+def _rec_remaining(rec):
+    """記錄未實現剩餘量 (qty − realized_qty/parts)。qty 缺失 → None (判斷唔到)。"""
+    q = rec.get("qty")
+    if q is None:
+        return None
+    try:
+        r = rec.get("realized_qty")
+        if r is None:
+            r = sum(float(p.get("qty") or 0.0) for p in (rec.get("realized_parts") or []))
+        return max(0.0, float(q) - float(r))
+    except (TypeError, ValueError):
+        return None
+
+
+def clear_transient_flags(rec):
+    """轉終態時清走 transient 旗 (office R1-C, 2026-09-27) —— 殘留旗會誤導
+    「有幾多筆需人手」查詢 (實測 10 筆 FLATTENED_LOW_FILL_RR 帶 needs_manual)。"""
+    for k in ("needs_manual_reconcile", "unknown_holding_reason", "rebuild_frozen"):
+        rec.pop(k, None)
+
+
+def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=None,
+                          trades_getter=None):
     """對帳孤兒狀態 —— fail-closed 嘅復原路徑。
 
     held_qty: 每筆持倉。callable(rec) -> float|None, 或 scalar。
@@ -226,10 +282,13 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
               = 死代碼。freeze-on-ambiguity 必須用呢個參數做。
     dust_eps: 低於此當「冇倉」。
     rebuild:  有倉時補建函數。
+    trades_getter: 可選 callable() -> list[myTrades] — 「歸零判 CLOSED」前覆核
+                   賣出證據 (P1, GLM round-2); None = 跳過覆核 (舊行為)。
     """
     changed = []
     summary = {"closed_orphan": 0, "rebuilt": 0, "needs_legs": 0, "skipped": 0,
-               "frozen_unknown": 0, "frozen_ambiguous": 0}
+               "skipped_evidence": 0, "frozen_unknown": 0, "frozen_ambiguous": 0,
+               "frozen_rebuild": 0, "resolved_flattened": 0, "rebuild_failed": 0}
 
     # ── 模糊歸因前置檢查 (2026-09-20 GLM 第四輪 MEDIUM) ────────────────────
     # 如果孤兒 qty 總和 > 帳戶餘額, 逐筆估出嚟嘅持倉**唔可能同時啱** (每人各分到
@@ -275,7 +334,45 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
                 rec["unknown_holding_reason"] = "冇法判斷持倉 (qty 缺失或帳戶查唔到)"
                 changed.append(rec)
             continue
+        # P1 (GLM round-2, 2026-09-27): 估算唔可以多過記錄剩餘量 —— cap 防高估
+        # 搶倉 (legs 觸發時賣走唔屬於呢筆嘅幣)。低估方向由下面賣出證據覆核擋。
+        _rem = _rec_remaining(rec)
+        if _rem is not None and float(h) > _rem:
+            h = _rem
+        if float(h) <= dust_eps:
+            # P1: 「歸零 → CLOSED」前必須有賣出證據 —— myTrades 有本記錄嘅 sell
+            # 成交 (legs / flatten / entry-sell orderId)。冇證據 = 可能未對帳賣出
+            # (phantom 同類) 或幽靈 → 降級 needs_manual, 唔自動 CLOSED。
+            # trades_getter=None (直接 caller / 舊測試) → 跳過覆核, 保持舊行為。
+            _blocked = None
+            if trades_getter is not None:
+                try:
+                    _tl = trades_getter()
+                except Exception as _e:              # noqa: BLE001
+                    _tl = None
+                    _blocked = f"myTrades 查唔到 ({type(_e).__name__}), 唔敢自動 CLOSED"
+                if _blocked is None:
+                    if not isinstance(_tl, list):
+                        # contract: getter 只回 list 或 raise; None/其他 = 唔可靠 →
+                        # fail-closed (GLM round-4 MEDIUM: 唔可以靜默跳過覆核)
+                        _blocked = (f"myTrades getter 回 {type(_tl).__name__} (唔係 list), "
+                                    f"唔敢自動 CLOSED")
+                    else:
+                        _ids = record_known_ids(rec)
+                        if not any((not t.get("isBuyer")) and str(t.get("orderId")) in _ids
+                                   for t in _tl):
+                            _blocked = "持倉歸零但冇本記錄嘅賣出成交 (可能未對帳賣出) — 交人手"
+            if _blocked:
+                summary["skipped"] += 1
+                summary["skipped_evidence"] = summary.get("skipped_evidence", 0) + 1
+                if (not rec.get("needs_manual_reconcile")
+                        or rec.get("unknown_holding_reason") != _blocked):
+                    rec["needs_manual_reconcile"] = True
+                    rec["unknown_holding_reason"] = _blocked
+                    changed.append(rec)
+                continue
         # FINDING 5b: 恢復正常時清走上一輪嘅 transient flag
+        # (放喺證據覆核之後 —— 唔可以清走上面啱啱落嘅訊號)
         rec.pop("needs_manual_reconcile", None)
         rec.pop("unknown_holding_reason", None)
         if float(h) <= dust_eps:
@@ -283,8 +380,22 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
             rec["resolved_via"] = "no_position"
             rec["resolved_ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             rec.setdefault("closed_note", "孤兒狀態復原: exchange 冇倉 → 歸 CLOSED")
+            clear_transient_flags(rec)        # office R1-C: 終態清 transient 旗
             changed.append(rec)
             summary["closed_orphan"] += 1
+        elif st == "FLATTENED_OCO_FAILED" and rec.get("flatten_ok") is True:
+            # 2026-09-27 phantom loop 修正: flatten 已確認成功 = 一定冇倉 →
+            # 直接判終態。**唔可以行 rebuild** —— rebuild 失敗 fallback 會市價
+            # 平倉 (賣走唔屬於呢筆嘅幣; 實證 09-20~09-27 每 tick 賣 0.00258 BTC
+            # ×270 筆)。定調: flatten_ok=True = 真嘅平咗 → done。
+            rec["status"] = "FLATTENED_LOW_FILL_RR"
+            rec["resolved_via"] = "flatten_confirmed"
+            rec["resolved_ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            rec.setdefault("resolved_note",
+                           "flatten 已確認成功 (flatten_ok=True) → 對帳判定冇倉 (終態)")
+            clear_transient_flags(rec)        # office R1-C: 終態清 transient 旗
+            changed.append(rec)
+            summary["resolved_flattened"] += 1
         elif rebuild is None:
             # LOW-1 (GLM 第四輪): F3 嘅 freeze 檢查要喺 rebuild 檢查**之前**。
             # 唔係嘅話 rebuild=None (lot_step 攞唔到) 時, 結果不明嘅
@@ -311,6 +422,22 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
             # 唔可以只標 needs_legs (冇消費者 = 死巷 → 倉永久裸掛冇止損)。
             # F2: contract —— rebuild 必須令 rec 離開 ORPHAN_STATUS, 否則當失敗
             # (免得每個 cycle 重複補建 → 重複 SELL legs)。
+            if rec.get("rebuild_frozen") or int(rec.get("rebuild_fail_count") or 0) >= REBUILD_FAIL_FREEZE:
+                # 已 freeze → 停手交人手 (唔重試)。2A (office, 2026-09-27):
+                # rebuild_frozen 係獨立終態欄位, 唔靠會被 pop 嘅 needs_manual_reconcile
+                # → 訊號持續 + 警報可以消費 (frozen_rebuild)。
+                if not rec.get("rebuild_frozen"):
+                    rec["rebuild_frozen"] = True
+                    rec["rebuild_frozen_note"] = (
+                        f"重建連續失敗 {int(rec.get('rebuild_fail_count') or 0)} 次 → "
+                        f"停止自動重建, 交人手對帳 (清 rebuild_frozen/rebuild_fail_count 可恢復)")
+                    changed.append(rec)
+                # GLM round-4 MEDIUM: FINDING 5b 每 tick 會 pop needs_manual —
+                # frozen 記錄要 re-assert, 唔係「需人手」查詢會漏計 (rebuild_frozen 係主旗)。
+                rec["needs_manual_reconcile"] = True
+                summary["needs_legs"] += 1
+                summary["frozen_rebuild"] = summary.get("frozen_rebuild", 0) + 1
+                continue
             try:
                 before = str(rec.get("status") or "")
                 new_rec = rebuild(rec)
@@ -324,12 +451,25 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
                         f"rebuild 冇令記錄離開孤兒狀態 (仍為 {now_st!r}) — 拒絕當成功")
                 rec.pop("needs_legs", None)
                 rec.pop("rebuild_error", None)
+                rec.pop("rebuild_fail_count", None)
+                rec.pop("rebuild_frozen", None)
+                rec.pop("rebuild_frozen_note", None)
                 rec["rebuilt_legs_ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 summary["rebuilt"] += 1
             except Exception as e:                       # noqa: BLE001
                 rec["rebuild_error"] = f"{type(e).__name__}: {e}"
                 rec["needs_legs"] = True
                 summary["needs_legs"] += 1
+                # 2026-09-27 phantom loop: 連續失敗要停手交人手 (無限重試 = 放大器)
+                rec["rebuild_fail_count"] = int(rec.get("rebuild_fail_count") or 0) + 1
+                if rec["rebuild_fail_count"] >= REBUILD_FAIL_FREEZE:
+                    rec["needs_manual_reconcile"] = True
+                    rec["rebuild_frozen"] = True          # 2A: 獨立終態欄位 (唔會被 pop)
+                    rec["rebuild_frozen_note"] = (
+                        f"重建連續失敗 {rec['rebuild_fail_count']} 次 → 停止自動重建, "
+                        f"交人手對帳 (清 rebuild_frozen/rebuild_fail_count 可恢復)")
+                    summary["frozen_rebuild"] = summary.get("frozen_rebuild", 0) + 1
+                summary["rebuild_failed"] += 1
             changed.append(rec)
         else:
             rec["needs_legs"] = True
@@ -617,16 +757,23 @@ def place_signal_order(setup, key, secret, atr=None, mode=None):
         rec["flatten_note"] = (f"成交後 RR {rr_fill:.2f} < {MIN_RR_EXEC} "
                                f"(entry_fill={fill_px:.2f}, 計劃 RR {rr:.2f}) — 即刻市價平倉")
         try:
-            _signed_request("POST", "/api/v3/order", {
+            _fl_resp = _signed_request("POST", "/api/v3/order", {
                 "symbol": SYMBOL, "side": exit_side, "type": "MARKET",
                 "quantity": f"{fill_qty:.5f}",
             }, key, secret)
             rec["flatten_ok"] = True
+            # 2026-09-27 GLM round-2 P2: 記低平倉 orderId → 賣出對帳可以結構性匹配
+            # (否則緊急平倉嘅 sell 會永遠當「唔對應記錄」= false positive)。
+            rec["flatten_order_id"] = (_fl_resp or {}).get("orderId")
         except urllib.error.HTTPError as e2:
             rec["flatten_ok"] = False
             rec["flatten_error"] = e2.read().decode()[:200]
         rec["flatten_ts"] = time.time()
-        rec["status"] = "FLATTENED_OCO_FAILED"
+        # 2026-09-27 phantom loop 修正: 只有 flatten **未確認** 先可以標 fail-closed
+        # 狀態。舊 code 無條件標 FLATTENED_OCO_FAILED → flatten_ok=True 嘅記錄仍
+        # 入對帳 rebuild, 每 tick 觸發「重建失敗 → 市價平倉」(實證: 270 筆幻影賣出)。
+        if not rec.get("flatten_ok"):
+            rec["status"] = "FLATTENED_OCO_FAILED"
         _log_upsert(rec)
         return rec, None
 
@@ -652,13 +799,16 @@ def _exit_cid(rec, tag):
     return cid
 
 
-def build_exit_legs(rec, key, secret, lot_step):
+def build_exit_legs(rec, key, secret, lot_step, allow_flatten=True):
     """已成交倉 (rec) → 建 3 段 exit: OCO_A(SL+TP1) / OCO_B(SL+TP2) / L3(尾倉 SL).
 
     由 place_signal_order 抽出, 因為 feat/limit-entry 之後限價單係「掛單 → 遲啲成交」,
     成交時已經係另一個 reconcile tick, 兩邊都要用同一套建 leg 邏輯。
 
-    任一段建立失敗 → 取消已建 exit + market flatten (冇裸倉)。
+    任一段建立失敗 → 取消已建 exit + market flatten (冇裸倉) —— 但呢個 fallback
+    只准喺「**肯定有倉**」(新成交) 嘅路徑用。對帳 rebuild 必須傳
+    allow_flatten=False: 紀錄嘅持倉只係估算, 市價平倉會賣走唔屬於佢嘅幣
+    (2026-09-27 phantom loop: rebuild 失敗 fallback 每 tick 賣 0.00258 BTC ×270)。
     rec 需要: side / qty / planned_stop / planned_tp1 / planned_tp2 / pattern / atr
     """
     side = rec["side"]
@@ -679,6 +829,7 @@ def build_exit_legs(rec, key, secret, lot_step):
 
     exit_orders = []   # (tag, ids) for cleanup
     leg_ids = []
+    failed = False     # 2026-09-27: 失敗路徑唔可以再行 OCO_PLACED 判定
 
     def _oco_qty(sl_qty, tp_price, tag="A"):
         if sl_qty <= 0:
@@ -864,6 +1015,7 @@ def build_exit_legs(rec, key, secret, lot_step):
             # exit 完全建唔成 (q1/q3 全 0 等) → 冇裸倉, 即 flatten (GLM review #B)
             raise RuntimeError("no exit legs built (q1/q3 both 0)")
     except (urllib.error.HTTPError, RuntimeError) as e:
+        failed = True
         # exit 建立失敗 → 取消已建 exit order + market flatten (冇裸倉)
         for tag, ids in exit_orders:
             for oid in ids:
@@ -872,20 +1024,36 @@ def build_exit_legs(rec, key, secret, lot_step):
                                     {"symbol": SYMBOL, "orderId": oid}, key, secret)
                 except Exception:
                     pass
-        try:
-            _signed_request("POST", "/api/v3/order", {
-                "symbol": SYMBOL, "side": exit_side, "type": "MARKET",
-                "quantity": f"{fill_qty:.5f}",
-            }, key, secret)
-            rec["status"] = "FLATTENED_OCO_FAILED"
-            rec["flatten_note"] = f"exit order 建立失敗 ({type(e).__name__}) → emergency market close"
-        except urllib.error.HTTPError as e2:
-            rec["flatten_error"] = e2.read().decode()[:200]
+        if allow_flatten:
+            try:
+                _fl_resp = _signed_request("POST", "/api/v3/order", {
+                    "symbol": SYMBOL, "side": exit_side, "type": "MARKET",
+                    "quantity": f"{fill_qty:.5f}",
+                }, key, secret)
+                rec["flatten_ok"] = True
+                # 2026-09-27 GLM round-2 P2: 記低平倉 orderId (賣出對帳結構性匹配)
+                rec["flatten_order_id"] = (_fl_resp or {}).get("orderId")
+                # 確認平倉 → 終態 (唔佔 cap、唔再入對帳 rebuild)
+                rec["status"] = "FLATTENED_LOW_FILL_RR"
+                rec["flatten_note"] = (f"exit order 建立失敗 ({type(e).__name__}) → "
+                                       f"emergency market close (已確認)")
+            except urllib.error.HTTPError as e2:
+                rec["flatten_ok"] = False
+                rec["flatten_error"] = e2.read().decode()[:200]
+                rec["status"] = "FLATTENED_OCO_FAILED"
+                rec["flatten_note"] = (f"exit order 建立失敗 ({type(e).__name__}) → "
+                                       f"emergency close 失敗 — 倉位未確認, 交對帳")
+            rec["flatten_ts"] = time.time()
+        else:
+            # 對帳 rebuild 唔准市價平倉 (2026-09-27 phantom loop 修正):
+            # 紀錄嘅持倉只係估算, 市價平倉會賣走唔屬於呢筆嘅幣。
+            rec["flatten_skipped_reason"] = (
+                "rebuild 路徑禁止自動市價平倉 (2026-09-27 phantom loop) — "
+                "倉位交交易所對帳, 唔靠估算")
         rec["oco_error"] = (e.read().decode()[:200] if isinstance(e, urllib.error.HTTPError)
                             else str(e)[:200])
-        rec["flatten_ts"] = time.time()
 
-    if leg_ids and rec.get("status") != "FLATTENED_OCO_FAILED":
+    if not failed and leg_ids:
         rec["exit_leg_ids"] = leg_ids
         rec["status"] = "OCO_PLACED"
         # NEW-4 (GLM 第八輪): 落新 OCO 成功 = 倉已有完整 legs → 清走上一輪嘅
@@ -893,7 +1061,7 @@ def build_exit_legs(rec, key, secret, lot_step):
         for _k in ("needs_manual_reconcile", "adopt_error", "adopt_fail_count",
                    "partial_count", "partial_adopt_ids", "unknown_holding_reason"):
             rec.pop(_k, None)
-    elif not leg_ids and rec.get("status") in ("FILLED_ENTRY", "LIMIT_FILLED"):
+    elif failed and not leg_ids and rec.get("status") in ("FILLED_ENTRY", "LIMIT_FILLED"):
         rec["status"] = "OCO_FAILED"
         rec["oco_error"] = "no exit legs built"
 

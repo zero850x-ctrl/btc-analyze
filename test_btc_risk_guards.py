@@ -57,9 +57,10 @@ def reset_log(orders=None):
 
 print("=== A. is_live_rec fail-closed ===")
 LIVE_EXPECT = ["FILLED_ENTRY", "ENTRY_FILLED_PENDING_EXITS", "OCO_PLACED", "LIMIT_PENDING",
-               "LIMIT_FILLED", "FLATTENED_OCO_FAILED", "OCO_FAILED", "WIPED",
+               "LIMIT_FILLED", "FLATTENED_OCO_FAILED", "OCO_FAILED",
                "SOMETHING_NEW_WE_NEVER_SAW"]
-DONE_EXPECT = ["CLOSED", "LIMIT_EXPIRED", "LIMIT_CANCELLED", "SKIP_PREFLIGHT"]
+DONE_EXPECT = ["CLOSED", "LIMIT_EXPIRED", "LIMIT_CANCELLED", "SKIP_PREFLIGHT",
+               "FLATTENED_LOW_FILL_RR", "WIPED"]   # WIPED: GLM 09-27 #9 (帳戶重置=終態)
 for st in LIVE_EXPECT:
     check(btp.is_live_rec({"status": st}), f"{st} 當 live")
 for st in DONE_EXPECT:
@@ -434,14 +435,195 @@ check(lg["orders"][0].get("needs_manual_reconcile") is True,
       "標 needs_manual_reconcile (交人手對賬)")
 check(btp.is_live_rec(lg["orders"][0]), "仍然當 live (保守)")
 
-# F3b: flatten_ok=True (明確已平) → 可以正常處理
+# F3b (2026-09-27 phantom loop 改寫): flatten_ok=True (明確已平) → 直接判終態,
+# **唔可以 call rebuild**。舊行為: rebuild 失敗 → emergency market close 賣走唔屬於
+# 呢筆嘅幣 (實證 09-20~09-27: 270 筆幻影賣出)。flatten 已確認 = 一定冇倉。
 reset_log()
 btp._log_upsert({"order_id": 52, "pattern": "A", "side": "BUY",
                  "status": "FLATTENED_OCO_FAILED", "entry_fill": 80000.0,
                  "flatten_ok": True})
 lg = btp.load_log()
-changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001, rebuild=_good_rebuild)
-check(summ["rebuilt"] == 1, "flatten_ok=True 時可以正常補建", str(summ))
+called52 = []
+changed, summ = btp.resolve_orphan_states(
+    lg, held_qty=0.001, rebuild=lambda r: called52.append(r) or _good_rebuild(r))
+check(not called52, "flatten_ok=True 唔會 call rebuild (唔會亂平倉)", str(len(called52)))
+check(summ.get("resolved_flattened") == 1, "標 resolved_flattened", str(summ))
+check(lg["orders"][0]["status"] == "FLATTENED_LOW_FILL_RR",
+      "轉做終態 FLATTENED_LOW_FILL_RR", lg["orders"][0]["status"])
+check(lg["orders"][0].get("resolved_via") == "flatten_confirmed", "有 resolved_via 審計")
+check(not btp.is_live_rec(lg["orders"][0]), "唔再當 live (釋放 cap)")
+check(lg["orders"][0].get("needs_manual_reconcile") is None,
+      "唔嘈人手 (已確認平倉, 唔需要人手)")
+
+# F3c (2026-09-27): rebuild 連續失敗 → 計數 + 第 3 次 freeze 停手
+reset_log()
+btp._log_upsert({"order_id": 53, "pattern": "A", "side": "BUY",
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+
+
+def _fail_rebuild(rec):
+    raise RuntimeError("OCO 建唔到 (價位對唔上)")
+
+
+changed, summ = btp.resolve_orphan_states(
+    lg, held_qty=0.001, rebuild=lambda r: _fail_rebuild(r))
+check(summ.get("rebuild_failed") == 1, "失敗計入 rebuild_failed", str(summ))
+check(lg["orders"][0].get("rebuild_fail_count") == 1, "fail_count=1",
+      str(lg["orders"][0].get("rebuild_fail_count")))
+btp.resolve_orphan_states(lg, held_qty=0.001, rebuild=lambda r: _fail_rebuild(r))
+btp.resolve_orphan_states(lg, held_qty=0.001, rebuild=lambda r: _fail_rebuild(r))
+check(lg["orders"][0].get("rebuild_fail_count") == 3, "fail_count 累積到 3")
+check(lg["orders"][0].get("needs_manual_reconcile") is True, "達門檻標人手")
+check(bool(lg["orders"][0].get("rebuild_frozen_note")), "有 freeze 原因 (可審計)")
+calls_after = []
+_ch4, s4 = btp.resolve_orphan_states(lg, held_qty=0.001,
+                                     rebuild=lambda r: calls_after.append(r) or _fail_rebuild(r))
+check(not calls_after, "freeze 後唔再重試 rebuild (停手交人手)", str(len(calls_after)))
+check(s4.get("needs_legs") == 1, "freeze 記錄仍計入 needs_legs (審計可見)", str(s4))
+check(lg["orders"][0].get("rebuild_frozen") is True,
+      "2A: freeze 用獨立 rebuild_frozen 欄位 (唔會被 pop)",
+      str(lg["orders"][0].get("rebuild_frozen")))
+check(s4.get("frozen_rebuild") == 1, "2B: summary 有 frozen_rebuild (警報可消費)", str(s4))
+
+# F3d (2026-09-27): 對帳 rebuild 路徑禁止市價平倉 —— build_exit_legs(allow_flatten=False)
+# OCO 落單失敗時**唔可以**出 MARKET 單 (會賣走唔屬於呢筆嘅幣)。
+reset_log()
+posted_d = []
+
+
+def fake_oco_fail(method, path, params, key, secret):
+    if method == "GET" and path.endswith("/openOrders"):
+        return []                                   # 冇已存在 legs
+    if path.endswith("/order/oco"):
+        raise RuntimeError("OCO 建唔到 (-2010 價位對唔上)")   # OCO 失敗
+    posted_d.append((method, path, params))
+    return {"orderId": 1}
+
+
+r_d = {"order_id": 71, "side": "BUY", "qty": 0.001, "planned_stop": 79600.0,
+       "planned_tp1": 80400.0, "planned_tp2": 80800.0, "atr": 200.0,
+       "status": "OCO_FAILED"}
+_orig_d = btp._signed_request
+btp._signed_request = fake_oco_fail
+try:
+    out_d, _err_d = btp.build_exit_legs(dict(r_d), "k", "s", 0.00001, allow_flatten=False)
+finally:
+    btp._signed_request = _orig_d
+_mk_d = [p for p in posted_d if p[2].get("type") == "MARKET"]
+check(not _mk_d, "allow_flatten=False: OCO 失敗唔會出 MARKET 單", str(posted_d))
+check(out_d.get("status") not in ("FLATTENED_LOW_FILL_RR", "OCO_PLACED"),
+      "狀態保持 fail-closed (冇變終態/成功)", str(out_d.get("status")))
+check(bool(out_d.get("flatten_skipped_reason")), "有記錄點解冇市價平倉")
+
+# F3e (2026-09-27): 新成交路徑 (allow_flatten=True): OCO 失敗 → 市價平倉 + 終態
+reset_log()
+posted_e = []
+
+
+def fake_oco_fail2(method, path, params, key, secret):
+    if method == "GET" and path.endswith("/openOrders"):
+        return []
+    if path.endswith("/order/oco"):
+        raise RuntimeError("OCO 建唔到")
+    posted_e.append((method, path, params))
+    return {"orderId": 77}
+
+
+r_e = dict(r_d, order_id=72)
+btp._signed_request = fake_oco_fail2
+try:
+    out_e, _err_e = btp.build_exit_legs(dict(r_e), "k", "s", 0.00001)   # 默認 allow_flatten=True
+finally:
+    btp._signed_request = _orig_d
+_mk_e = [p for p in posted_e if p[2].get("type") == "MARKET"]
+check(len(_mk_e) == 1, "allow_flatten=True: OCO 失敗 → 出 1 張市價平倉", str(posted_e))
+check(out_e.get("status") == "FLATTENED_LOW_FILL_RR",
+      "平倉確認 → 終態", str(out_e.get("status")))
+check(out_e.get("flatten_ok") is True, "flatten_ok=True 有記錄")
+check(not btp.is_live_rec(out_e), "終態唔佔 cap")
+check(out_e.get("flatten_order_id") == 77, "flatten_order_id 有記錄 (P2 賣出對帳)",
+      str(out_e.get("flatten_order_id")))
+
+# F3f (2026-09-27 GLM review #1 核實): 生產 _rebuild 經 build_exit_legs 回傳
+# (rec, err) **tuple** → resolve_orphan_states 必須正確拆包。呢度直接鎖死
+# tuple 回傳嘅兼容性 (GLM 誤以為 resolve 會 AttributeError)。
+reset_log()
+btp._log_upsert({"order_id": 61, "pattern": "A", "side": "BUY",
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+_tuple_out = {"order_id": 61, "pattern": "A", "side": "BUY", "status": "OCO_PLACED",
+              "entry_fill": 80000.0, "exit_leg_ids": [1, 2, 3]}
+changed, summ = btp.resolve_orphan_states(
+    lg, held_qty=0.001, rebuild=lambda r: (dict(r, **_tuple_out), None))
+check(summ.get("rebuilt") == 1, "build_exit_legs (rec, err) tuple 回傳照樣計 rebuilt",
+      str(summ))
+check(lg["orders"][0]["status"] == "OCO_PLACED", "記錄離開孤兒狀態 (tuple 拆包 OK)",
+      lg["orders"][0]["status"])
+
+# F3g (2026-09-27 GLM review #9): WIPED 已係終態 — resolve 唔會再郁佢
+# (唔喺 ORPHAN_STATUS), 亦唔會 rebuild。
+reset_log()
+btp._log_upsert({"order_id": 62, "pattern": "A", "side": "BUY",
+                 "status": "WIPED", "entry_fill": 80000.0, "qty": 0.001})
+lg = btp.load_log()
+calls_w = []
+changed, summ = btp.resolve_orphan_states(
+    lg, held_qty=0.001, rebuild=lambda r: calls_w.append(r) or _good_rebuild(r))
+check(not calls_w, "WIPED 唔會入 rebuild", str(len(calls_w)))
+check(not any(v for v in summ.values()), "WIPED 唔入對帳 summary", str(summ))
+check(lg["orders"][0]["status"] == "WIPED", "WIPED 保持原狀")
+check(not btp.is_live_rec(lg["orders"][0]), "WIPED 唔佔 cap")
+check("WIPED" not in btp.ORPHAN_STATUS, "WIPED 已移出 ORPHAN_STATUS (唔再當孤兒)")
+
+# F3h (2026-09-27 1+2 office R1-C): 轉終態要清走 transient 旗 —— frozen 記錄
+# 經 flatten 確認轉 FLATTENED_LOW_FILL_RR 時, needs_manual/unknown/frozen 全清
+# (生產曾殘留 10 筆帶旗嘅終態記錄, 會誤導「有幾多筆需人手」查詢)
+reset_log()
+btp._log_upsert({"order_id": 63, "pattern": "A", "side": "BUY", "qty": 0.0026,
+                 "status": "FLATTENED_OCO_FAILED", "entry_fill": 80000.0,
+                 "flatten_ok": True, "needs_manual_reconcile": True,
+                 "rebuild_frozen": True, "rebuild_fail_count": 3,
+                 "rebuild_frozen_note": "x", "unknown_holding_reason": "y"})
+lg = btp.load_log()
+btp.resolve_orphan_states(lg, held_qty=0.001, acct_btc=1.0)
+o = lg["orders"][0]
+check(o["status"] == "FLATTENED_LOW_FILL_RR", "F3h: 轉終態", str(o.get("status")))
+check(o.get("needs_manual_reconcile") is None and o.get("rebuild_frozen") is None
+      and o.get("unknown_holding_reason") is None,
+      "F3h: 終態清走 transient 旗 (needs_manual/unknown/frozen)",
+      str({k: o.get(k) for k in ("needs_manual_reconcile", "unknown_holding_reason",
+                                 "rebuild_frozen")}))
+
+# F3i (2026-09-27 1+2 P1): 剩餘歸零 + myTrades 有賣出證據 → CLOSED (正常收口)
+reset_log()
+btp._log_upsert({"order_id": 64, "pattern": "A", "side": "BUY", "qty": 0.0026,
+                 "status": "OCO_FAILED", "entry_fill": 80000.0,
+                 "realized_qty": 0.0026, "exit_leg_ids": [881001]})
+lg = btp.load_log()
+_tg = lambda: [{"orderId": 881001, "isBuyer": False, "time": 0}]      # noqa: E731
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001, acct_btc=1.0,
+                                          trades_getter=_tg)
+o = lg["orders"][0]
+check(o["status"] == "CLOSED" and o.get("resolved_via") == "no_position",
+      "F3i P1: 剩餘歸零 + 有賣出證據 → CLOSED", str(o.get("status")))
+
+# F3j (2026-09-27 1+2 P1): 剩餘歸零但冇賣出證據 → 降 needs_manual (唔靜靜 CLOSED)
+reset_log()
+btp._log_upsert({"order_id": 65, "pattern": "A", "side": "BUY", "qty": 0.0026,
+                 "status": "OCO_FAILED", "entry_fill": 80000.0, "realized_qty": 0.0026})
+lg = btp.load_log()
+changed, summ = btp.resolve_orphan_states(lg, held_qty=0.001, acct_btc=1.0,
+                                          trades_getter=_tg)
+o = lg["orders"][0]
+check(o.get("needs_manual_reconcile") is True and o["status"] == "OCO_FAILED",
+      "F3j P1: 剩餘歸零 + 冇賣出證據 → needs_manual (唔自動 CLOSED)",
+      f"({o.get('status')}, {o.get('unknown_holding_reason')})")
+check(summ.get("skipped") == 1, "F3j: 計入 skipped", str(summ))
+check(summ.get("skipped_evidence") == 1, "F3j: skipped_evidence 分開計 (語義唔混)", str(summ))
+
+# F3k (2026-09-27 1+2 office R2): WIPED 已移出 HOLDING_STATUS (冇隱式依賴)
+check("WIPED" not in btp.HOLDING_STATUS, "F3k: WIPED 已移出 HOLDING_STATUS")
 
 # F5: LIVE_STATUS 死代碼已刪 (只可以剩註釋提及, 唔可以有賦值)
 import re as _re2

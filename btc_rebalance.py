@@ -31,6 +31,15 @@ from binance_testnet_paper import (  # noqa: E402
 
 HKT = timezone(timedelta(hours=8))
 LOG_PATH = os.path.expanduser("~/.hermes/reports/btc_rebalance_log.json")
+LEDGER_PATH = os.path.expanduser("~/.hermes/reports/btc_rebalance_ledger.json")
+
+# ── 虛擬帳本 ──
+# 馬丁格爾實驗共用同一個 testnet 帳戶, 每 15 分鐘平倉會賣 BTC (4 注全平 ~0.00258 BTC)。
+# 若再平衡直接讀帳戶餘額, 會見到「BTC% 跌」而被迫不停買返 → 兩個系統互相對沖。
+# (實證 2026-09-23: 帳戶 BTC 由 1.0006 跌到 0.5898, 但 rebalance 5 次全部係 BUY,
+#  而當時 BTC 明明升緊 ── 正常應該係 SELL 獲利。)
+# 所以再平衡改為只讀寫自己嘅虛擬帳本; 實際帳戶只用嚟做落單前嘅餘額 sanity check。
+# 帳本起點 = 首次啟用當日嘅實際持倉 (見 ensure_ledger)。
 
 TARGET_BTC_PCT = float(os.environ.get("BTC_REBAL_TARGET", "0.60"))
 BAND = float(os.environ.get("BTC_REBAL_BAND", "0.05"))          # 偏離 5% 即做
@@ -59,9 +68,74 @@ def save_log(log):
 
 
 def read_account(key, secret):
+    """實際 testnet 帳戶餘額 (共用 — 含馬丁格爾倉位)."""
     acct = _signed_request("GET", "/api/v3/account", {}, key, secret)
     bal = {b["asset"]: float(b["free"]) + float(b["locked"]) for b in acct["balances"]}
     return bal.get("BTC", 0.0), bal.get("USDT", 0.0)
+
+
+def load_ledger():
+    if os.path.exists(LEDGER_PATH):
+        with open(LEDGER_PATH) as f:
+            return json.load(f)
+    return None
+
+
+def save_ledger(led):
+    os.makedirs(os.path.dirname(LEDGER_PATH), exist_ok=True)
+    tmp = LEDGER_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(led, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, LEDGER_PATH)
+
+
+def ensure_ledger(key, secret):
+    """首次啟用: 用當日實際持倉做帳本起點 (之後馬丁格爾嘅交易唔會再影響)."""
+    led = load_ledger()
+    if led:
+        return led
+    btc, usdt = read_account(key, secret)
+    led = {"created": now_hkt().isoformat(),
+           "note": "虛擬帳本 — 隔離馬丁格爾對共用 testnet 帳戶嘅干擾",
+           "btc": btc, "usdt": usdt, "trades": []}
+    save_ledger(led)
+    return led
+
+
+def read_ledger_pos(key=None, secret=None):
+    """倉位來源: 虛擬帳本 (唔係實際帳戶)."""
+    led = load_ledger()
+    if led is None:
+        if key is None:
+            raise RuntimeError("ledger 未初始化 — 要先 call ensure_ledger()")
+        led = ensure_ledger(key, secret)
+    return led["btc"], led["usdt"]
+
+
+def apply_to_ledger(action, detail):
+    """按**實際成交**更新帳本 (唔係理想目標值)."""
+    led = load_ledger()
+    if led is None:
+        return None
+    if action == "buy":
+        q = detail.get("executed_qty") or 0.0
+        cost = detail.get("quote_spent") or 0.0
+        led["btc"] += q
+        led["usdt"] -= cost
+    elif action == "sell":
+        q = detail.get("executed_qty") or 0.0
+        got = detail.get("quote_gained") or 0.0
+        led["btc"] -= q
+        led["usdt"] += got
+    else:
+        return led
+    led["trades"].append({"ts": now_hkt().isoformat(), "action": action,
+                          "qty": detail.get("executed_qty"),
+                          "quote": detail.get("quote_spent") or detail.get("quote_gained"),
+                          "btc_after": led["btc"], "usdt_after": led["usdt"]})
+    led["trades"] = led["trades"][-200:]
+    save_ledger(led)
+    return led
 
 
 def compute_state(btc, usdt, px):
@@ -85,15 +159,28 @@ def rebalance(key, secret, dry=False, force=False, reason=""):
     """
     action, detail = _decide_and_execute(key, secret, dry=dry, force=force, reason=reason)
     if not dry:
+        if action != "none":
+            apply_to_ledger(action, detail)
+            # snapshot 必須記「交易後」狀態 — 之前記交易前, 令對帳數字誤導
+            led = load_ledger()
+            px2 = float(detail.get("avg_price") or detail["state"]["px"])
+            keep = {k: v for k, v in detail["state"].items()
+                    if k.startswith("actual") or k == "capped"}
+            detail["state"] = compute_state(led["btc"], led["usdt"], px2)
+            detail["state"].update(keep)
+            detail["state"]["post_trade"] = True
         _record(action, detail)
     return action, detail
 
 
 def _record(action, detail):
     log = load_log()
-    log["snapshots"].append({"ts": now_hkt().isoformat(), **{
-        k: detail["state"][k] for k in ("btc", "usdt", "px", "total_usd",
-                                        "btc_pct", "drift_pct")}})
+    snap = {k: detail["state"][k] for k in ("btc", "usdt", "px", "total_usd",
+                                            "btc_pct", "drift_pct")}
+    snap["post_trade"] = bool(detail["state"].get("post_trade"))
+    snap["capped"] = bool(detail["state"].get("capped"))
+    snap["ts"] = now_hkt().isoformat()
+    log["snapshots"].append(snap)
     log["snapshots"] = log["snapshots"][-500:]
     if action != "none":
         log["events"].append({"ts": now_hkt().isoformat(), "action": action,
@@ -106,8 +193,15 @@ def _record(action, detail):
 def _decide_and_execute(key, secret, dry=False, force=False, reason=""):
     """返回 (action, detail). action ∈ {'none','buy','sell'}."""
     px = current_price()
-    btc, usdt = read_account(key, secret)
+    # 倉位由虛擬帳本決定 (隔離馬丁格爾干擾); 實際帳戶只用嚟做落單前 sanity check
+    led = ensure_ledger(key, secret)
+    btc, usdt = led["btc"], led["usdt"]
+    act_btc, act_usdt = read_account(key, secret)
     st = compute_state(btc, usdt, px)
+    st["actual_btc"] = act_btc
+    st["actual_usdt"] = act_usdt
+    st["actual_total_usd"] = act_btc * px + act_usdt
+    st["drift_to_actual_btc"] = act_btc - btc
 
     qtr = is_quarter_month()
     drift = abs(st["btc_pct"] - TARGET_BTC_PCT)
@@ -138,6 +232,15 @@ def _decide_and_execute(key, secret, dry=False, force=False, reason=""):
         if buy_usd < min_notional:
             return "none", {"state": st, "msg": (
                 f"買入額 ${buy_usd:.2f} < minNotional ${min_notional:.2f}")}
+        # sanity check: 實際帳戶共用, 可能唔夠 USDT (馬丁 SELL chain 會用 USDT)
+        if buy_usd > act_usdt:
+            cap = act_usdt * 0.995          # 留 0.5% buffer 畀手續費/滑價
+            if cap < min_notional:
+                return "none", {"state": st, "msg": (
+                    f"帳本要買 ${buy_usd:.2f} 但實際 USDT 只有 ${act_usdt:.2f} "
+                    f"(馬丁佔用) — 唔做")}
+            buy_usd = cap
+            st["capped"] = True
         if dry:
             return "buy", {"state": st, "trigger": trigger, "msg": (
                 f"[DRY] {trigger} — 買入 BTC 用 ${buy_usd:.2f} (現 BTC {st['btc_pct'] * 100:.1f}% → "
@@ -160,6 +263,14 @@ def _decide_and_execute(key, secret, dry=False, force=False, reason=""):
         if qty * px < min_notional:
             return "none", {"state": st, "msg": (
                 f"賣出額 ${qty * px:.2f} < minNotional ${min_notional:.2f}")}
+        # sanity check: 實際帳戶共用, 可能唔夠 BTC
+        if qty > act_btc:
+            qty = round_step(act_btc * 0.995, step)
+            st["capped"] = True
+            if qty * px < min_notional:
+                return "none", {"state": st, "msg": (
+                    f"帳本要賣 {abs(need_btc):.6f} BTC 但實際只有 {act_btc:.6f} "
+                    f"(馬丁佔用) — 唔做")}
         if dry:
             return "sell", {"state": st, "trigger": trigger, "msg": (
                 f"[DRY] {trigger} — 賣出 {qty:.6f} BTC (~${qty * px:,.2f}) "
@@ -193,23 +304,34 @@ def main():
 
     key, secret = _load_keys()
     px = current_price()
-    btc, usdt = read_account(key, secret)
+    btc, usdt = read_ledger_pos(key, secret)
+    act_btc, act_usdt = read_account(key, secret)
     st = compute_state(btc, usdt, px)
+    st["actual_btc"] = act_btc
+    st["actual_usdt"] = act_usdt
+    st["drift_to_actual_btc"] = act_btc - btc
 
     if status_only:
         need_qty = st["target_btc"] - st["btc"]
         need_usd = need_qty * px
         act = "買入" if need_qty > 0 else "賣出"
+        led = load_ledger() or {}
+        gap_btc = st.get("drift_to_actual_btc", 0.0)
         print(f"📊 再平衡狀態 {now_hkt().strftime('%Y-%m-%d %H:%M')} HKT")
         print(f"  目標: BTC {TARGET_BTC_PCT * 100:.0f}% / USDT {(1 - TARGET_BTC_PCT) * 100:.0f}%"
               f"  偏離帶 ±{BAND * 100:.0f}%  季度月 {QUARTER_MONTHS}")
-        print(f"  現時: {fmt_status(st)}")
+        print(f"  帳本: {fmt_status(st)}")
+        print(f"  實際: BTC {st.get('actual_btc', 0):.6f} / USDT {st.get('actual_usdt', 0):,.2f}"
+              f" ｜ 與帳本差 {gap_btc:+.6f} BTC (馬丁格爾佔用)")
         print(f"  目標倉: {st['target_btc']:.6f} BTC / ${st['target_usdt']:,.2f} USDT")
         print(f"  需要: {act} {abs(need_qty):.6f} BTC (~${abs(need_usd):,.2f})"
               f"{'  ⚠️ 未夠 MIN_TRADE_USD' if abs(need_usd) < MIN_TRADE_USD else ''}")
         trig = ("季度月，今次會做" if is_quarter_month()
                 else f"非季度月，偏離 {abs(st['drift_pct']):.1f}% (需 > {BAND * 100:.0f}% 才做)")
         print(f"  觸發: {trig}")
+        if led.get("trades"):
+            print(f"  帳本交易記錄: {len(led['trades'])} 筆 (最近 "
+                  f"{led['trades'][-1]['ts'][:16]} {led['trades'][-1]['action']})")
         return
 
     action, detail = rebalance(key, secret, dry=dry, force=force)
