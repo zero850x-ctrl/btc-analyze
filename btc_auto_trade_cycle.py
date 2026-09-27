@@ -43,6 +43,56 @@ def log(msg):
             f.writelines(lines[-500:])
 
 
+RECONCILE_STATE = os.environ.get("BTC_RECONCILE_STATE") or os.path.expanduser(
+    "~/.hermes/reports/btc_reconcile_state.json")
+BALANCE_DROP_ALERT_BTC = float(os.environ.get("BTC_BALANCE_DROP_ALERT", "0.05"))
+
+
+def reconcile_alerts(summary, acct_btc):
+    """對帳狀態變化 / 餘額異常警報 —— 只喺狀態變化先出聲 (唔會每 tick spam)。
+
+    2026-09-27 phantom loop 教訓: 孤兒狀態連續 7 日每 tick 重複 rebuild 失敗
+    (needs_legs 長期 10+) 全程冇任何警報 → 冇人知。所以:
+      - orphan summary (per-tick 計數) 有變化 → ⚠️ 出一條, 之後靜默直到再變。
+      - 餘額 high-water mark: 由高位累計跌 ≥ BALANCE_DROP_ALERT_BTC 出一次聲
+        (正常單筆規模 0.002-0.003 BTC, 跌 0.05 = 唔可能係正常操作), 破新高先重設。
+    回傳 list[str]; caller 用 log() 輸出 (⚠️ 喺 cron NOTABLE_KEYS = 會推送 TG)。
+    """
+    msgs = []
+    try:
+        st = {}
+        if os.path.exists(RECONCILE_STATE):
+            with open(RECONCILE_STATE) as f:
+                st = json.load(f) or {}
+        cur = {k: v for k, v in (summary or {}).items() if v}
+        prev = st.get("orphan_summary") or {}
+        if cur != prev:
+            def _fmt(d):
+                return ", ".join(f"{k}={v}" for k, v in sorted(d.items()))
+            if cur and prev:
+                msgs.append(f"⚠️ 孤兒對帳狀態變化: {_fmt(cur)} (之前: {_fmt(prev)})")
+            elif cur:
+                msgs.append(f"⚠️ 孤兒對帳狀態: {_fmt(cur)}")
+            elif prev:
+                msgs.append(f"✅ 孤兒對帳已清空 (之前: {_fmt(prev)})")
+        st["orphan_summary"] = cur
+        if acct_btc is not None:
+            hw = st.get("balance_hw")
+            if hw is None or acct_btc > hw:
+                st["balance_hw"], st["balance_alerted"] = acct_btc, False
+            drop = float(st["balance_hw"]) - float(acct_btc)
+            if drop >= BALANCE_DROP_ALERT_BTC and not st.get("balance_alerted"):
+                msgs.append(f"⚠️ testnet BTC 餘額異常: 高位 {st['balance_hw']:.5f} → "
+                            f"現 {acct_btc:.5f} (跌 {drop:.5f} BTC) — 查下有冇未對帳嘅賣出")
+                st["balance_alerted"] = True
+        st["ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(RECONCILE_STATE, "w") as f:
+            json.dump(st, f, ensure_ascii=False, indent=1)
+    except Exception as e:                    # noqa: BLE001
+        msgs.append(f"⚠️ reconcile alert 出錯 (唔影響交易): {type(e).__name__}: {e}")
+    return msgs
+
+
 def _pnl_of(rec, exit_px, qty, fee, fee_asset):
     """單一段 exit 嘅 pnl (扣 fee).
 
@@ -271,7 +321,9 @@ def reconcile_cycle(key, secret):
     def _rebuild(rec):
         if lot_step is None:
             raise RuntimeError("冇 lot_step, 唔敢建 legs")
-        return build_exit_legs(rec, key, secret, lot_step)
+        # 2026-09-27 phantom loop: 對帳 rebuild 唔准市價平倉 (持倉只係估算,
+        # 平倉會賣走唔屬於呢筆嘅幣) —— 見 build_exit_legs docstring。
+        return build_exit_legs(rec, key, secret, lot_step, allow_flatten=False)
 
     orph, orph_summ = resolve_orphan_states(
         log_d, _held_for, dust_eps=dust_eps,
@@ -282,6 +334,10 @@ def reconcile_cycle(key, secret):
         dirty = True
         log("🩹 孤兒狀態對帳: " + ", ".join(f"{k}={v}" for k, v in orph_summ.items() if v)
             + f" (dust_eps={dust_eps:.5f}, acct_btc={_acct_btc})")
+    # 2026-09-27 phantom loop: 對帳狀態變化 / 餘額異常警報 (⚠️ = cron 會推送 TG;
+    # 狀態唔變 = 完全靜默)。呼叫喺 orphan 處理之後, 攞到最新 summary + 餘額。
+    for _m in reconcile_alerts(orph_summ, _acct_btc):
+        log(_m)
 
     # ── F4: 未知 status 要出聲 (之前會永久 live 但零 log) ──────────────────
     _known = set(DONE_STATUS) | set(ORPHAN_STATUS) | {"LIMIT_PENDING", "OCO_PLACED"}
@@ -495,7 +551,10 @@ def reconcile_cycle(key, secret):
         # 追加 closed history — **只計真正平倉嘅單**。
         # feat/limit-entry: LIMIT_EXPIRED / LIMIT_CANCELLED 係「掛單未成交就取消」,
         # 冇 trade 過、冇 PnL, 寫入 HISTORY 會污染 sumR / 勝率 (佢哋冇 r_multiple)。
-        closed_recs = [r for r in changed if r.get("status") == "CLOSED"]
+        # 2026-09-27: 對帳判 CLOSED 嘅孤兒 (冇 exit 成交、冇 r_multiple) 亦唔可以入
+        # HISTORY —— 佢哋唔係完成嘅 trade, 只係對帳結論 (入咗會令統計 KeyError/失真)。
+        closed_recs = [r for r in changed if r.get("status") == "CLOSED"
+                       and r.get("r_multiple") is not None]
         if closed_recs:
             hist = json.load(open(HISTORY)) if os.path.exists(HISTORY) else {"trades": []}
             hist["trades"].extend(closed_recs)
@@ -551,7 +610,8 @@ def main():
     # 4. 每日統計
     if closed:
         hist = json.load(open(HISTORY))
-        rs = [t["r_multiple"] for t in hist["trades"]]
+        # .get() 防禦 (09-27): 統計唔可以因任何缺 field 嘅記錄 crash
+        rs = [t.get("r_multiple") or 0 for t in hist["trades"]]
         log(f"📊 累計 {len(rs)} 平倉: sumR={sum(rs):+.2f} 勝率={sum(1 for r in rs if r > 0)}/{len(rs)}")
 
 

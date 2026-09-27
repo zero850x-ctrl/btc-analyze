@@ -12,11 +12,42 @@
 
 用法: python3 test_rr_gates.py   (repo root)
 """
+import json
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import binance_testnet_paper as btp
+
+# ── 沙盒 (fix ①, 2026-09-27) ─────────────────────────────────────────
+# 之前呢個 test 會直接寫**生產 log**: T2 嘅 fake fill 會 persist 成真記錄
+# (orderId 999001), 生產 reconcile 當佢係孤兒 → 每 tick 重建失敗 → 觸發市價
+# 平倉 (實證 09-20~09-27: 270 筆幻影賣出 = 0.6966 BTC)。測試一律唔准掂生產
+# log — redirect LOG_PATH 去即棄 temp dir; 完場有 T6/T6b 斷言驗證冇洩漏。
+_TMP = tempfile.mkdtemp(prefix="btc-rr-gates-")
+btp.LOG_PATH = os.path.join(_TMP, "orders.json")
+
+_PROD_LOG = os.path.expanduser("~/.hermes/reports/btc_testnet_orders.json")
+
+
+def _prod_order_ids():
+    """生產 log 嘅 order_id 出現次數 (Counter — 重複 append 同一 id 都捉到)。"""
+    if not os.path.exists(_PROD_LOG):
+        return {}
+    try:
+        with open(_PROD_LOG) as f:
+            ids = [o.get("order_id") for o in json.load(f).get("orders", [])
+                   if o.get("order_id")]
+        cnt = {}
+        for i in ids:
+            cnt[i] = cnt.get(i, 0) + 1
+        return cnt
+    except Exception:
+        return {}
+
+
+_prod_ids_before = _prod_order_ids()
 
 RESULTS = []
 
@@ -132,6 +163,15 @@ no_tp1.pop("btc_tp1")
 btp.current_price = lambda: 77215.0
 rec5, err5 = btp.place_signal_order(no_tp1, "k", "s", atr=145.6, mode="market")
 result("T5 冇 TP1 → 唔落單", rec5 is None and err5, f"({err5})")
+
+# ── T6: 沙盒斷言 (fix ①, 2026-09-27) ─────────────────────────────────
+# 冇 redirect 嘅話 T2 就會寫生產 log; 呢兩個斷言係防回歸守衛。
+result("T6 沙盒生效: LOG_PATH 已 redirect 去 temp",
+       btp.LOG_PATH.startswith(_TMP), f"({btp.LOG_PATH})")
+_after = _prod_order_ids()
+_new_ids = [i for i, cnt in _after.items() if cnt > _prod_ids_before.get(i, 0)]
+_leaked = sorted(i for i in _new_ids if i in {999001, 999002, 999003, 999004, 999005})
+result("T6b 生產 log 冇新增 test 幻影記錄 (999001-5)", not _leaked, f"(leaked={_leaked})")
 
 print(f"\n{sum(1 for _, ok in RESULTS if ok)}/{len(RESULTS)} PASS")
 sys.exit(0 if all(ok for _, ok in RESULTS) else 1)

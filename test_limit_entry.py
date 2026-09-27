@@ -19,6 +19,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import binance_testnet_paper as btp
 
+# ── 沙盒 (fix ①, 2026-09-27): 測試唔准寫生產 log ──────────────────────
+# 任何漏咗 patch load_log/save_log 嘅路徑會寫入 temp, 唔會洩漏去生產檔案。
+# (背景: test_rr_gates T2 曾直寫生產 log → 生產 reconcile 追殺幻影記錄。)
+import tempfile as _tempfile
+
+btp.LOG_PATH = os.path.join(_tempfile.mkdtemp(prefix="btc-limit-entry-"), "orders.json")
+
 RESULTS = []
 
 
@@ -123,6 +130,14 @@ result("L11 market 模式仍可落單 (legacy)",
 
 # ── 3. reconcile: LIMIT_PENDING 處理 ──────────────────────────
 import btc_auto_trade_cycle as cyc
+
+# 沙盒延伸 (fix ①, 2026-09-27): reconcile_cycle 會經 log() 寫生產 heartbeat +
+# 寫 reconcile 狀態檔。用 fake API call 生產函数 = 一定要 redirect 呢兩個路徑,
+# 否則假讀數會污染生產檔案。(實證 09:05:37 UTC: 呢個 test 令生產 heartbeat 出現
+# 假「餘額 0.00000」警報 — fake /account 冇 BTC balance → acct=0。)
+_cyc_tmp = _tempfile.mkdtemp(prefix="btc-limit-entry-cyc-")
+cyc.HEARTBEAT = os.path.join(_cyc_tmp, "heartbeat.txt")
+cyc.RECONCILE_STATE = os.path.join(_cyc_tmp, "reconcile_state.json")
 
 HIST_PATH = cyc.HISTORY
 

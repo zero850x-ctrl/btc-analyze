@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import copy
+import atexit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import binance_testnet_paper as btp
@@ -33,6 +34,28 @@ with open(backup, "w") as f:
     json.dump(orig_log, f, ensure_ascii=False, indent=2)
 n_before = len(orig_log["orders"])
 print(f"log backup → {backup} ({n_before} orders)")
+
+# 2026-09-27: 呢個 script 本質上會暫時改生產 log (integration check) —— register
+# atexit 還原: 中途 assert 爆 / KeyboardInterrupt 都會還原 + 清 backup。
+# (之前寫法只有行到最尾先還原; 中途 crash 會留低測試記錄喺生產 log。)
+_restored = {"done": False}
+
+
+def _restore_log():
+    if _restored["done"]:
+        return
+    _restored["done"] = True
+    try:
+        with open(LOG_PATH, "w") as f:
+            json.dump(orig_log, f, ensure_ascii=False, indent=2)
+        if os.path.exists(backup):
+            os.unlink(backup)
+        print(f"\n[cleanup] 生產 log 已還原 ({len(orig_log['orders'])} orders)")
+    except Exception as e:                          # noqa: BLE001
+        print(f"\n[cleanup] ⚠️ 還原失敗: {e} — backup 喺 {backup}")
+
+
+atexit.register(_restore_log)
 
 # ── 1. 掛一張唔會成交嘅 LIMIT (距市價 1.5%: > 唔會即刻成交, < 3% 唔會被偏離保護 cancel) ──
 limit_px = round(px * 0.985, 2)
@@ -108,9 +131,8 @@ bad = [t for t in hist["trades"] if t.get("pattern", "").startswith("🧪")]
 print(f"\n5) HISTORY: {len(hist['trades'])} 單, 其中測試單 = {len(bad)}")
 assert not bad, "測試單污染咗 HISTORY"
 
-# ── 6. 清理 log (還原到測試前) ──
-with open(LOG_PATH, "w") as f:
-    json.dump(orig_log, f, ensure_ascii=False, indent=2)
+# ── 6. 清理 log (還原到測試前; atexit 亦會補做) ──
+_restore_log()
 with open(LOG_PATH) as f:
     restored = json.load(f)
 print(f"\n6) log 還原: {len(restored['orders'])} orders (測試前 {n_before})")
@@ -119,4 +141,3 @@ assert len(restored["orders"]) == n_before
 opens_end = btp._signed_request("GET", "/api/v3/openOrders", {"symbol": "BTCUSDT"}, key, secret)
 print(f"   最後 openOrders = {len(opens_end)} 張 (冇殘留)")
 print("\n🎉 INTEGRATION CHECK ALL PASS")
-os.unlink(backup)

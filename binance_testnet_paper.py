@@ -149,10 +149,13 @@ def load_log():
 # F5 (GLM 第三輪): 原本仲有一個 LIVE_STATUS tuple 但冇任何消費者 —— 已刪 (死代碼,
 # 而且「WIPED 當 live」呢個政策決定藏喺死 tuple 入面, 會誤導讀者)。
 # 明確「已完結」= 唔再佔用倉位 (其餘一律當 live)
-# FLATTENED_LOW_FILL_RR: 成交後 RR < MIN_RR_EXEC → 即刻市價平倉。log 有 flatten_ok=True
-#   = 真嘅平咗 → 必須當 done, 否則 3 筆殭屍記錄永久佔 cap (新 code 實測揪出, 因為
-#   fail-closed 會將佢當 live)。注意: FLATTENED_OCO_FAILED 唔同 —— 佢係 flatten
-#   **未確認成功**, 所以仍然要當 live / 交人手。
+# FLATTENED_LOW_FILL_RR: 緊急平倉**已確認**嘅終態 —— 觸發原因可以係 (a) 成交後
+#   RR < MIN_RR_EXEC 即刻市價平倉, 或 (b) exit legs 建立失敗後 emergency market
+#   close 成功。log 有 flatten_ok=True = 真嘅平咗 → 必須當 done, 否則殭屍記錄
+#   永久佔 cap (新 code 實測揪出, 因為 fail-closed 會將佢當 live)。注意:
+#   FLATTENED_OCO_FAILED 唔同 —— 佢係 flatten **未確認成功** (flatten_ok None/False),
+#   所以仍然要當 live / 交人手。resolve_orphan_states 見到 flatten_ok=True 嘅
+#   FLATTENED_OCO_FAILED 會直接轉做 FLATTENED_LOW_FILL_RR (2026-09-27 phantom loop 修正)。
 DONE_STATUS = ("CLOSED", "LIMIT_EXPIRED", "LIMIT_CANCELLED", "SKIP_PREFLIGHT",
                "FLATTENED_LOW_FILL_RR")
 
@@ -163,6 +166,11 @@ MAX_DAILY_LOSS_R = float(os.environ.get("BTC_MAX_DAILY_LOSS_R", "3.0"))
 # 同方向並行上限。XAUUSD 用 3; BTC 維持 1 —— BTC 24/7 + 波動 3.4× 黃金,
 # 3 個同向倉嘅實際風險暴露大好多。用戶 09-04 放寬 XAUUSD 係針對黃金, 唔應自動套去 BTC。
 SAME_DIR_MAX = int(os.environ.get("BTC_SAME_DIR_MAX", "1"))
+
+# 對帳 rebuild 連續失敗 N 次 → 停止自動重建 + 標人手對帳。
+# 2026-09-27 phantom loop: 無限重試係 7 日 270 筆幻影賣出嘅放大器 —— 停手交人手,
+# 好過每 tick 重試。清除 rebuild_frozen / rebuild_fail_count 可恢復自動重建。
+REBUILD_FAIL_FREEZE = int(os.environ.get("BTC_REBUILD_FAIL_FREEZE", "3"))
 
 
 def is_live_rec(o):
@@ -229,7 +237,8 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
     """
     changed = []
     summary = {"closed_orphan": 0, "rebuilt": 0, "needs_legs": 0, "skipped": 0,
-               "frozen_unknown": 0, "frozen_ambiguous": 0}
+               "frozen_unknown": 0, "frozen_ambiguous": 0,
+               "resolved_flattened": 0, "rebuild_failed": 0}
 
     # ── 模糊歸因前置檢查 (2026-09-20 GLM 第四輪 MEDIUM) ────────────────────
     # 如果孤兒 qty 總和 > 帳戶餘額, 逐筆估出嚟嘅持倉**唔可能同時啱** (每人各分到
@@ -285,6 +294,18 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
             rec.setdefault("closed_note", "孤兒狀態復原: exchange 冇倉 → 歸 CLOSED")
             changed.append(rec)
             summary["closed_orphan"] += 1
+        elif st == "FLATTENED_OCO_FAILED" and rec.get("flatten_ok") is True:
+            # 2026-09-27 phantom loop 修正: flatten 已確認成功 = 一定冇倉 →
+            # 直接判終態。**唔可以行 rebuild** —— rebuild 失敗 fallback 會市價
+            # 平倉 (賣走唔屬於呢筆嘅幣; 實證 09-20~09-27 每 tick 賣 0.00258 BTC
+            # ×270 筆)。定調: flatten_ok=True = 真嘅平咗 → done。
+            rec["status"] = "FLATTENED_LOW_FILL_RR"
+            rec["resolved_via"] = "flatten_confirmed"
+            rec["resolved_ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            rec.setdefault("resolved_note",
+                           "flatten 已確認成功 (flatten_ok=True) → 對帳判定冇倉 (終態)")
+            changed.append(rec)
+            summary["resolved_flattened"] += 1
         elif rebuild is None:
             # LOW-1 (GLM 第四輪): F3 嘅 freeze 檢查要喺 rebuild 檢查**之前**。
             # 唔係嘅話 rebuild=None (lot_step 攞唔到) 時, 結果不明嘅
@@ -311,6 +332,10 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
             # 唔可以只標 needs_legs (冇消費者 = 死巷 → 倉永久裸掛冇止損)。
             # F2: contract —— rebuild 必須令 rec 離開 ORPHAN_STATUS, 否則當失敗
             # (免得每個 cycle 重複補建 → 重複 SELL legs)。
+            if int(rec.get("rebuild_fail_count") or 0) >= REBUILD_FAIL_FREEZE:
+                # 已連續失敗達門檻 → 停手交人手 (唔重試、唔重複入 changed)
+                summary["needs_legs"] += 1
+                continue
             try:
                 before = str(rec.get("status") or "")
                 new_rec = rebuild(rec)
@@ -324,12 +349,22 @@ def resolve_orphan_states(log, held_qty, dust_eps=0.0, rebuild=None, acct_btc=No
                         f"rebuild 冇令記錄離開孤兒狀態 (仍為 {now_st!r}) — 拒絕當成功")
                 rec.pop("needs_legs", None)
                 rec.pop("rebuild_error", None)
+                rec.pop("rebuild_fail_count", None)
+                rec.pop("rebuild_frozen_note", None)
                 rec["rebuilt_legs_ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 summary["rebuilt"] += 1
             except Exception as e:                       # noqa: BLE001
                 rec["rebuild_error"] = f"{type(e).__name__}: {e}"
                 rec["needs_legs"] = True
                 summary["needs_legs"] += 1
+                # 2026-09-27 phantom loop: 連續失敗要停手交人手 (無限重試 = 放大器)
+                rec["rebuild_fail_count"] = int(rec.get("rebuild_fail_count") or 0) + 1
+                if rec["rebuild_fail_count"] >= REBUILD_FAIL_FREEZE:
+                    rec["needs_manual_reconcile"] = True
+                    rec["rebuild_frozen_note"] = (
+                        f"重建連續失敗 {rec['rebuild_fail_count']} 次 → 停止自動重建, "
+                        f"交人手對帳 (清 rebuild_frozen/rebuild_fail_count 可恢復)")
+                summary["rebuild_failed"] += 1
             changed.append(rec)
         else:
             rec["needs_legs"] = True
@@ -626,7 +661,11 @@ def place_signal_order(setup, key, secret, atr=None, mode=None):
             rec["flatten_ok"] = False
             rec["flatten_error"] = e2.read().decode()[:200]
         rec["flatten_ts"] = time.time()
-        rec["status"] = "FLATTENED_OCO_FAILED"
+        # 2026-09-27 phantom loop 修正: 只有 flatten **未確認** 先可以標 fail-closed
+        # 狀態。舊 code 無條件標 FLATTENED_OCO_FAILED → flatten_ok=True 嘅記錄仍
+        # 入對帳 rebuild, 每 tick 觸發「重建失敗 → 市價平倉」(實證: 270 筆幻影賣出)。
+        if not rec.get("flatten_ok"):
+            rec["status"] = "FLATTENED_OCO_FAILED"
         _log_upsert(rec)
         return rec, None
 
@@ -652,13 +691,16 @@ def _exit_cid(rec, tag):
     return cid
 
 
-def build_exit_legs(rec, key, secret, lot_step):
+def build_exit_legs(rec, key, secret, lot_step, allow_flatten=True):
     """已成交倉 (rec) → 建 3 段 exit: OCO_A(SL+TP1) / OCO_B(SL+TP2) / L3(尾倉 SL).
 
     由 place_signal_order 抽出, 因為 feat/limit-entry 之後限價單係「掛單 → 遲啲成交」,
     成交時已經係另一個 reconcile tick, 兩邊都要用同一套建 leg 邏輯。
 
-    任一段建立失敗 → 取消已建 exit + market flatten (冇裸倉)。
+    任一段建立失敗 → 取消已建 exit + market flatten (冇裸倉) —— 但呢個 fallback
+    只准喺「**肯定有倉**」(新成交) 嘅路徑用。對帳 rebuild 必須傳
+    allow_flatten=False: 紀錄嘅持倉只係估算, 市價平倉會賣走唔屬於佢嘅幣
+    (2026-09-27 phantom loop: rebuild 失敗 fallback 每 tick 賣 0.00258 BTC ×270)。
     rec 需要: side / qty / planned_stop / planned_tp1 / planned_tp2 / pattern / atr
     """
     side = rec["side"]
@@ -679,6 +721,7 @@ def build_exit_legs(rec, key, secret, lot_step):
 
     exit_orders = []   # (tag, ids) for cleanup
     leg_ids = []
+    failed = False     # 2026-09-27: 失敗路徑唔可以再行 OCO_PLACED 判定
 
     def _oco_qty(sl_qty, tp_price, tag="A"):
         if sl_qty <= 0:
@@ -864,6 +907,7 @@ def build_exit_legs(rec, key, secret, lot_step):
             # exit 完全建唔成 (q1/q3 全 0 等) → 冇裸倉, 即 flatten (GLM review #B)
             raise RuntimeError("no exit legs built (q1/q3 both 0)")
     except (urllib.error.HTTPError, RuntimeError) as e:
+        failed = True
         # exit 建立失敗 → 取消已建 exit order + market flatten (冇裸倉)
         for tag, ids in exit_orders:
             for oid in ids:
@@ -872,20 +916,34 @@ def build_exit_legs(rec, key, secret, lot_step):
                                     {"symbol": SYMBOL, "orderId": oid}, key, secret)
                 except Exception:
                     pass
-        try:
-            _signed_request("POST", "/api/v3/order", {
-                "symbol": SYMBOL, "side": exit_side, "type": "MARKET",
-                "quantity": f"{fill_qty:.5f}",
-            }, key, secret)
-            rec["status"] = "FLATTENED_OCO_FAILED"
-            rec["flatten_note"] = f"exit order 建立失敗 ({type(e).__name__}) → emergency market close"
-        except urllib.error.HTTPError as e2:
-            rec["flatten_error"] = e2.read().decode()[:200]
+        if allow_flatten:
+            try:
+                _signed_request("POST", "/api/v3/order", {
+                    "symbol": SYMBOL, "side": exit_side, "type": "MARKET",
+                    "quantity": f"{fill_qty:.5f}",
+                }, key, secret)
+                rec["flatten_ok"] = True
+                # 確認平倉 → 終態 (唔佔 cap、唔再入對帳 rebuild)
+                rec["status"] = "FLATTENED_LOW_FILL_RR"
+                rec["flatten_note"] = (f"exit order 建立失敗 ({type(e).__name__}) → "
+                                       f"emergency market close (已確認)")
+            except urllib.error.HTTPError as e2:
+                rec["flatten_ok"] = False
+                rec["flatten_error"] = e2.read().decode()[:200]
+                rec["status"] = "FLATTENED_OCO_FAILED"
+                rec["flatten_note"] = (f"exit order 建立失敗 ({type(e).__name__}) → "
+                                       f"emergency close 失敗 — 倉位未確認, 交對帳")
+            rec["flatten_ts"] = time.time()
+        else:
+            # 對帳 rebuild 唔准市價平倉 (2026-09-27 phantom loop 修正):
+            # 紀錄嘅持倉只係估算, 市價平倉會賣走唔屬於呢筆嘅幣。
+            rec["flatten_skipped_reason"] = (
+                "rebuild 路徑禁止自動市價平倉 (2026-09-27 phantom loop) — "
+                "倉位交交易所對帳, 唔靠估算")
         rec["oco_error"] = (e.read().decode()[:200] if isinstance(e, urllib.error.HTTPError)
                             else str(e)[:200])
-        rec["flatten_ts"] = time.time()
 
-    if leg_ids and rec.get("status") != "FLATTENED_OCO_FAILED":
+    if not failed and leg_ids:
         rec["exit_leg_ids"] = leg_ids
         rec["status"] = "OCO_PLACED"
         # NEW-4 (GLM 第八輪): 落新 OCO 成功 = 倉已有完整 legs → 清走上一輪嘅
@@ -893,7 +951,7 @@ def build_exit_legs(rec, key, secret, lot_step):
         for _k in ("needs_manual_reconcile", "adopt_error", "adopt_fail_count",
                    "partial_count", "partial_adopt_ids", "unknown_holding_reason"):
             rec.pop(_k, None)
-    elif not leg_ids and rec.get("status") in ("FILLED_ENTRY", "LIMIT_FILLED"):
+    elif failed and not leg_ids and rec.get("status") in ("FILLED_ENTRY", "LIMIT_FILLED"):
         rec["status"] = "OCO_FAILED"
         rec["oco_error"] = "no exit legs built"
 
