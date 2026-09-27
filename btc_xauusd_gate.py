@@ -41,6 +41,10 @@ MAX_HOLD_BARS = 96
 STEP_BARS = 48
 WARMUP = 500
 COST_PCT = 0.001
+# 對齊 XAUUSD analyze_v3: SPIKE_WINDOW_BARS=4, SPIKE_ATR_MULT=3.0
+# (09-08 由 2.0 調高 — 2.0 喺普通趨勢延續都會 fire; 9/4  motivating move ≈9.5 ATR)
+SPIKE_ATR_MULT = 3.0
+SPIKE_WINDOW_BARS = 4
 
 
 def _load(name, fname):
@@ -134,6 +138,29 @@ def gate_levels(setup, side, daily_trend, h1_trend):
     }
 
 
+def spike_of(closes_tail, atr, mult=None, win=None):
+    """複製 XAUUSD `analyze_v3._post_spike_state` 嘅公式 (純函數).
+
+    ⚠️ BTC repo 嘅 analyze_v3.py 係**舊版**, 冇 `_post_spike_state`
+    (post-spike gate 係 XAUUSD repo 2026-09-04 加嘅層, 未同步過嚟)
+    → 要自己實作先測得到 nospike。
+
+    公式 (同官方一字不差):
+        move = close[-2] - close[-2-win]     # -1 = forming bar, -2 = 最後已收市
+        |move| > mult × ATR → spike, 方向 = move 符號
+    """
+    mult = SPIKE_ATR_MULT if mult is None else mult
+    win = SPIKE_WINDOW_BARS if win is None else win
+    if not closes_tail or not atr or atr <= 0:
+        return None
+    if len(closes_tail) < win + 2:
+        return None
+    move = closes_tail[-2] - closes_tail[-2 - win]
+    if abs(move) <= mult * atr:
+        return None
+    return "down" if move < 0 else "up"
+
+
 def apply_interval_scaling(interval):
     """M30 每根 bar 30 分鐘 → WARMUP/STEP/MAX_HOLD 要 ×2 保持同樣時間跨度.
 
@@ -185,6 +212,11 @@ def run_segment(bars, label, budget_s=900):
                                           close=df_a["Close"].values)
             patterns = av3.detect_all_patterns(df_a, pts, atr=atr)
             setups = av3.generate_trade_setups(df_a, patterns, pts, dt, px, atr, h1_trend=ht)
+            # nospike 診斷: 自算 (BTC repo 嘅 av3 冇 _post_spike_state; 公式
+            # 同 XAUUSD 一字不差, 見 spike_of docstring)。唔 mutate setup,
+            # 免污染 gate_levels 讀嘅 quality/priority。
+            closes_tail = [float(x) for x in window["close"].values[-9:]]
+            spike_state = spike_of(closes_tail, atr)
         except Exception as e:
             # 唔可以靜默: 若全部窗口都 raise, 之前會顯示「0 樣本」假象
             if n_err < 3:
@@ -224,6 +256,14 @@ def run_segment(bars, label, budget_s=900):
                 last = float(fwd["close"].iloc[-1])
                 pnl = ((last - entry_fill) / risk) if side == "BUY" else ((entry_fill - last) / risk)
             g = gate_levels(s, side, dt, ht)
+            # nospike 診斷欄: closes_tail + atr → 之後可離線掃任何
+            # SPIKE_ATR_MULT × SPIKE_WINDOW_BARS 組合 (唔使重跑 backtest)
+            # ⚠️ 官方 gate 係 block「同 spike 方向一致」嘅 setup
+            g["post_spike"] = bool(
+                (spike_state == "down" and side == "SELL")
+                or (spike_state == "up" and side == "BUY"))
+            g["atr"] = round(float(atr), 4)
+            g["ct"] = [round(c, 2) for c in closes_tail]
             rows.append({"ts": str(ts), "side": side, "pattern": str(s.get("pattern", "?"))[:22],
                          "pnl_r": round(float(pnl), 3), "label": label, **g})
         i += STEP_BARS

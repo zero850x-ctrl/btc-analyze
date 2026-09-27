@@ -104,8 +104,108 @@ deterministic, 差異 100% 來自 gate。
 6. **冇任何一層統計顯著** (全部 |t| < 2, 最大 1.08)
 7. **gate 係風控紀律, 唔係 alpha 來源** — 兩個市場都一樣
 
+## ⚠️ 方法論修正 (2026-09-27 追加, 查 nospike 時發現)
+
+**上面「逐層移除」嘅數字唔可以歸因任何一層。** 我當初已警告 cooldown
+confound, 但報告時仍然寫咗「移除 nospike 反而多賺 +441.31」— 呢個係錯嘅。
+
+證據 (180d H1, 三組都係 72 單但 PnL 唔同):
+| gate 組合 | 單數 | 總PnL |
+|---|---|---|
+| G5 = tp_sl+quality+aligned+priority+kline | 72 | +317.51 |
+| 移除 nospike = G5 **+session** | 72 | +441.31 |
+| 移除 session = G5 **+nospike** | 72 | +195.16 |
+
+→ G5 vs 「移除 nospike」只差 **session** 層 → 嗰 +$124 係 **session** 嘅效果。
+→ 加 nospike 令 +317.51 → +195.16 (−$122)。
+→ 單數一樣但 PnL 唔同 = 交易序列唔同 = **cooldown 序列效應**, 唔係層嘅貢獻。
+
+**結論: cooldown-based backtest ablation 唔可以用嚟判斷 gate 層貢獻。**
+正確方法 = ① 逐 setup 獨立評估 ② 直接數 fire 次數。
+
+---
+
+## nospike 深入查 (2026-09-27, 用戶要求)
+
+機制 (`analyze_v3._post_spike_state`):
+```
+move = close[-2] - close[-2-W]      # W = SPIKE_WINDOW_BARS = 4 (已收市 bar)
+|move| > MULT × ATR  → spike, 方向 = move 符號
+setup 方向同 spike 方向一致 → post_spike_blocked = True (唔推送)
+MULT = 3.0 (09-08 由 2.0 調高 — 2.0 喺普通趨勢延續都 fire; 動機事件 ≈9.5 ATR)
+```
+
+### 新工具
+
+- `btc_xauusd_gate.spike_of()` — 複製官方公式 (BTC repo 嘅 av3 冇呢個函數,
+  post-spike gate 係 XAUUSD repo 09-04 加、未同步)。**`test_spike_of.py` 19 PASS / 0 FAIL** —
+  同 XAUUSD 原函數逐字對比 (300 組隨機 + 邊界 + 4 個參數組合), 100% 一致。
+- `count_nospike.py` — monkey-patch `bt._inject_push_metadata` 直接數 fire 次數。
+- `xauusd_nospike_deep.py` — 離線掃 MULT × WINDOW (backtest 只需跑一次)。
+
+### 發現 1: nospike 確實 fire, 但對最終交易零影響
+
+| 數據 | setups | blocked | fire 率 | 產出交易 |
+|---|---|---|---|---|
+| 60d M30 | 3,543 | 46 | 1.30% | 26 |
+| 180d H1 | 7,502 | 100 | 1.33% | 28 |
+
+但 60d M30 ablation「移除 L_nospike」→ **48 單 −45.53, 同 G6 一模一樣**
+→ fire 咗但**零影響** (被其他層或 priority 排序蓋過) = **冗餘層**。
+
+### 發現 2: 方向對, 但感知度極低 (GC=F 730d 1h 乾淨版, 442 setup)
+
+- 被擋 **5 單 (1.1%)**, meanR **−1.004**, 勝率 **0%** (全滅)
+- 通過 437 單, meanR −0.078
+- TRAIN −1.005 / TEST −1.000 → ✅ 兩段同號
+- → **方向正確** (擋走嘅係蝕單), 但 n=5 → 唔顯著
+- 放行呢 5 單 → sumR −39.07 → −44.09 (**更差**)
+
+### 發現 3: ❌ 唔應該放寬 (敏感度, GC=F 1h)
+
+| MULT | W | 被擋 n | 被擋 meanR | 放行 meanR | vs 唔加 (−0.088) |
+|---|---|---|---|---|---|
+| 1.5 | 2 | 18 | −0.61 | −0.07 | +0.022 |
+| 2.0 | 2 | 11 | −0.64 | −0.07 | +0.014 |
+| **3.0** | **4** | **5** | **−1.00** | **−0.08** | **+0.010 ←官方** |
+| 3.0 | 6 | 20 | **+0.11** | −0.10 | −0.010 |
+| 1.5 | 6 | 104 | **+0.04** | −0.13 | **−0.038 ❌** |
+| 2.0 | 6 | 74 | **+0.01** | −0.11 | −0.021 ❌ |
+
+→ **放寬 (細 MULT / 長 window) 會令被擋嘅 meanR 變正** = 開始誤殺賺錢單。
+  官方 (3.0, 4) 剛好喺「方向對 + 誤殺最少」嘅位置。
+- Bonferroni: 測 24 組合 → 門檻 |t| > 2.6 → 最佳 |t| = 2.04 **唔過**。
+
+### 發現 4: 🔄 BTC 上完全相反 (570 setup, 1h)
+
+- 被擋 **15 單 (2.6%)**, meanR **+0.589**, 勝率 **66.7%**, t **+2.15**
+- 放行 555 單 meanR +0.058
+- TRAIN +0.869 / TEST +0.170 → 兩段**同號皆正** → 一致地誤殺
+- spike 反方向放行 (搏反彈) 3 單 meanR **+0.850** (100% 勝)
+- 敏感度: **所有** MULT×WINDOW 組合被擋 meanR 都係正 (除 n=4 兩格)
+- → **BTC 上呢層方向係反嘅**: 急升/急跌後追同方向**賺錢** (動量延續),
+  唔係黃金嗰種 V 型反彈陷阱。
+
+### 結論: nospike 係咪過緊?
+
+**唔係。** 佢:
+1. 感知度低 (1.3%), 對最終交易**零影響** (60d M30 移除零變化) = 冗餘層
+2. 方向**正確** (擋走嘅係蝕單), 放寬反而會誤殺
+3. 官方參數 (3.0, 4) 已喺合理位置
+4. 邊際貢獻 ≈ 0 → 保留成本近零, 但唔應該期望佢貢獻 alpha
+
+⚠️ 之前「移除 nospike 多賺 +$124」係 cooldown artifact (見上方法論修正)。
+
+### ⚠️ 限制
+
+- GC=F 1h 乾淨版同官方 M30 設計有 timeframe mismatch (yfinance 30m 只 60 日
+  → WARMUP=1000 令 M30 樣本不足) → M30 乾淨版做唔到
+- 全部 |t| 遠低於 Bonferroni 門檻 → 唔顯著
+- nospike fire 率用 GC=F(黃金期貨) 代理 XAUUSD spot, 兩者可能唔同
+
 ## 待辦 (若要繼續)
 
 - 730d 需要先改 XAUUSD backtest 用固定窗口 (O(n)), 否則跑唔完
-- `nospike` 疑似過緊, 值得單獨檢視
+- `nospike` 已查完 (見上)
 - `quality / priority` 若真係零 bind, 可以簡化 (但唔係緊急)
+
