@@ -115,6 +115,26 @@ def fmt_summary(s):
     return f"🚧 今日 gate 擋 {s['total']} 次 ({detail})"
 
 
+def latest_reason(log_path=None):
+    """最近一根 M30 bar 嘅擋單原因 — 令報告講得出「而家擋緊咩」."""
+    log_path = log_path or DEFAULT_LOG
+    if not os.path.exists(log_path):
+        return "冇記錄"
+    with open(log_path) as f:
+        log = json.load(f)
+    day = datetime.now(HKT).strftime("%Y-%m-%d")
+    bars = (log.get(day) or {}).get("bars") or {}
+    if not bars:
+        return "冇記錄"
+    last_bar = max(bars)
+    reasons = bars[last_bar].get("reasons") or {}
+    if not reasons:
+        return "冇記錄"
+    txt = ", ".join(f"{r} × {n}" for r, n in
+                    sorted(reasons.items(), key=lambda x: -x[1]))
+    return f"{last_bar} bar: {txt}"
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--record":
