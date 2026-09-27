@@ -46,6 +46,9 @@ def log(msg):
 RECONCILE_STATE = os.environ.get("BTC_RECONCILE_STATE") or os.path.expanduser(
     "~/.hermes/reports/btc_reconcile_state.json")
 BALANCE_DROP_ALERT_BTC = float(os.environ.get("BTC_BALANCE_DROP_ALERT", "0.05"))
+# 孤兒狀態長期唔變都要定期重提 (GLM 09-27 #3): 一次性警報冇人理 = 永遠靜默,
+# 正正係 7 日 phantom 事故嘅教訓。每 N 小時重提未處理嘅孤兒對帳。
+ALERT_REMIND_SEC = int(os.environ.get("BTC_ALERT_REMIND_HOURS", "6")) * 3600
 
 
 def reconcile_alerts(summary, acct_btc):
@@ -54,6 +57,8 @@ def reconcile_alerts(summary, acct_btc):
     2026-09-27 phantom loop 教訓: 孤兒狀態連續 7 日每 tick 重複 rebuild 失敗
     (needs_legs 長期 10+) 全程冇任何警報 → 冇人知。所以:
       - orphan summary (per-tick 計數) 有變化 → ⚠️ 出一條, 之後靜默直到再變。
+      - 狀態長期唔變 (例如 freeze 後) → 每 BTC_ALERT_REMIND_HOURS (default 6h)
+        重提一次 (GLM 09-27 #3: 一次性警報冇人理 = 永遠靜默, 就係事故嘅核心教訓)。
       - 餘額 high-water mark: 由高位累計跌 ≥ BALANCE_DROP_ALERT_BTC 出一次聲
         (正常單筆規模 0.002-0.003 BTC, 跌 0.05 = 唔可能係正常操作), 破新高先重設。
     回傳 list[str]; caller 用 log() 輸出 (⚠️ 喺 cron NOTABLE_KEYS = 會推送 TG)。
@@ -66,15 +71,24 @@ def reconcile_alerts(summary, acct_btc):
                 st = json.load(f) or {}
         cur = {k: v for k, v in (summary or {}).items() if v}
         prev = st.get("orphan_summary") or {}
+        now_ts = time.time()
+
+        def _fmt(d):
+            return ", ".join(f"{k}={v}" for k, v in sorted(d.items()))
+
         if cur != prev:
-            def _fmt(d):
-                return ", ".join(f"{k}={v}" for k, v in sorted(d.items()))
             if cur and prev:
                 msgs.append(f"⚠️ 孤兒對帳狀態變化: {_fmt(cur)} (之前: {_fmt(prev)})")
             elif cur:
                 msgs.append(f"⚠️ 孤兒對帳狀態: {_fmt(cur)}")
             elif prev:
                 msgs.append(f"✅ 孤兒對帳已清空 (之前: {_fmt(prev)})")
+            st["alert_ts"] = now_ts
+        elif cur and now_ts - float(st.get("alert_ts") or 0.0) >= ALERT_REMIND_SEC:
+            # GLM 09-27 #3: 狀態長期唔變 (e.g. freeze 後) 都要定期重提 ——
+            # 一次性警報冇人理 = 永遠靜默 (7 日事故核心教訓)。
+            msgs.append(f"⏰ 孤兒對帳仍未處理 (每 {ALERT_REMIND_SEC // 3600}h 重提): {_fmt(cur)}")
+            st["alert_ts"] = now_ts
         st["orphan_summary"] = cur
         if acct_btc is not None:
             hw = st.get("balance_hw")
@@ -321,6 +335,18 @@ def reconcile_cycle(key, secret):
     def _rebuild(rec):
         if lot_step is None:
             raise RuntimeError("冇 lot_step, 唔敢建 legs")
+        # 2026-09-27 GLM review #2: 建 legs 前必須確認 entry 成交真係存在於交易所
+        # (myTrades)。幽靈記錄 (test 污染/人手改 log) 價位合理時會照樣掛真 OCO/SL
+        # legs → SL 遲啲觸發 = 延遲版市價平倉。驗證唔到 entry → 拒建, 交人手
+        # (行同一條 rebuild-fail → freeze 路徑, 3 tick 後停手; 全程唔會落任何單)。
+        entry_id = rec.get("order_id")
+        trades_all = _signed_request("GET", "/api/v3/myTrades",
+                                     {"symbol": "BTCUSDT", "limit": 1000}, key, secret)
+        if not entry_id or not any(str(x.get("orderId")) == str(entry_id)
+                                   for x in trades_all):
+            raise RuntimeError(
+                f"reconcile rebuild 拒絕: entry order {entry_id!r} 唔喺 myTrades — "
+                f"疑似幽靈記錄, 唔建 legs (交人手對帳)")
         # 2026-09-27 phantom loop: 對帳 rebuild 唔准市價平倉 (持倉只係估算,
         # 平倉會賣走唔屬於呢筆嘅幣) —— 見 build_exit_legs docstring。
         return build_exit_legs(rec, key, secret, lot_step, allow_flatten=False)
@@ -591,7 +617,7 @@ def main():
     for w in wiped:
         log(f"🧹 WIPED {w.get('side','?')} {(w.get('pattern') or '?')[:18]} "
             f"entry={w.get('entry_fill')} remaining={w.get('wiped_remaining_qty')} "
-            f"(testnet 帳戶重置 — 唔計入 sumR, cap 1 已釋放)")
+            f"(testnet 帳戶重置 — 終態 WIPED, 唔計入 sumR, cap 已釋放)")
 
     # 2. 引擎掃描
     out = sh("python3 btc_engine.py 2>&1 | tail -30")
@@ -610,8 +636,10 @@ def main():
     # 4. 每日統計
     if closed:
         hist = json.load(open(HISTORY))
-        # .get() 防禦 (09-27): 統計唔可以因任何缺 field 嘅記錄 crash
-        rs = [t.get("r_multiple") or 0 for t in hist["trades"]]
+        # .get() 防禦 (09-27): 統計唔可以因任何缺 field 嘅記錄 crash。
+        # GLM 09-27 #10: 缺 r_multiple 嘅記錄唔可以當 0R 計入勝率分母 ——
+        # 同 HISTORY 寫入 filter (r_multiple is not None) 對齊。
+        rs = [t["r_multiple"] for t in hist["trades"] if t.get("r_multiple") is not None]
         log(f"📊 累計 {len(rs)} 平倉: sumR={sum(rs):+.2f} 勝率={sum(1 for r in rs if r > 0)}/{len(rs)}")
 
 

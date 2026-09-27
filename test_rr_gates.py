@@ -170,8 +170,10 @@ result("T6 沙盒生效: LOG_PATH 已 redirect 去 temp",
        btp.LOG_PATH.startswith(_TMP), f"({btp.LOG_PATH})")
 _after = _prod_order_ids()
 _new_ids = [i for i, cnt in _after.items() if cnt > _prod_ids_before.get(i, 0)]
-_leaked = sorted(i for i in _new_ids if i in {999001, 999002, 999003, 999004, 999005})
-result("T6b 生產 log 冇新增 test 幻影記錄 (999001-5)", not _leaked, f"(leaked={_leaked})")
+# GLM 09-27 #11: 唔止 999001-5 —— 任何新增 order_id < 1,000,000 都當洩漏。
+# (生產真實 order id 而家 6.9M+ 且單調遞增; 新記錄出現 ≤1M id 冇可能係真單。)
+_leaked = sorted(i for i in _new_ids if isinstance(i, int) and i < 1_000_000)
+result("T6b 生產 log 冇新增測試幻影記錄 (任何 <1M 新 id)", not _leaked, f"(leaked={_leaked})")
 
 print(f"\n{sum(1 for _, ok in RESULTS if ok)}/{len(RESULTS)} PASS")
 sys.exit(0 if all(ok for _, ok in RESULTS) else 1)

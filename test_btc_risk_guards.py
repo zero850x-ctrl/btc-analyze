@@ -57,10 +57,10 @@ def reset_log(orders=None):
 
 print("=== A. is_live_rec fail-closed ===")
 LIVE_EXPECT = ["FILLED_ENTRY", "ENTRY_FILLED_PENDING_EXITS", "OCO_PLACED", "LIMIT_PENDING",
-               "LIMIT_FILLED", "FLATTENED_OCO_FAILED", "OCO_FAILED", "WIPED",
+               "LIMIT_FILLED", "FLATTENED_OCO_FAILED", "OCO_FAILED",
                "SOMETHING_NEW_WE_NEVER_SAW"]
 DONE_EXPECT = ["CLOSED", "LIMIT_EXPIRED", "LIMIT_CANCELLED", "SKIP_PREFLIGHT",
-               "FLATTENED_LOW_FILL_RR"]
+               "FLATTENED_LOW_FILL_RR", "WIPED"]   # WIPED: GLM 09-27 #9 (帳戶重置=終態)
 for st in LIVE_EXPECT:
     check(btp.is_live_rec({"status": st}), f"{st} 當 live")
 for st in DONE_EXPECT:
@@ -477,9 +477,10 @@ check(lg["orders"][0].get("rebuild_fail_count") == 3, "fail_count 累積到 3")
 check(lg["orders"][0].get("needs_manual_reconcile") is True, "達門檻標人手")
 check(bool(lg["orders"][0].get("rebuild_frozen_note")), "有 freeze 原因 (可審計)")
 calls_after = []
-btp.resolve_orphan_states(lg, held_qty=0.001,
-                          rebuild=lambda r: calls_after.append(r) or _fail_rebuild(r))
+_ch4, s4 = btp.resolve_orphan_states(lg, held_qty=0.001,
+                                     rebuild=lambda r: calls_after.append(r) or _fail_rebuild(r))
 check(not calls_after, "freeze 後唔再重試 rebuild (停手交人手)", str(len(calls_after)))
+check(s4.get("needs_legs") == 1, "freeze 記錄仍計入 needs_legs (審計可見)", str(s4))
 
 # F3d (2026-09-27): 對帳 rebuild 路徑禁止市價平倉 —— build_exit_legs(allow_flatten=False)
 # OCO 落單失敗時**唔可以**出 MARKET 單 (會賣走唔屬於呢筆嘅幣)。
@@ -537,6 +538,37 @@ check(out_e.get("status") == "FLATTENED_LOW_FILL_RR",
       "平倉確認 → 終態", str(out_e.get("status")))
 check(out_e.get("flatten_ok") is True, "flatten_ok=True 有記錄")
 check(not btp.is_live_rec(out_e), "終態唔佔 cap")
+
+# F3f (2026-09-27 GLM review #1 核實): 生產 _rebuild 經 build_exit_legs 回傳
+# (rec, err) **tuple** → resolve_orphan_states 必須正確拆包。呢度直接鎖死
+# tuple 回傳嘅兼容性 (GLM 誤以為 resolve 會 AttributeError)。
+reset_log()
+btp._log_upsert({"order_id": 61, "pattern": "A", "side": "BUY",
+                 "status": "OCO_FAILED", "entry_fill": 80000.0})
+lg = btp.load_log()
+_tuple_out = {"order_id": 61, "pattern": "A", "side": "BUY", "status": "OCO_PLACED",
+              "entry_fill": 80000.0, "exit_leg_ids": [1, 2, 3]}
+changed, summ = btp.resolve_orphan_states(
+    lg, held_qty=0.001, rebuild=lambda r: (dict(r, **_tuple_out), None))
+check(summ.get("rebuilt") == 1, "build_exit_legs (rec, err) tuple 回傳照樣計 rebuilt",
+      str(summ))
+check(lg["orders"][0]["status"] == "OCO_PLACED", "記錄離開孤兒狀態 (tuple 拆包 OK)",
+      lg["orders"][0]["status"])
+
+# F3g (2026-09-27 GLM review #9): WIPED 已係終態 — resolve 唔會再郁佢
+# (唔喺 ORPHAN_STATUS), 亦唔會 rebuild。
+reset_log()
+btp._log_upsert({"order_id": 62, "pattern": "A", "side": "BUY",
+                 "status": "WIPED", "entry_fill": 80000.0, "qty": 0.001})
+lg = btp.load_log()
+calls_w = []
+changed, summ = btp.resolve_orphan_states(
+    lg, held_qty=0.001, rebuild=lambda r: calls_w.append(r) or _good_rebuild(r))
+check(not calls_w, "WIPED 唔會入 rebuild", str(len(calls_w)))
+check(not any(v for v in summ.values()), "WIPED 唔入對帳 summary", str(summ))
+check(lg["orders"][0]["status"] == "WIPED", "WIPED 保持原狀")
+check(not btp.is_live_rec(lg["orders"][0]), "WIPED 唔佔 cap")
+check("WIPED" not in btp.ORPHAN_STATUS, "WIPED 已移出 ORPHAN_STATUS (唔再當孤兒)")
 
 # F5: LIVE_STATUS 死代碼已刪 (只可以剩註釋提及, 唔可以有賦值)
 import re as _re2

@@ -149,15 +149,20 @@ def load_log():
 # F5 (GLM 第三輪): 原本仲有一個 LIVE_STATUS tuple 但冇任何消費者 —— 已刪 (死代碼,
 # 而且「WIPED 當 live」呢個政策決定藏喺死 tuple 入面, 會誤導讀者)。
 # 明確「已完結」= 唔再佔用倉位 (其餘一律當 live)
-# FLATTENED_LOW_FILL_RR: 緊急平倉**已確認**嘅終態 —— 觸發原因可以係 (a) 成交後
-#   RR < MIN_RR_EXEC 即刻市價平倉, 或 (b) exit legs 建立失敗後 emergency market
-#   close 成功。log 有 flatten_ok=True = 真嘅平咗 → 必須當 done, 否則殭屍記錄
-#   永久佔 cap (新 code 實測揪出, 因為 fail-closed 會將佢當 live)。注意:
-#   FLATTENED_OCO_FAILED 唔同 —— 佢係 flatten **未確認成功** (flatten_ok None/False),
+# FLATTENED_LOW_FILL_RR: 緊急平倉單**已獲交易所接受**嘅終態 —— 觸發原因可以係
+#   (a) 成交後 RR < MIN_RR_EXEC 即刻市價平倉, 或 (b) exit legs 建立失敗後 emergency
+#   market close 成功。log 有 flatten_ok=True = MARKET 單已 accepted (未做 fill
+#   二次核實; 如 accepted 但未成交, 之後嘅交易所對帳/餘額警報會再捕捉 — GLM 09-27 #5)。
+#   當 done 處理, 否則殭屍記錄永久佔 cap (fail-closed 會將佢當 live)。
+#   注意: FLATTENED_OCO_FAILED 唔同 —— 佢係 flatten **未確認成功** (flatten_ok None/False),
 #   所以仍然要當 live / 交人手。resolve_orphan_states 見到 flatten_ok=True 嘅
 #   FLATTENED_OCO_FAILED 會直接轉做 FLATTENED_LOW_FILL_RR (2026-09-27 phantom loop 修正)。
+# WIPED (2026-09-27 GLM review #9): testnet 帳戶重置後 entry 成交 + 全部 legs 都消失
+#   + 冇 open orders → 一定唔係我哋嘅倉 → 終態。舊寫法唔喺 DONE_STATUS 但又喺
+#   ORPHAN_STATUS: 永遠當 live 佔 cap + 每 tick 入 rebuild (同 phantom 同類殭屍,
+#   而 🧹 訊息一路聲稱「cap 已釋放」= code 同訊息唔一致)。
 DONE_STATUS = ("CLOSED", "LIMIT_EXPIRED", "LIMIT_CANCELLED", "SKIP_PREFLIGHT",
-               "FLATTENED_LOW_FILL_RR")
+               "FLATTENED_LOW_FILL_RR", "WIPED")
 
 # 每日虧損硬上限 (R)。XAUUSD 用 -3R hard stop; BTC 實測最差單日 -3.59R (09-04, 4 單),
 # 11 日之中只有 1 日 ≤ -3R → -3R 唔會過度封鎖, 但會截斷最壞嘅日。
@@ -184,13 +189,15 @@ def is_live_rec(o):
     return str(o.get("status") or "") not in DONE_STATUS
 
 
-# 需要對帳復原嘅「孤兒」狀態: 卡住但可能已經冇倉 (或者冇止損裸掛)
+# 需要對帳復原嘅「孤兒」狀態: 卡住但可能已經冇倉 (或者冇止損裸掛)。
+# WIPED 唔喺度 (2026-09-27 GLM #9): 佢已經係確認咗嘅終態 (帳戶重置), 唔使再對帳。
 ORPHAN_STATUS = ("FLATTENED_OCO_FAILED", "OCO_FAILED", "ENTRY_FILLED_PENDING_EXITS",
-                 "FILLED_ENTRY", "LIMIT_FILLED", "WIPED")
+                 "FILLED_ENTRY", "LIMIT_FILLED")
 
 # 持貨類 status —— 佔住實際 BTC 嘅狀態 (用嚟做持倉歸因扣減, LOW-4/LOW-I)。
 # 注意: 唔包括 LIMIT_PENDING (掛單未成交、冇鎖 BTC)。
-# WIPED / FLATTENED_OCO_FAILED 保守當「可能仲有貨」(flatten 結果可能未確認)。
+# FLATTENED_OCO_FAILED 保守當「可能仲有貨」(flatten 結果可能未確認)。
+# WIPED 保留喺 tuple 只為歷史審計 — 佢而家係 DONE, 唔會 live, 唔會入扣減。
 HOLDING_STATUS = ("ENTRY_FILLED_PENDING_EXITS", "OCO_PLACED", "FILLED_ENTRY",
                   "LIMIT_FILLED", "OCO_FAILED", "FLATTENED_OCO_FAILED", "WIPED")
 

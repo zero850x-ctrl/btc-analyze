@@ -138,11 +138,13 @@ import btc_auto_trade_cycle as cyc
 _cyc_tmp = _tempfile.mkdtemp(prefix="btc-limit-entry-cyc-")
 cyc.HEARTBEAT = os.path.join(_cyc_tmp, "heartbeat.txt")
 cyc.RECONCILE_STATE = os.path.join(_cyc_tmp, "reconcile_state.json")
-
+# GLM 09-27 #8: HISTORY 都要 redirect —— 測試路徑寫 closed_recs 會污染生產統計。
 HIST_PATH = cyc.HISTORY
+cyc.HISTORY = os.path.join(_cyc_tmp, "history.json")
 
 
-def run_reconcile(orders, opens, order_lookup, price=76000.0, history_file=None):
+def run_reconcile(orders, opens, order_lookup, price=76000.0, history_file=None,
+                  account_btc=0.0):
     """orders=local log records, opens=openOrders, order_lookup=orderId→order dict"""
     global LOG
     LOG = {"orders": orders, "history": []}
@@ -154,6 +156,9 @@ def run_reconcile(orders, opens, order_lookup, price=76000.0, history_file=None)
     def fake(method, path, params, key, secret):
         if path == "/api/v3/openOrders":
             return opens
+        if path == "/api/v3/account":
+            return {"balances": [{"asset": "BTC", "free": f"{account_btc:.8f}",
+                                  "locked": "0.00000000"}]}
         if path == "/api/v3/order" and method == "GET":
             return order_lookup.get(params.get("orderId"), {})
         if path == "/api/v3/order" and method == "DELETE":
@@ -170,7 +175,7 @@ def run_reconcile(orders, opens, order_lookup, price=76000.0, history_file=None)
         return {}
 
     btp._signed_request = fake
-    cyc.HISTORY = history_file or "/tmp/_test_hist_unused.json"
+    cyc.HISTORY = history_file or os.path.join(_cyc_tmp, "history.json")
     return cyc.reconcile_cycle("k", "s")
 
 
@@ -255,6 +260,22 @@ hist_after = json.load(open(tmp_hist))
 result("R7 CLOSED 照入 HISTORY (regression)", len(hist_after["trades"]) == 1,
        f"(trades={len(hist_after['trades'])}, status={closed_rec.get('status')})")
 os.unlink(tmp_hist)
+
+# R8 (2026-09-27 GLM review #2): 幽靈記錄 (entry 成交唔喺 myTrades) 唔可以補建
+# legs —— 就算價位合理都唔可以掛真 OCO/SL (SL 觸發 = 延遲版市價平倉)。
+placed.clear()
+ghost = {"pattern": "👻 GHOST", "side": "BUY", "qty": 0.0026, "order_id": 777777,
+         "status": "FILLED_ENTRY", "entry_fill": 75000.0,
+         "planned_stop": 74800.0, "planned_tp1": 76000.0, "atr": 150.0}
+ch, wp = run_reconcile([ghost], [], {}, account_btc=0.0026)
+_oco_calls = [c[1] for c in placed if c[1].endswith("/order/oco")]
+result("R8 幽靈記錄 → 拒建 legs (唔落任何 OCO)",
+       ghost.get("rebuild_fail_count") == 1 and ghost.get("needs_legs") is True
+       and not _oco_calls,
+       f"(count={ghost.get('rebuild_fail_count')}, oco={_oco_calls})")
+result("R8b 錯誤訊息指名 entry 唔喺 myTrades",
+       "唔喺 myTrades" in str(ghost.get("rebuild_error")),
+       f"({ghost.get('rebuild_error')})")
 
 cyc.HISTORY = HIST_PATH
 
