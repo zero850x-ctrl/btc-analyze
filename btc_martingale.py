@@ -3,12 +3,23 @@
 
 設計 (用戶確認 2026-09-03):
 - 第一注 S0 = $15 notional (細注), qty = round_step(15/px, 0.00001)
-- Max chain = 4 注 (S0 ×1, ×2, ×4, ×8) — 第 4 注重見反向 trigger = 全平止損
-- WIN: chain 淨盈 >= $3 → 市價全平, chain reset
+- Max chain = 4 注 (level 0-3, notional ×1/×2/×4/×8)
+- WIN: chain 淨盈 >= $0.2 → 市價全平, chain reset
 - Add-on trigger: price 由最後一注 entry 反向 >= 1×ATR(15m)
 - 每日 loss cap: $225 (chain 止損累計) → 到 cap 即日唔再開新 chain
 - 方向: 15m close vs SMA50 (trend filter)
 - 純 urllib, 唔需要 numpy/pandas (cron 環境穩陣)
+
+⚠️ Cap 層實際行為 — 係計時器, 唔係止損 (2026-09-28 查證):
+tick() 嘅分支順序係
+    net >= WIN_TARGET_USD  → WIN (全平)
+    level >= MAX_LEVEL     → 全平   ← **冇任何價格條件**
+    else                   → ADD-ON (需 1×ATR 逆向)
+即係一到 level 3 (第 4 注, notional $120), **下一個 tick (15 分鐘) 就無條件
+全平**, 唔係原本設想嘅「重見反向 trigger 才止損」。log 實證: 7/7 筆 LOSS
+都係 note4 後剛好 15 分鐘平倉。
+→ 第 4 注存在時間上限 = 15 分鐘; ADD-ON 要 1×ATR 但 cap 唔要, 兩者唔一致。
+   詳細分析 (反事實模擬 + 限制): ~/repos/btc-analyze/MARTINGALE_CAP_FINDINGS.md
 
 用法:
   python3 btc_martingale.py            # tick: 開 chain / 加註 / 平倉
@@ -214,7 +225,9 @@ def tick(key, secret, dry=False):
                 daily["wins"] += 1
                 out.append(f"✅ 馬丁 WIN +${profit:.2f} — {chain['side']} {len(entries)}注 close@{o['fill_px']:.0f}")
             s["active"] = None
-        # 2) CAP LOSS: 第 4 注重見 → 全平止損
+        # 2) CAP LOSS: 到 level 3 之後, 下一個 tick 無條件全平
+        #    ⚠️ 呢個分支冇價格條件 — 係「計時器」唔係「反向 trigger 止損」。
+        #    (見檔頭 docstring 同 MARTINGALE_CAP_FINDINGS.md)
         elif chain["level"] >= MAX_LEVEL:
             if dry:
                 out.append(f"❌ [DRY] CAP trigger level={chain['level']} — close {total_qty:.5f}")
