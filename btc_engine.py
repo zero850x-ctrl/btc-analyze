@@ -42,7 +42,13 @@ COINBASE_TICKER_URL = "https://api.exchange.coinbase.com/products/BTC-USD/ticker
 BTC_RISK_PCT = 0.5          # 每筆風險 = 帳戶 0.5% (24/7 + 高波動 → 比 XAUUSD 保守)
 BTC_EXCHANGE_DIFF_PCT = 0.8  # Coinbase vs 主源價差 >0.8% → UNVERIFIED (黃金 basis $40 之 BTC 版)
 SL_FLOOR_ATR_MULT = 0.8     # 同 XAUUSD — SL 至少 0.8×ATR
-MIN_RR = 1.2                # RR gate: TP1/risk >= 1.2 (RR<1.2 單贏細輸大 — live 15 筆實證: 贏 avg +0.28R / 輸 avg -1.08R)
+MIN_RR = 1.2                # RR gate 門檻 — 2026-09-28 起計 **3 段出場 blended R**, 唔再係 TP1 單段。
+                            # (舊: TP1/risk >= 1.2。但引擎 TP1 按設計擺 ~1:1 → RR(TP1) 中位 0.83,
+                            #  2 年 274 個 Flag setup 只有 3.7% >= 1.2 → gate 幾乎永遠擋死 =
+                            #  結構性唔開單, 2026-09-13~09-30 連續 17 日 0 單。
+                            #  實際出場 = 1/3 TP1 + 1/3 TP2 + 1/3 尾倉, 所以正確 metric 係 blended。)
+TAIL_R_ASSUMED = 0.0        # blended 公式中尾倉 (1/3) 嘅保守 R 假設: TP2 後 SL 推 breakeven → 最壞 0R。
+                            # ⚠️ 0 係期望值假設, 唔係下界 (尾倉本身可以蝕 1R)。
 MAX_MA50_EXT_PCT = 2.0      # Flag extended gate: 離 MA50(m30) > ±2% 唔開 Flag
                             # (09-04 實證: 3 單 Bull Flag entry 離 MA50 +2.0~3.8% 全部 SL;
                             #  歷史 15 單 Flag: 呢個 gate 擋 -2.50R、誤殺正R $0.00)
@@ -281,12 +287,21 @@ def btc_filter_setups(setups, atr, px, diff_check, ma50=None):
         s["btc_tp2"] = round(tp2, 2) if tp2 else None
         s["btc_risk_pct"] = BTC_RISK_PCT
         s["btc_position_size_usd"] = round(10000 * BTC_RISK_PCT / 100 / risk * limit_px, 2)
-        # RR gate: TP 細過 risk → 贏都贏唔起, skip (live 實證: RR<1 單贏 +0.09R 但輸 −1.08R)
+        # RR gate (2026-09-28): 改用 3 段出場 blended R = (1/3)·rr1 + (1/3)·rr2 + (1/3)·尾倉。
+        # 舊版只用 rr1 (TP1 單段) — 但 TP1 按設計擺 ~1:1, 令 gate 幾乎永遠擋 (見 MIN_RR 註釋)。
+        # 冇 TP2 → exec layer 會將第 2 份併入尾倉 → 1/3 @ rr1 + 2/3 @ 尾倉。
         if tp1:
             rr = abs(tp1 - limit_px) / risk
+            rr2 = (abs(tp2 - limit_px) / risk) if tp2 else None
+            if rr2 is None:
+                blended = (rr + 2 * TAIL_R_ASSUMED) / 3.0
+            else:
+                blended = (rr + rr2 + TAIL_R_ASSUMED) / 3.0
             s["rr_tp1"] = round(rr, 2)
-            if rr < MIN_RR:
-                s["_gate_skip"] = f"rr_{s['rr_tp1']}_lt_{MIN_RR}"
+            s["rr_tp2"] = round(rr2, 2) if rr2 is not None else None
+            s["rr_blended"] = round(blended, 2)
+            if blended < MIN_RR:
+                s["_gate_skip"] = f"rr_blended_{s['rr_blended']}_lt_{MIN_RR}"
                 continue
         # MA50 extended gate: Flag = trend continuation, entry 離 MA50 太遠 = 追火棒
         if ma50 is not None and np.isfinite(ma50) and ma50 > 0:

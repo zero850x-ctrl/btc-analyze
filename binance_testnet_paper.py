@@ -40,7 +40,18 @@ LOT_STEP = 0.00001         # BTC lot step
 
 # fix/btc-exit-symmetry: 落單前 hard RR gate — 歷史實證 RR<1.2 嘅單全部贏細輸大
 # (engine json 嘅 rr_tp1 有缺口, 呢度做最後防線, 唔信 json)
+#
+# 2026-09-28 (feat/rr-blended-gate): metric 由「TP1 單段 RR」改為 **3 段出場 blended R**。
+# 原因: 實際出場係 1/3 @ TP1 + 1/3 @ TP2 + 1/3 尾倉 (trail), 只用 TP1 計 R 係錯 metric —
+# 而引擎 TP1 按設計擺喺 ~1:1, 令 RR(TP1) 中位數 0.83 (2 年 274 個 Flag setup 只有
+# 3.7% >= 1.2) → gate 幾乎永遠擋, 主系統結構性唔開單 (14 日 0 單)。
+# 改為 blended 之後, 門檻 1.2 表達嘅係「3 段出場嘅期望 R >= 1.2」, 同實際出場一致。
 MIN_RR_EXEC = 1.2
+
+# 尾倉 (最後 1/3) 嘅保守 R 假設。TP2 到價後 SL 推 breakeven, 最壞 = 0R。
+# 用 0 係刻意保守: gate 要證明「就算尾倉一分都賺唔到」都夠 1.2R。
+# ⚠️ 注意 0 唔係 worst case (尾倉本身可以 -1R); 呢個係期望值假設, 唔係下界。
+TAIL_R_ASSUMED = 0.0
 
 # 入場模式 (feat/limit-entry, 09-16):
 #   "limit"  = 掛 LIMIT @ engine 指定價, 等價格返到 zone 才成交 (RR 準確, 冇滑價; 可能唔成交)
@@ -50,13 +61,48 @@ ENTRY_MODE = os.environ.get("BTC_ENTRY_MODE", "limit")
 LIMIT_TTL_HOURS = float(os.environ.get("BTC_LIMIT_TTL_HOURS", "8"))
 
 
+def _blended_r(rr1, rr2, tail=None):
+    """3 段出場 blended R = (1/3)·rr1 + (1/3)·rr2 + (1/3)·tail.
+
+    rr2 is None (冇 TP2) → exec layer 會將第 2 份併入尾倉
+    (見 build_exit_legs docstring「冇 TP2 就併入尾倉」) → 1/3 @ rr1 + 2/3 @ tail。
+    """
+    t = TAIL_R_ASSUMED if tail is None else tail
+    if rr2 is None:
+        return (rr1 + 2 * t) / 3
+    return (rr1 + rr2 + t) / 3
+
+
+def _rr_at(setup, entry):
+    """以某個 entry 參考價計 3 段出場 RR → {'rr1','rr2','blended'} (計唔到回 None).
+
+    entry 可以係 planned limit_px / 現價 px / 實際成交 fill_px。
+    """
+    try:
+        stop = float(setup["btc_stop"])
+        tp1 = float(setup["btc_tp1"]) if setup.get("btc_tp1") else None
+        tp2 = float(setup["btc_tp2"]) if setup.get("btc_tp2") else None
+    except (KeyError, TypeError, ValueError):
+        return None
+    if tp1 is None:
+        return None
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    rr1 = abs(tp1 - entry) / risk
+    rr2 = (abs(tp2 - entry) / risk) if tp2 else None
+    return {"rr1": rr1, "rr2": rr2, "blended": _blended_r(rr1, rr2)}
+
+
 def _compute_rr(setup, entry_override=None):
-    """setup → TP1/risk RR (落單前驗證用).
+    """setup → 3 段出場 blended R (落單前驗證用).
 
     entry_override: 用現價/實際成交價代替 planned entry 計 RR。
     09-13 實證: gate 用 planned entry 計出 1.35, 但 MARKET 成交差 57-77 點
-    (0.07-0.1%) → 實際 RR 跌到 0.51。25 單統計: 實際 RR<1.2 佔 21 單
-    (贏 +0.37R / 輸 -0.90R = 贏細輸大)。所以 gate 要同時用現價計一次。
+    (0.07-0.1%) → 實際 RR 跌到 0.51。
+
+    2026-09-28: 回傳值改為 blended R (1/3 TP1 + 1/3 TP2 + 1/3 尾倉), 唔再係
+    TP1 單段 RR — 見檔頭 MIN_RR_EXEC 註釋。TP1 單段值仍然可以經 `_rr_at()` 拎到。
     """
     try:
         if entry_override is not None:
@@ -66,16 +112,10 @@ def _compute_rr(setup, entry_override=None):
             entry = float(setup["btc_limit_px"])
         else:
             entry = float(setup["btc_entry"])
-        stop = float(setup["btc_stop"])
-        tp1 = float(setup["btc_tp1"]) if setup.get("btc_tp1") else None
     except (KeyError, TypeError, ValueError):
         return None
-    if tp1 is None:
-        return None
-    risk = abs(entry - stop)
-    if risk <= 0:
-        return None
-    return abs(tp1 - entry) / risk
+    r = _rr_at(setup, entry)
+    return r["blended"] if r else None
 
 
 def _load_keys():
@@ -632,9 +672,14 @@ def place_signal_order(setup, key, secret, atr=None, mode=None):
         mode = ENTRY_MODE
 
     # RR hard gate — 落單前最後防線, 唔信 json; 冇 TP1 = 冇法計 RR = 一律拒
+    # (2026-09-28: `rr` 係 3 段出場 blended R, 唔再係 TP1 單段 — 見檔頭 MIN_RR_EXEC)
     rr = _compute_rr(setup)
     if rr is None or rr < MIN_RR_EXEC:
         return None, f"RR {'n/a(冇TP1)' if rr is None else f'{rr:.2f}'} < {MIN_RR_EXEC} hard gate — skip"
+
+    # TP1 單段值同時記入 log 做對照 (blended 同 TP1 並存, 方便日後分析)
+    r_entry = _rr_at(setup, float(setup.get("btc_limit_px") or entry))
+    r_px = None
 
     px = current_price()
     lot_step, lot_min, min_notional = exchange_filters(key, secret)
@@ -645,10 +690,12 @@ def place_signal_order(setup, key, secret, atr=None, mode=None):
         if tp1:
             if px == stop:
                 return None, f"risk 0 (px={px:.0f} = stop) — skip"
-            rr_px = abs(tp1 - px) / abs(px - stop)
-            if rr_px < MIN_RR_EXEC:
-                return None, (f"RR(現價 ${px:,.0f}) {rr_px:.2f} < {MIN_RR_EXEC} — skip "
-                              f"(planned RR {rr:.2f} 但市價已追高 {abs(px - entry) / entry * 100:.2f}%)")
+            r_px = _rr_at(setup, px)
+            rr_px = r_px["blended"] if r_px else None
+            if rr_px is None or rr_px < MIN_RR_EXEC:
+                return None, (f"blended R(現價 ${px:,.0f}) "
+                              f"{'n/a' if rr_px is None else f'{rr_px:.2f}'} < {MIN_RR_EXEC} — skip "
+                              f"(planned {rr:.2f} 但市價已追高 {abs(px - entry) / entry * 100:.2f}%)")
         else:
             return None, "冇 TP1 — 冇法計 RR, skip"
 
@@ -733,7 +780,9 @@ def place_signal_order(setup, key, secret, atr=None, mode=None):
         "atr": round(float(atr), 2) if atr else None,
         "seeded_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "rr_planned": round(rr, 2) if rr else None,
-        "rr_px": round(abs(tp1 - px) / abs(px - stop), 2) if (tp1 and px != stop) else None,
+        "rr_planned_tp1": round(r_entry["rr1"], 2) if r_entry else None,
+        "rr_px": round(r_px["blended"], 2) if r_px else None,
+        "rr_px_tp1": round(r_px["rr1"], 2) if r_px else None,
     }
 
     # ── 2026-09-20 fix: 成交即刻寫 log, 唔等 build_exit_legs ──────────────────
@@ -749,12 +798,14 @@ def place_signal_order(setup, key, secret, atr=None, mode=None):
     # MARKET 一定有滑價, 落單前估嘅 RR 同實際成交可以差好遠 (09-12 單: 計劃 1.35 → 實際 0.51)。
     # 未建 exit legs 就發現 → 即刻市價平倉 (唔使 cancel 任何 order, 成本 = spread)。
     exit_side = "SELL" if side == "BUY" else "BUY"
-    risk_fill = abs(fill_px - stop)
-    rr_fill = (abs(tp1 - fill_px) / risk_fill) if (tp1 and risk_fill > 0) else None
+    r_fill = _rr_at(setup, fill_px)
+    rr_fill = r_fill["blended"] if r_fill else None
     rec["rr_fill"] = round(rr_fill, 2) if rr_fill is not None else None
+    rec["rr_fill_tp1"] = round(r_fill["rr1"], 2) if r_fill else None
     if rr_fill is None or rr_fill < MIN_RR_EXEC:
         rec["status"] = "FLATTENED_LOW_FILL_RR"
-        rec["flatten_note"] = (f"成交後 RR {rr_fill:.2f} < {MIN_RR_EXEC} "
+        rec["flatten_note"] = (f"成交後 blended R {rr_fill if rr_fill is None else f'{rr_fill:.2f}'} "
+                               f"< {MIN_RR_EXEC} "
                                f"(entry_fill={fill_px:.2f}, 計劃 RR {rr:.2f}) — 即刻市價平倉")
         try:
             _fl_resp = _signed_request("POST", "/api/v3/order", {

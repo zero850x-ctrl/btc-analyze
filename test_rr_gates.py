@@ -128,10 +128,11 @@ result("T3c 冇建任何 exit legs", not rec3.get("exit_leg_ids"), f"({rec3.get(
 result("T3d 冇 OCO 建單", not any("oco" in c[1] for c in placed), f"({[c[1] for c in placed]})")
 result("T3e 記入 log", len(saved.get("lg", {}).get("orders", [])) == 1,
        f"(orders={len(saved.get('lg', {}).get('orders', []))})")
-result("T3f 記低 rr_planned / rr_px / rr_fill",
+result("T3f 記低 rr_planned / rr_px / rr_fill (blended) + TP1 對照值",
        rec3.get("rr_planned") is not None and rec3.get("rr_px") is not None
-       and rec3.get("rr_fill") == 0.51,
-       f"(planned={rec3.get('rr_planned')}, px={rec3.get('rr_px')}, fill={rec3.get('rr_fill')})")
+       and rec3.get("rr_fill") == 0.6 and rec3.get("rr_fill_tp1") == 0.51,
+       f"(planned={rec3.get('rr_planned')}, px={rec3.get('rr_px')}, "
+       f"fill={rec3.get('rr_fill')}, fill_tp1={rec3.get('rr_fill_tp1')})")
 result("T3g flatten_order_id 有記錄 (P2 賣出對帳匹配用)",
        rec3.get("flatten_order_id") == 999003, f"({rec3.get('flatten_order_id')})")
 
