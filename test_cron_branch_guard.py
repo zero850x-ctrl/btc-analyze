@@ -769,6 +769,12 @@ def test_mart_net_btc():
             got = run({"active": [1, 2]})
             check("active 係 list → None", got is None, f"got={got}")
 
+            # (k2) GLM R3 M4: entries 唔係 list/tuple → None (唔好 TypeError 噪音)
+            got = run({"active": {"side": "SELL", "entries": 5}})
+            check("entries 係數字 → None (唔會 TypeError)", got is None, f"got={got}")
+            got = run({"active": {"side": "SELL", "entries": {"qty": 1}}})
+            check("entries 係 dict → None", got is None, f"got={got}")
+
             # (l) 行為測試 _gap_attribution (取代 source-grep)
             at = getattr(mod, "_gap_attribution", None)
             if not callable(at):
@@ -800,6 +806,12 @@ def test_mart_net_btc():
                 t6 = at(0.001, -0.002)
                 check("mo 方向相反 → 標明 (唔會顯示 200%)",
                       "相反" in t6 and "200%" not in t6, f"got={t6!r}")
+                # GLM R3 M3: gap=0 但 mo 非零 → 唔可以出「佔 X (0%)」自相矛盾
+                t7 = at(0.0, -0.002)
+                check("gap=0 但 mo 非零 → 講唔對帳 (唔出 0%)",
+                      "唔對帳" in t7 and "(0%" not in t7, f"got={t7!r}")
+                t8 = at(0.0, 0.0001)
+                check("gap=0 且 mo≈0 → 正常講佔用", "馬丁格爾佔用" in t8, f"got={t8!r}")
     finally:
         # ⚠️ 一定要 finally: 中途 raise 會令 mod.MART 永久指住 tempfile,
         #    之後用同一個 module 嘅測試全部讀到唔存在嘅檔案。

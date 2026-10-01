@@ -90,7 +90,13 @@ def _mart_net_btc():
             return None
         q = 0.0
         n_used = 0
-        raw_entries = a.get("entries") or []
+        raw_entries = a.get("entries")
+        # GLM R3 M4: entries 唔係 list/tuple 時 `for e in 5` 會 TypeError →
+        # 跌入外層 except → 印 stderr 噪音。呢個係「唔知」, 直接回 None 乾淨啲。
+        if raw_entries is None:
+            raw_entries = []
+        if not isinstance(raw_entries, (list, tuple)):
+            return None
         for e in raw_entries:
             if not isinstance(e, dict):
                 continue
@@ -126,6 +132,12 @@ def _gap_attribution(gap, mo):
     if mo is None:
         return "馬丁 log 讀唔到 → 差額歸因不明 (檢查 MART log 路徑)"
     tol = max(0.0005, abs(gap) * 0.05)
+    if gap == 0:
+        # GLM R3 M3: 帳本同帳戶完全對齊, 但馬丁 log 話有佔用 → 呢個本身就係矛盾,
+        # 唔可以照行落面出「佔 -0.002000 (0%)」咁自相矛盾嘅字。
+        if abs(mo) <= tol:
+            return f"馬丁格爾佔用 {mo:+.6f}"
+        return (f"帳本零差額但馬丁 log 話佔用 {mo:+.6f} → ⚠️ 唔對帳")
     if abs(gap - mo) <= tol:
         return f"馬丁格爾佔用 {mo:+.6f}"
     # ⚠️ 一定要報比例: 馬丁佔 90% 但絕對差 > 門檻時, 只講「唔係馬丁」會誤導。
