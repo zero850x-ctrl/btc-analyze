@@ -122,7 +122,15 @@ def ensure_repo():
     if _repo_healthy():
         return repo_cycle, None
     missing = [f for f in REQUIRED_FILES if not os.path.isfile(os.path.join(REPO, f))]
-    note = f"🔧 repo 唔完整 (缺 {', '.join(missing) or 'git metadata'}) — 自動恢復中"
+    if missing:
+        why = f"缺 {', '.join(missing)}"
+    elif os.path.isdir(os.path.join(REPO, ".git")) and not _head_ok():
+        why = "git metadata 壞"
+    elif os.path.isdir(os.path.join(REPO, ".git")) and not _branch_ok():
+        why = f"branch 唔對 (應該係 {BRANCH_PIN})"
+    else:
+        why = "repo 唔完整"
+    note = f"🔧 repo 唔完整 ({why}) — 自動恢復中"
     # 1) repo 目錄喺 + .git 用得到 → 輕量 git checkout 補回被清走嘅 file
     if os.path.isdir(os.path.join(REPO, ".git")):
         subprocess.run(["git", "-C", REPO, "checkout", "--", "."],
