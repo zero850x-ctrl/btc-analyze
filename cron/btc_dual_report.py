@@ -239,7 +239,19 @@ def main():
             out.append(f"  🎯 主: {o['side']} {o.get('pattern','')[:12]} @{o.get('entry_fill')} "
                        f"(開{ts}) ocoA={o.get('oco_a_id')} l3={o.get('l3_id')}")
     elif os.path.exists(PAUSED_MARKER):
-        out.append("  ⏸️ 主: 已停用 (無可證實 edge)")
+        # 停用要有日期 + 原因 + 幾耐冇落單，唔可以只講「已停用」
+        # （09-18 停用 → 09-20 靜默重開 = 同一個決定做咗兩次嘅事故）
+        last_seed = None
+        for o in log.get("orders", []):
+            t = _hkt(o.get("seeded_time") or "")
+            if t and (last_seed is None or t > last_seed):
+                last_seed = t
+        if last_seed:
+            days = (n - last_seed).days
+            out.append(f"  ⏸️ 主: 已正式停用（{days} 日無新單；無可證實 edge）")
+        else:
+            out.append("  ⏸️ 主: 已正式停用（無可證實 edge）")
+        out.append("     ⚠️ 呢個係報告標記 — 落單路徑仍然存在（見 paused 檔）")
     elif os.path.exists(HIST_MARKER):
         out.append(f"  📡 主: 0 live 倉 (09-18 曾停用, 09-20 重開)")
     else:
