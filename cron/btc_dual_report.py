@@ -89,7 +89,9 @@ def _mart_net_btc():
         if side not in ("BUY", "SELL"):
             return None
         q = 0.0
-        for e in (a.get("entries") or []):
+        n_used = 0
+        raw_entries = a.get("entries") or []
+        for e in raw_entries:
             if not isinstance(e, dict):
                 continue
             v = e.get("qty")
@@ -99,8 +101,13 @@ def _mart_net_btc():
             if not math.isfinite(v):      # nan / inf → 傳落去報告會印 "nan"
                 continue
             q += v
-        if q == 0:
-            return 0.0
+            n_used += 1
+        # ⚠️ 兩種「冇數」唔可以混:
+        #    entries 空 list   = 未成交, 明確冇佔用 → 0.0
+        #    有 entries 但全部讀唔到 = 唔知有幾多 → None (同「無法辨識 side」同一個原則)
+        #    GLM R2 M1 指出原本一律回 0.0 會低估佔用。
+        if n_used == 0:
+            return 0.0 if not raw_entries else None
         return -q if side == "SELL" else q
     except Exception as e:
         # 唔可以全靜音 — log 路徑錯咗會令報告永遠顯示「歸因不明」而冇人知
@@ -123,7 +130,14 @@ def _gap_attribution(gap, mo):
         return f"馬丁格爾佔用 {mo:+.6f}"
     # ⚠️ 一定要報比例: 馬丁佔 90% 但絕對差 > 門檻時, 只講「唔係馬丁」會誤導。
     frac = abs(mo / gap) if gap else 0.0
-    return (f"馬丁格爾佔 {mo:+.6f} ({frac:.0%})｜其餘 {gap - mo:+.6f} "
+    # GLM R2 M2: frac 可以 >100% (gap 同 mo 符號相反 / mo 絕對值大過 gap) —
+    # 呢個本身就係「有嘢唔對帳」嘅信號, 唔應該收埋, 要明示。
+    if gap * mo < 0:
+        note = " ⚠️ 方向同差額相反"
+        frac = min(frac, 1.0)
+    else:
+        note, frac = "", min(frac, 1.0)
+    return (f"馬丁格爾佔 {mo:+.6f} ({frac:.0%}{note})｜其餘 {gap - mo:+.6f} "
             f"唔係馬丁 (事故殘餘 / 未對帳)")
 
 

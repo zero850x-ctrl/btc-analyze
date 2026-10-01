@@ -758,6 +758,13 @@ def test_mart_net_btc():
             check("nan/字串/bool qty → 過濾走 (唔會變 nan)", got == -0.001,
                   f"got={got} — nan 會令報告印 'nan'")
 
+            # (j2) ⚠️ GLM R2 M1: 「有 entries 但全部讀唔到」= 唔知 → None,
+            #      唔可以回 0.0 (會低估佔用)。同 (i)「entries 空 = 未成交 → 0.0」唔同。
+            got = run({"active": {"side": "SELL",
+                                  "entries": [{"qty": float("nan")}, {"px": 1}]}})
+            check("有 entries 但全部 qty 讀唔到 → None (唔當 0 低估)",
+                  got is None, f"got={got}")
+
             # (k) active 唔係 dict → None
             got = run({"active": [1, 2]})
             check("active 係 list → None", got is None, f"got={got}")
@@ -789,6 +796,10 @@ def test_mart_net_btc():
                     check("gap=0 → 唔會 ZeroDivisionError", True, f"got={t5!r}")
                 except Exception as e:
                     check("gap=0 → 唔會 ZeroDivisionError", False, f"{type(e).__name__}")
+                # GLM R2 M2: mo 大過 gap / 符號相反 → frac 唔應該 >100%, 要明示
+                t6 = at(0.001, -0.002)
+                check("mo 方向相反 → 標明 (唔會顯示 200%)",
+                      "相反" in t6 and "200%" not in t6, f"got={t6!r}")
     finally:
         # ⚠️ 一定要 finally: 中途 raise 會令 mod.MART 永久指住 tempfile,
         #    之後用同一個 module 嘅測試全部讀到唔存在嘅檔案。
