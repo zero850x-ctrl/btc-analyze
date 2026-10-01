@@ -180,25 +180,37 @@ M30/H4/D1 三個週期、11 個資產 — **全部唔係冇 alpha 就係 beta**�
 
 ---
 
-## 7. ⚠️ 收檔時發現嘅 cron 風險（未修，需確認）
+## 7. ✅ cron 共用 repo 風險 — 已修復
 
 4 個 BTC cron script 共用同一個 repo path（`~/repos/btc-analyze`），但 BRANCH_PIN 唔一致：
 
-| script | BRANCH_PIN |
-|---|---|
-| `btc_weekend_cron.py`（落單） | `main` ✅ |
-| `btc_rebalance_cron.py`（再平衡） | **`fix/btc-exit-symmetry`** ⚠️ 落後 main **7 commits** |
-| `btc_martingale_cron.py` | （無 pin，用現狀） |
-| `btc_dual_report.py` | （無 pin，用現狀） |
+| script | BRANCH_PIN | 復原 | 狀態 |
+|---|---|---|---|
+| `btc_weekend_cron.py`（落單） | `main` | 有 | ✅ |
+| `btc_rebalance_cron.py`（再平衡） | ~~`fix/btc-exit-symmetry`~~ → **`main`** | 有 | ✅ 已修 |
+| `btc_martingale_cron.py` | `exp/martingale`（自己 repo） | 有 | ✅ 無衝突 |
+| `btc_dual_report.py` | （無，只讀） | 無 | ✅ 無衝突 |
 
-**風險鏈**：repo 損壞時（macOS clean-tmps 有清過檔嘅先例）→ 邊個 cron 先撞到就由佢復原：
-若 rebalance 先 → `git clone -b fix/btc-exit-symmetry` 落**共用** path →
-repo 變成落後 7 commits、**缺少 PR#7 phantom-sell 修復**
-（`binance_testnet_paper.py` 少 222 行、`btc_auto_trade_cycle.py` 少 202 行）→
-之後落單 cron 嘅 `_repo_healthy()` **只檢查檔案存在 + HEAD 可解析，唔檢查 branch** →
-當佢健康 → **靜默跑舊 code 落單**。
+**原風險鏈**：repo 損壞 → 邊個 cron 先撞到就由佢復原 → 若 rebalance 先 →
+clone 舊 branch 落**共用** path → 落單 cron 嘅健康檢查只睇 file + HEAD →
+當健康 → **靜默跑舊 code 落單**（缺 PR#7 phantom-sell 修復）。
 
-**現時未觸發**（repo 實際喺 `main` @ `17f2adf`，clean），屬**潛在**風險。
-建議修法（需用戶確認才做，因涉及 cron）：
-把 `btc_rebalance_cron.py` 嘅 BRANCH_PIN 改為 `main`，
-並在 `_repo_healthy()` 加 `git rev-parse --abbrev-ref HEAD == "main"` 驗證。
+**端到端實證**（真 repo 內容 clone 落舊 branch）：
+```
+binance_testnet_paper.py: 舊 branch 1093 行 vs main 1261 行 (少 168 行)
+舊檢查 _repo_healthy() = True    ← 會放行
+新檢查 _repo_healthy() = False   ← 攔住
+ensure_repo() → 自動 checkout main ✅
+```
+
+**修復**（branch `fix/cron-branch-pin-parity`，已 push + 已部署）：
+1. `btc_rebalance_cron.py` BRANCH_PIN → `main`
+2. 三個 wrapper 加 branch 驗證（detached HEAD 同錯 branch 都當唔健康）
+3. 錯 branch 走**輕量 `git checkout`**，唔跌落破壞性 re-clone
+4. cron wrapper 納入 repo `cron/` 目錄版本控制（之前零 git 保護）
+5. `test_cron_branch_guard.py` 47 斷言
+
+**部署驗證**：production repo `main` @ `17f2adf` 未動、clean；
+三個 wrapper 對真實 repo 都報 healthy；備份喺
+`~/.hermes/scripts/archive/cron_backup_20261001_155546`。
+
