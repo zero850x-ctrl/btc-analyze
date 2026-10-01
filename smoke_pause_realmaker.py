@@ -2,7 +2,10 @@
 """冒煙: 用**真嘅 production 停用標記** + worktree 版 code 行一次 cycle.main()。
 
 唔會打 API、唔會落單、唔會寫 production log —— reconcile_cycle / sh 全部 monkeypatch。
-目的係證明「真 marker 檔 → 真 gate 生效」唔係 فقط 測試環境先得。
+目的係證明「真 marker 檔 → 真 gate 生效」唔係只有測試環境先得。
+
+⚠️ 呢個 script 係為「已停用」嘅機器而設: 如果冇 marker, 佢會 exit 1
+   (代表「冇嘢好驗」而唔係「驗證失敗」)。
 """
 import importlib.util
 import io

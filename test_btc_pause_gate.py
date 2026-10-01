@@ -142,6 +142,9 @@ pause.MARKER_PATH = os.path.join(TMP, "nope.txt")
 check("CLI: 未停用 → exit 0", pause.main() == 0)
 
 print("\n[2] 靜默/出聲 設計不變式 (emoji 唔可以調亂)")
+# ⚠️ load cron module 會行 top-level code。已核實 `btc_weekend_cron` 同
+#    `btc_dual_report` 嘅 top-level 只有 import + 常數 + 路徑計算（冇 I/O、
+#    冇 scheduler、冇讀 log 檔）→ 可以安全 import。
 cron = load("btc_weekend_cron_test",
             os.path.join(REPO_DIR, "cron", "btc_weekend_cron.py"))
 check("⏸️ 唔喺 NOTABLE_KEYS (常規停用 = 靜默, 唔會 spam TG)",
@@ -209,11 +212,12 @@ check("有出聲 (⚠️ 唔確定)", pause.UNCERTAIN_EMOJI in out)
 check("唔確定時唔會出 ⏸️ (唔應該出兩次)", pause.PAUSED_EMOJI not in out)
 
 print("\n[7] 行為: binance_testnet_paper.main() 自己都要擋 (defense in depth)")
+# ⚠️ load `binance_testnet_paper.py` 會行 top-level code。已核實佢 top-level
+#    只有 import + 常數 + def（冇網絡 / 冇讀 credentials）—— `_load_keys` 係函數。
 btp = load("btp_cli_test", "binance_testnet_paper.py")
 set_marker(MARKER)                                     # 標記存在 → 應該擋
 btp.REPO = TMP
 btp._load_keys = lambda: ("k", "s")                    # 唔好讀真 credentials
-btp.place_signal_order = lambda *a, **k: None          # 唔好真落單
 placed = []
 btp.place_signal_order = lambda *a, **k: placed.append(a)
 argv_bak = sys.argv
@@ -229,7 +233,8 @@ except Exception as e:                                 # noqa: BLE001
 finally:
     sys.argv = argv_bak
 out_cli = buf.getvalue()
-check("CLI 落單路徑被擋 (印 ⛔)", "⛔" in out_cli)
+# 斷言特定訊息而唔係淨係搵 "⛔" —— 免得 import 期或者其他路徑 print 咗個 ⛔ 就假 PASS
+check("CLI 落單路徑被擋 (印停用訊息)", "停用" in out_cli and "唔落單" in out_cli)
 check("CLI 冇真落單 (place_signal_order 冇 call)", not placed)
 
 print("\n[8] 報告要真驗閘裝好, 唔可以見 marker 就講「已封住」")

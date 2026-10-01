@@ -1134,16 +1134,31 @@ def main():
     #    `btc_auto_trade_cycle.main()` 已經擋咗呢條路, 但呢個 script 有自己嘅
     #    CLI entry, 直接 `python3 binance_testnet_paper.py` 會完全繞過 cycle 嘅閘。
     #    所以真正落單嘅入口自己都要驗一次。
-    #    只擋「落新單」路徑 —— 上面 --status / --cancel-all / --reconcile 早退,
-    #    診斷同對帳唔受影響。
+    #
+    #    位置: 喺 `--status` / `--cancel-all` / `--reconcile` 三個早退之後
+    #    (2026-10-01 逐行核實過: 佢哋分別喺 main() 頂部 return, 唔會行到呢度)。
+    #    ⚠️ 但 `--dry-run` **會**被擋 (佢喺下面 1247 行才 dispatch) —— 呢個係刻意嘅:
+    #       停用期間「預覽會落咩單」係誤導 (實際一張都唔會落), 正確答案就係
+    #       「⛔ 已停用」。
+    #    影響範圍核實 (2026-10-01): 全 repo grep `binance_testnet_paper.py` 嘅
+    #    subprocess 調用只有 `btc_auto_trade_cycle.py`;馬丁係**獨立 clone**
+    #    (~/repos/btc-martingale, 自帶另一份 binance_testnet_paper.py);
+    #    再平衡只 `from binance_testnet_paper import ...` (唔經 main()) → 都唔受影響。
     try:
         import btc_pause
-        _paused, _why, _certain = btc_pause.check()
     except Exception as _e:                 # noqa: BLE001 — 載唔到 = 唔知, 當停用
-        print(f"⛔ 停用硬閘無法確認 ({type(_e).__name__}: {_e}) — 為安全起見唔落單")
+        print(f"⛔ 停用硬閘無法確認 (載入 btc_pause 失敗: "
+              f"{type(_e).__name__}: {_e}) — 為安全起見唔落單")
+        return
+    try:
+        _paused, _why, _certain = btc_pause.check()
+    except Exception as _e:                 # noqa: BLE001 — 檢查爆 = 唔知, 當停用
+        print(f"⛔ 停用硬閘無法確認 (btc_pause.check() 失敗: "
+              f"{type(_e).__name__}: {_e}) — 為安全起見唔落單")
         return
     if _paused or not _certain:
-        print(f"⛔ {_why} — 唔落單（--status / --reconcile 仍然可用）")
+        print(f"⛔ {_why} — 唔落單"
+              f"（--status／--reconcile／--cancel-all 唔受影響；--dry-run 會被擋）")
         return
 
     json_path = os.path.join(REPO, "btc_last_analysis.json")

@@ -230,8 +230,8 @@ def _pause_gate_status():
         #    → 舊寫法會報「已封住」, 但實際閘全開、系統照落單。
         return False, ("     ⚠️ 停用硬閘**未生效**: btc_pause 顯示系統**未**停用 "
                        "（標記可能已刪／路徑唔一致）")
-    return True, ("     ⛔ 停用有效（btc_pause 在位 + 標記讀得到）"
-                  "— 落單入口會跳過")
+    return True, ("     ⛔ 停用有效（btc_pause 在位 + 標記讀得到 + paused=True）"
+                  "— 入口行為由呼叫者負責")
 
 
 def main():

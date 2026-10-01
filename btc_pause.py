@@ -21,6 +21,16 @@
 嘅路徑。停用期間唔跑 = 一旦有倉未平就會**冇人管**, 風險比唔停用更大。
 (2026-10-01: 當時 0 live 倉, 所以今日兩者等價; 但唔可以因此寫成「全部唔跑」。)
 
+⚠️ 「reconcile 只會減倉」係上面論證嘅地基, 所以有核實, 唔係假設
+(2026-10-01 GLM review 質疑過)。逐行查 `build_exit_legs()` 嘅證據:
+  - `exit_side = "SELL" if side == "BUY" else "BUY"` → 永遠係入場方向嘅**相反**
+  - `q1 + q2 + q3 == fill_qty`（有 over-sell 保護: round 後唔可以多過 fill_qty）
+  - 另一個路徑用 `allow_flatten=False`（更保守）
+  ⇒ 落單量恰好等於記錄倉位、方向相反 → 結構上 reduce-only。
+**殘餘風險（未修）**: 如果 `rec["side"]` 唔係 "BUY"/"SELL"（例如 None / "LONG"），
+`exit_side` 會 fallback 成 "BUY" → 理論上可以加倉。屬既有資料品質風險
+(同 PR#10 個 `side` 符號反轉同源), 未加 reduce-only assertion。
+
 ⚠️ **「讀唔到標記」(uncertain) 都一樣照跑 reconcile。**
 2026-10-01 GLM review 捉到原本設計方向反咗: 原本 uncertain 連 reconcile 都跳,
 但「讀唔到 marker」同「知唔知有冇倉」完全無關 —— 佢唔會令 reconcile 變得唔安全
@@ -70,6 +80,11 @@ import sys
 #    嘅同類常數要靠 test_btc_pause_gate.py 嘅相等斷言綁住 —— 改咗呢度,
 #    冇同步改其他就會測試 FAIL, 唔會靜默漂移。
 _DEFAULT_MARKER = "~/.hermes/reports/btc_main_system_paused.txt"
+
+# ⚠️ `BTC_PAUSE_MARKER` env 可以覆寫路徑 (測試 / 第二部機)。
+#    注意 `cron/btc_dual_report.py` 嘅 `PAUSED_MARKER` 係**寫死**同一個預設值,
+#    **唔** honor 呢個 env —— 如果真係要用 env 改路徑, 報告嗰邊要同步改,
+#    否則報告嘅「標記存在」分支同 gate 結果可以講兩回事。測試只綁默認值相等。
 
 # 喺 import 時解析 (env override 方便測試 / 第二部機)。
 # 函數唔會 capture 呢個值做 default arg —— 咁樣 monkeypatch MARKER_PATH 才生效。

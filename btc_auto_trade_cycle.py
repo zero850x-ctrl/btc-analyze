@@ -706,7 +706,9 @@ def main():
     block_trading = paused or not pause_certain
     if not pause_certain:
         # ⚠️ 唔確定 → 一定要出聲 (⚠️ 喺 wrapper NOTABLE_KEYS → 推 TG)
-        log(pause_reason)
+        # `or ...` 防禦: 將來若 check() 回一個空 reason, 唔可以 log 出一行空白
+        log(pause_reason or
+            "⚠️ 停用狀態不明（btc_pause 冇提供理由）— 為安全起見唔開新倉")
 
     key, secret = _load_keys()
     if not key or not secret:
