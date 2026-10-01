@@ -140,19 +140,38 @@ n = 16 / 26，最近一年（2026）轉負 → 典型小樣本 + 時間不穩定
 
 ## 5. 對照：production gate 擋走嘅家族本身都係負
 
-`family_ablation.py`（setup pool, 4 年, SL 1.5/3.0/4.0 ×ATR 平均）：
+`family_ablation.py`（engine setup pool；跑邊個 pool 就用邊個期間）
+**4 年 pool**: 2126 窗口 → 4869 setup → 4282 成交 (2022-10-22 → 2026-10-01)
 
-| 家族 | n | meanR | t |
+SL 1.5/3.0/4.0 ×ATR 平均：
+
+| 家族 | n | meanR | t | （540 日舊版 meanR／t） |
+|---|---|---|---|---|
+| boundary | 1008 | −0.180 | −4.45 | −0.181 / −2.92 |
+| DoubleBottom | 211 | −0.387 | −4.19 | −0.606 / −5.79 |
+| **Flag**（production 唯一放行） | **1932** | **−0.427** | **−14.71** | −0.491 / −13.09 |
+| Triangle | 648 | −0.445 | −9.38 | −0.397 / −5.49 |
+| DoubleTop | 254 | −0.523 | −8.06 | −0.561 / −5.52 |
+| Wedge | 228 | −0.529 | −7.37 | −0.625 / −7.59 |
+
+**18/18 組合負，0 positive，15 個 Bonferroni 顯著（全部負）。**
+兩段期間（540 日 vs 4 年）結果**高度一致**，4 年版本 t 更強（Flag t −22.4 @SL1.5×ATR）。
+→ 證明「gate 太嚴所以冇單」唔係問題核心：**放寬去其他家族一樣係負，
+連唯一放行嘅 Flag 都係最差之一**。
+
+### 5.1 期間一致性（同一 script、唔同 pool）
+
+| 家族 | 540 日 pool meanR | 4 年 pool meanR | 一致？ |
 |---|---|---|---|
-| boundary | 429 | −0.181 | −2.92 |
-| Triangle | 308 | −0.397 | −5.49 |
-| **Flag**（production 唯一放行） | 1023 | **−0.491** | −13.09 |
-| DoubleTop | 118 | −0.561 | −5.52 |
-| DoubleBottom | 111 | −0.606 | −5.79 |
-| Wedge | 138 | −0.625 | −7.59 |
+| boundary | −0.181 | −0.180 | ✅ 幾乎一樣 |
+| Flag | −0.491 | −0.427 | ✅ 同號同量級 |
+| Triangle | −0.397 | −0.445 | ✅ |
+| DoubleTop | −0.561 | −0.523 | ✅ |
+| DoubleBottom | −0.606 | −0.387 | ✅ 同號 |
+| Wedge | −0.625 | −0.529 | ✅ |
 
-**冇一個家族有 edge**，連 Flag 都係 −0.49。
-→ 證明「gate 太嚴所以冇單」唔係問題核心：放寬去其他家族一樣係負。
+⚠️ **期間唔同唔可以直接比數字**（本報告初次版本誤將 540 日 pool 寫成「4 年」，已修正）。
+兩者結論一致 → 結論對期間唔敏感。
 
 ## 6. 對照基準（同期同成本）
 
@@ -178,6 +197,9 @@ n = 16 / 26，最近一年（2026）轉負 → 典型小樣本 + 時間不穩定
 
 **建議：唔好將呢個方向加入 production。**
 
+6. ✅ **期間一致性**：家族 ablation 喺 540 日同 4 年兩個 pool 上結果一致
+   （見 §5.1）→ 結論唔係期間 artifact。
+
 ---
 
 ## 8. 檔案
@@ -188,10 +210,11 @@ n = 16 / 26，最近一年（2026）轉負 → 典型小樣本 + 時間不穩定
 | `test_pattern_detector.py` | **26 PASS / 0 FAIL** |
 | `sweep_patterns.py` | A/B/C 三組 sweep（4 年） |
 | `check_channel_breakout.py` | 230 組合細網格 + bootstrap + 單調性 + 成本敏感度 + 年度 |
-| `family_ablation.py` | production gate 各家族對比 |
+| `family_ablation.py` | production gate 各家族對比（跑 `setup_pool.json`；pool 期間決定結果期間） |
 | `channel_breakout_grid_cost0.002.csv` | 230 組合原始結果 |
 | `pattern_sweep_cost0.002.csv` | A/B/C 原始結果 |
-| `family_ablation_cost0.002.csv` | 家族原始結果 |
+| `family_ablation_cost0.002.csv` | 家族原始結果（4 年 pool） |
+| `family_ablation_540d_cost0.002.csv` | 家族原始結果（540 日 pool，保留做期間對照） |
 
 ### 過程中修正嘅自身錯誤
 1. **通道平行容忍 0.25×ATR/bar 太鬆** → 99.4% bar「有效」，平行過濾形同虛設 → 收緊至 0.05（7.5%）
