@@ -23,6 +23,11 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 FEE = 0.001                      # Binance taker 0.1%（兩邊都收）
+# ⚠️ 單一來源：呢個值**必須**同生產 code 一致 ——
+#    `~/repos/btc-martingale/btc_martingale.py` 嘅 `WIN_TARGET_USD`。
+#    呢度 hardcode 係一個已知缺口：生產改咗呢度唔會跟。
+#    （原本寫喺 `if l3:` 區塊內，令下面 parity 用到時會 unbound → 提升做 module 常數。）
+TARGET = 0.20                    # 對應 WIN_TARGET_USD（2026-10-01 核對）
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.expanduser("~/.hermes/cache/btc_klines_15m.json")
 
@@ -51,7 +56,10 @@ def get_bars(start_iso: str, end_iso: str, interval: str = "15m",
     if use_cache and os.path.exists(CACHE):
         try:
             c = json.load(open(CACHE))
-            if c.get("start") == s and c.get("end") == e:
+            # ⚠️ 一定要一齊比對 interval —— 只比 start/end 嘅話，
+            #    用同一個 cache 檔攞 1h bar 會靜靜哋攞到 15m bar（錯數據、唔會出錯）。
+            if (c.get("start") == s and c.get("end") == e
+                    and c.get("interval") == interval):
                 return c["bars"]
         except Exception:
             pass
@@ -295,7 +303,6 @@ def martingale(bars: list[dict]):
     if l3:
         notional = statistics.median([sum(e["qty"] * e["px"] for e in c["entries"]) for c in l3])
         S0 = statistics.median([c["entries"][0]["qty"] * c["entries"][0]["px"] for c in l3])
-        TARGET = 0.20
         print(f"  L3 名義中位 ${notional:.2f}（S0 中位 ${S0:.2f} × 15）")
         print(f"  入場費 ${notional*FEE:.3f} + 出場費 ${notional*FEE:.3f} = "
               f"${notional*FEE*2:.3f}")
@@ -306,7 +313,10 @@ def martingale(bars: list[dict]):
 
     # ── C. 反事實：WIN 門檻改成淨額 + 真停損（真 bar）──
     print("\n  ── C. 反事實變體（真 15m bar 回放）──")
-    print("     由「第 4 加入場」之後第一個 tick 起，逐支 15m bar 逐 tick 評估")
+    # ⚠️ 準確描述：唔係「逐 tick」——係**逐支 15m bar 嘅開市價**評估。
+    #    即 bar 內觸及停損/TP 但開市價未到嘅情況**唔會**被偵測到，
+    #    同主引擎 sim_one（用 high/low）標準唔一致 → 停損變體唔等於真停損。
+    print("     由「第 4 加入場」之後第一支 bar 起，逐支 15m bar 以**開市價**評估")
 
     def chain_pnl(c, px):
         """回 (gross, net, qty) —— gross = code 用嘅 chain_net（零手續費）。"""
@@ -367,21 +377,31 @@ def martingale(bars: list[dict]):
         return
 
     # ── C0. PARITY 斷言：'live_timer' 必須重現實況（唔可以係裝飾）──
+    # ⚠️ 判「實際有冇 WIN」一定要用 **code 嘅實際判準**，唔可以用 profit > 0。
+    #    真 code 係 `net (=gross) >= WIN_TARGET_USD`；一條 gross 為正但細過門檻
+    #    嘅 chain，code 會行 CAP 分支判 LOSS（記錄 state="LOSS"），
+    #    但 `profit_usd > 0` 會當佢 WIN → **假 mismatch**。
+    #    實例 m-7538384：state=LOSS / profit_usd=+0.10 → 舊寫法當「實際 WIN」，
+    #    但 sim 判 CAP(timer) 其實同真 code 一致 → 12/13 低估咗真一致率。
     par, mism = 0, []
     for c in l4:
         r = sim_mart(c, "live_timer")
         if r is None:
             continue
-        actual_win = (c["profit_usd"] or 0) > 0
+        st = (c.get("state") or "").upper()
+        if st in ("WIN", "LOSS"):
+            actual_win = st == "WIN"
+        else:                                    # 冇 state → 退回門檻判準
+            actual_win = (c["profit_usd"] or 0) >= TARGET
         sim_win = r["oc"] == "WIN"
         if actual_win == sim_win:
             par += 1
         else:
-            mism.append((c["id"], c["profit_usd"], round(r["net"], 3), r["oc"]))
+            mism.append((c["id"], st, c["profit_usd"], round(r["net"], 3), r["oc"]))
     print(f"  🔍 PARITY：live_timer 變體 vs 實際記錄 {par}/{len(l4)} 一致"
           f"{'  ✅ 回放可信' if par >= len(l4)*0.9 else '  ⛔ 回放無效 —— 以下數字唔可以信'}")
     for m in mism[:5]:
-        print(f"       ✗ {m[0]}  實際 {m[1]:+.3f} / 回放 {m[2]:+.3f} ({m[3]})")
+        print(f"       ✗ {m[0]}  實際 state={m[1]} profit={m[2]:+.3f} / 回放 {m[3]:+.3f} ({m[4]})")
 
     for tag, mode, stop in [
             ("現行（gross門檻+計時器）", "live_timer", None),
