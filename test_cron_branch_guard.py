@@ -31,6 +31,11 @@ CRON = os.environ.get("CRON_DIR") or os.path.join(REPO, "cron")
 
 RESULTS = []
 
+# 只驗呢 4 個 BTC cron wrapper — CRON_DIR 可能係 ~/.hermes/scripts (56 個無關 script),
+# 唔應該掃全目錄 (會誤報其他 script 冇 __main__ guard 等)
+WRAPPERS = ("btc_weekend_cron", "btc_rebalance_cron",
+            "btc_martingale_cron", "btc_dual_report")
+
 
 def check(name, cond, detail=""):
     RESULTS.append((name, bool(cond), detail))
@@ -68,8 +73,9 @@ def make_repo(root, branch="main", files=("a.py", "b.py")):
 def test_parity():
     print("\n【1】共用同一 REPO 嘅 cron — BRANCH_PIN 必須一致")
     pins = {}
-    for fn in sorted(os.listdir(CRON)):
-        if not fn.endswith(".py"):
+    for name in WRAPPERS:
+        fn = f"{name}.py"
+        if not os.path.exists(os.path.join(CRON, fn)):
             continue
         src = open(os.path.join(CRON, fn)).read()
         m_repo = re.search(r'BTC_REPO"\)\s*or\s*os\.path\.expanduser\("([^"]+)"\)', src)
@@ -238,22 +244,21 @@ def test_martingale():
 # ── 6. 語法 / 對外介面 ─────────────────────────────────────────────
 def test_syntax_and_interface():
     print("\n【6】語法 + 對外介面 (cron 靠呢啲 entry point)")
-    for fn in sorted(os.listdir(CRON)):
-        if not fn.endswith(".py"):
+    for name in WRAPPERS:
+        p = os.path.join(CRON, f"{name}.py")
+        if not os.path.exists(p):
+            check(f"{name}.py 存在", False)
             continue
-        p = os.path.join(CRON, fn)
-        r = subprocess.run([sys.executable, "-m", "py_compile", p], capture_output=True, text=True)
-        check(f"{fn} 語法 OK", r.returncode == 0, r.stderr[-160:])
-    # main() 仲喺 (cron 用 `python3 x.py` 跑)
-    for name in ("btc_weekend_cron", "btc_rebalance_cron", "btc_martingale_cron", "btc_dual_report"):
+        r = subprocess.run([sys.executable, "-m", "py_compile", p],
+                           capture_output=True, text=True)
+        check(f"{name}.py 語法 OK", r.returncode == 0, r.stderr[-160:])
+        # main() 仲喺 (cron 用 `python3 x.py` 跑)
         mod = load(name)
         check(f"{name}.main() 存在", callable(getattr(mod, "main", None)))
-    # __main__ guard 仲喺
-    for fn in sorted(os.listdir(CRON)):
-        if fn.endswith(".py"):
-            src = open(os.path.join(CRON, fn)).read()
-            check(f"{fn} 有 __main__ guard (import 唔會執行)",
-                  '__name__ == "__main__"' in src)
+        # __main__ guard 仲喺 (import 唔會執行)
+        src = open(p).read()
+        check(f"{name}.py 有 __main__ guard (import 唔會執行)",
+              '__name__ == "__main__"' in src)
 
 
 def main():
