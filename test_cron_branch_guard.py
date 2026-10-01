@@ -300,36 +300,44 @@ class FakeProc:
         self.returncode, self.stdout, self.stderr = rc, out, err
 
 
-def _run_main_with_failing_checkout(mod, trade, pin_wrong=True):
+def _run_main_with_failing_checkout(mod, trade):
     """令 branch checkout 一定失敗, 睇 main() 仲會唔會跑落單 entry。
 
     只有「branch checkout -q …」被攔截 (模擬 checkout 失敗), 其餘 git 指令
     照跑真嘅 — 咁 _repo_healthy() 讀到嘅係真 repo 狀態。
-    回傳 (ran_trade_list, raised)。
+    回傳 (ran_trade_list, raised, captured_stdout)。
     """
+    import contextlib
+    import io
+
     ran, raised = [], None
     real_run = subprocess.run
 
     def fake_run(cmd, *a, **kw):
-        joined = " ".join(str(c) for c in cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
-        if "checkout" in joined and "-q" in joined:
+        parts = [str(c) for c in cmd] if isinstance(cmd, (list, tuple)) else [str(cmd)]
+        joined = " ".join(parts)
+        # branch checkout = `git -C REPO checkout -q <pin>` (要 -q 先係切 branch;
+        # `checkout -- .` 係還原檔案, 要放行)
+        if "checkout" in parts and "-q" in parts:
             return FakeProc(1, "", "fatal: simulated checkout failure")
         if trade in joined:
             ran.append(joined)
             return FakeProc(0, "TRADE RAN", "")
         return real_run(cmd, *a, **kw)
 
+    buf = io.StringIO()
     subprocess.run = fake_run
     try:
-        try:
-            mod.main()
-        except SystemExit:
-            pass
-        except BaseException as e:
-            raised = e
+        with contextlib.redirect_stdout(buf):
+            try:
+                mod.main()
+            except SystemExit:
+                pass
+            except BaseException as e:
+                raised = e
     finally:
         subprocess.run = real_run
-    return ran, raised
+    return ran, raised, buf.getvalue()
 
 
 def test_failsafe():
@@ -347,23 +355,30 @@ def test_failsafe():
             mod.REPO = rp
             # repo 留喺錯 branch
             sh("git checkout -q -b wrongbranch", rp)
-            # 繞過唔相關嘅前置條件
+            # 繞過唔相關嘅前置條件 (唔想測試受時間窗口 / interpreter 探測影響)
             if hasattr(mod, "in_window"):
                 mod.in_window = lambda: True
             if hasattr(mod, "pick_python"):
                 mod.pick_python = lambda: sys.executable
+            if hasattr(mod, "hourly_status"):
+                mod.hourly_status = lambda: None      # 免得污染 sys.path / 出雜訊
 
-            ran, raised = _run_main_with_failing_checkout(mod, trade)
+            ran, raised, out = _run_main_with_failing_checkout(mod, trade)
             check(f"{name}: 修復失敗 → 冇跑 {trade} (fail-safe)",
                   not ran, f"有跑: {ran}")
-            check(f"{name}: 修復失敗 → 有出聲 (raise 或 print)",
-                  raised is not None or True)   # print 已經係出聲, 只記錄
+            # ⚠️ 一定要真斷言「有出聲」— 唔可以寫成永遠 PASS (會掏空呢個回歸測試)
+            spoke = ("❌" in out) or (raised is not None)
+            check(f"{name}: 修復失敗 → 有出聲 (唔會靜默)",
+                  spoke, f"out={out[:120]!r} raised={raised!r}")
+            check(f"{name}: 修復失敗 → 冇 unhandled traceback 爆出",
+                  raised is None or isinstance(raised, (RuntimeError, SystemExit)),
+                  f"raised={type(raised).__name__ if raised else None}")
 
             # 對照: 健康 → 應該照跑 (證明上面唔係「永遠唔跑」)
             sh(f"git checkout -q {pin}", rp)
             cur = sh("git rev-parse --abbrev-ref HEAD", rp).stdout.strip()
             check(f"{name}: 對照組前置 — repo 已還原到 {pin}", cur == pin, f"got={cur}")
-            ran2, _ = _run_main_with_failing_checkout(mod, trade)
+            ran2, _, _ = _run_main_with_failing_checkout(mod, trade)
             check(f"{name}: repo 健康 → 照跑 {trade} (對照組)",
                   bool(ran2), "健康但冇跑 = 過度保守")
 
@@ -416,6 +431,22 @@ def test_lock():
     src = open(os.path.join(CRON, "btc_weekend_cron.py")).read()
     check("weekend main() 落單期間持共享鎖",
           "exclusive=False" in src and "_repo_lock(exclusive=False" in src)
+
+    # 【唔抽共用模組嘅補償】三個 wrapper 嘅 _repo_lock 實作要一致 —
+    # 今次個 bug 正正就係「兩邊唔同步」, 唔想將來改一個漏咗其他。
+    import inspect
+    srcs = {}
+    for name in ("btc_weekend_cron", "btc_rebalance_cron", "btc_martingale_cron"):
+        m = load_safe(name)
+        if m is not None and callable(getattr(m, "_repo_lock", None)):
+            try:
+                srcs[name] = inspect.getsource(m._repo_lock)
+            except Exception:
+                pass
+    if len(srcs) >= 2:
+        norm = {k: re.sub(r"\s+", " ", v).strip() for k, v in srcs.items()}
+        check(f"_repo_lock 實作 {len(srcs)} 個 wrapper 一致 (防將來改漏)",
+              len(set(norm.values())) == 1, f"唔一致: {sorted(norm)}")
 
 
 # ── 9. dual_report 唔應該喺 import 時拉真 repo ──────────────────────

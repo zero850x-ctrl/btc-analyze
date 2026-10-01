@@ -28,7 +28,14 @@ def _bt():
     """
     if BTC_REPO not in sys.path:
         sys.path.insert(0, BTC_REPO)
-    import binance_testnet_paper as m
+    try:
+        import binance_testnet_paper as m
+    except Exception as e:
+        # 唔好靜默: 講清楚係「repo code 載入失敗」而唔係普通 import error
+        # (lazy import 令 import error 由啟動時變成用到先爆, 更加要講清)
+        raise RuntimeError(
+            f"載入 {BTC_REPO} 嘅 binance_testnet_paper 失敗: {type(e).__name__}: {e}"
+            f" — 檢查 repo 狀態 / branch (應該係 {BRANCH_PIN})") from e
     return m
 
 
@@ -88,8 +95,9 @@ def main():
     try:
         px = current_price()
         out[0] += f" — BTC ${px:,.0f}"
-    except Exception:
-        pass
+    except Exception as e:
+        # 原本靜默 pass → repo code 載入唔到時報告會「少咗 BTC 價」而冇人知
+        out.append(f"⚠️ 攞 BTC 價失敗: {e}")
 
     # ── 主系統 ──
     try:

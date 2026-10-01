@@ -39,8 +39,11 @@ class RepoUnavailable(RuntimeError):
 
 
 # 同主系統一樣用 flock: 防止 cron tick 同人手執行重疊時同時做 re-clone。
+# ⚠️ 鎖名由 REPO 嘅 **realpath** 算出 — 改 BTC_REPO env = 換鎖。
+#    亦唔好刪 ~/.hermes/reports/.repo_recover_*.lock — flock 係 inode-based,
+#    刪咗再建會出現兩個持有者。
 _LOCK_PATH = os.path.join(os.path.expanduser("~/.hermes/reports"),
-                          f".repo_recover_{os.path.basename(REPO)}.lock")
+                          f".repo_recover_{os.path.basename(os.path.realpath(REPO))}.lock")
 
 
 @contextmanager
@@ -59,7 +62,7 @@ def _repo_lock(exclusive, timeout=300):
                 if time.time() >= deadline:
                     raise RepoUnavailable(
                         f"攞唔到 repo 鎖 ({_LOCK_PATH}, {'獨佔' if exclusive else '共享'}) "
-                        f"超過 {timeout}s")
+                        f"超過 {timeout}s — 另一個 cron 可能做緊復原")
                 time.sleep(1)
         yield
     finally:
@@ -169,10 +172,14 @@ def main():
     # 落單期間持共享鎖: 擋住重疊執行 (人手/cron) 做 checkout / re-clone
     try:
         with _repo_lock(exclusive=False, timeout=600):
+            # 攞到共享鎖之後再驗一次 — 等鎖期間 repo 可能被改動/rename 走
+            if not _repo_healthy():
+                print("\n".join(prepend + ["❌ repo 喺落單前變得不健康 — 為安全起見唔跑"]))
+                return
             r = subprocess.run([py, os.path.join(REPO, "btc_martingale.py")],
                                cwd=REPO, capture_output=True, text=True, timeout=120, env=env)
-    except RepoUnavailable as e:
-        print("\n".join(prepend + [f"❌ 唔夠安全跑馬丁: {e}"]))
+    except (RepoUnavailable, subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        print("\n".join(prepend + [f"❌ 唔夠安全跑馬丁: {type(e).__name__}: {e}"]))
         return
     out = (r.stdout + r.stderr).strip()
     if r.returncode != 0:

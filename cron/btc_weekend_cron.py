@@ -49,8 +49,12 @@ class RepoUnavailable(RuntimeError):
 #   - 兩個同時 clone 落同一個 path → 一個半途而死
 #   - A 啱啱 checkout 好準備落單時, B 插入做 checkout → trade 讀到半更新 worktree
 # 用 flock: 復原 = LOCK_EX (獨佔), 落單 = LOCK_SH (共享, 可並存但擋住復原)。
+# ⚠️ 鎖名由 REPO 嘅 **realpath** 算出 — 只有指去同一個真目錄嘅 cron 才會撞同一把鎖。
+#    改 BTC_REPO env = 換鎖, 共用同一 REPO 嘅 cron 要一致。
+#    亦唔好刪 ~/.hermes/reports/.repo_recover_*.lock — flock 係 inode-based,
+#    刪咗再建會出現兩個持有者。
 _LOCK_PATH = os.path.join(os.path.expanduser("~/.hermes/reports"),
-                          f".repo_recover_{os.path.basename(REPO)}.lock")
+                          f".repo_recover_{os.path.basename(os.path.realpath(REPO))}.lock")
 
 
 @contextmanager
@@ -259,12 +263,19 @@ def main():
     # 共享鎖之間可以並存, 所以唔會阻礙落單本身。
     try:
         with _repo_lock(exclusive=False, timeout=600):
+            # 攞到共享鎖之後**再驗一次**: 等鎖期間另一個 cron 可能做過復原
+            # (甚至將 REPO rename 走)。唔驗就等於喺狀態不明之下落單。
+            if not _repo_healthy():
+                print("\n".join(prepend + ["❌ repo 喺落單前變得不健康 — 為安全起見唔跑"]))
+                return
             r = subprocess.run(
                 [py, "btc_auto_trade_cycle.py"],
                 cwd=REPO, capture_output=True, text=True, timeout=280, env=env,
             )
-    except RepoUnavailable as e:
-        print("\n".join(prepend + [f"❌ 唔夠安全跑落單 cycle: {e}"]))
+    # 全部當「唔夠安全」處理 — 唔可以讓 unhandled traceback 蓋過訊息
+    # (cron stderr traceback 會令 telegram 收唔到任何出聲)
+    except (RepoUnavailable, subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        print("\n".join(prepend + [f"❌ 唔夠安全跑落單 cycle: {type(e).__name__}: {e}"]))
         return
     out = (r.stdout + r.stderr).strip()
     if r.returncode != 0:
