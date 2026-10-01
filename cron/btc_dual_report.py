@@ -153,6 +153,9 @@ def main():
         out.append(f"     🚧 gate log 讀取失敗 ({e})")
 
     # ── 再平衡 60/40 ──
+    # 2026-10-01 GLM review LOW: 原本所有失敗都寫「讀 log 失敗」— 但呢段同時做
+    # 攞價 (current_price) 同簽名 API 查詢, 失敗原因可以完全唔同 → 訊息要講清楚,
+    # 否則查問題時會去錯方向。
     try:
         rb_path = os.path.expanduser("~/.hermes/reports/btc_rebalance_log.json")
         led_path = os.path.expanduser("~/.hermes/reports/btc_rebalance_ledger.json")
@@ -162,14 +165,20 @@ def main():
             evs = rlg.get("events") or []
             led = json.load(open(led_path)) if os.path.exists(led_path) else None
             if led:
-                px = current_price()
+                try:
+                    px = current_price()
+                except Exception as e:
+                    raise RuntimeError(f"攞 BTC 價失敗: {e}") from e
                 tot = led["btc"] * px + led["usdt"]
                 pct = (led["btc"] * px) / tot * 100
-                a_btc, a_usdt = _load_keys()
-                acct = _signed_request("GET", "/api/v3/account", {}, a_btc, a_usdt)
-                bal = {b["asset"]: float(b["free"]) + float(b["locked"])
-                       for b in acct["balances"]}
-                gap = bal.get("BTC", 0) - led["btc"]
+                try:
+                    a_btc, a_usdt = _load_keys()
+                    acct = _signed_request("GET", "/api/v3/account", {}, a_btc, a_usdt)
+                    bal = {b["asset"]: float(b["free"]) + float(b["locked"])
+                           for b in acct["balances"]}
+                    gap = bal.get("BTC", 0) - led["btc"]
+                except Exception as e:
+                    raise RuntimeError(f"查帳戶失敗: {e}") from e
                 ev_txt = ""
                 if evs:
                     d = _hkt(evs[-1].get("ts"))
@@ -179,36 +188,57 @@ def main():
                            f" ｜偏離 {pct - 60:+.1f}% ｜總值 ${tot:,.0f}{ev_txt}")
                 out.append(f"     與實際帳戶差 {gap:+.6f} BTC (馬丁格爾佔用)")
     except Exception as e:
-        out.append(f"  ⚖️ 再平衡: 讀 log 失敗 ({e})")
+        out.append(f"  ⚖️ 再平衡: {e}")
 
     # ── 馬丁格爾 ──
+    # 2026-10-01 GLM review LOW: 呢段原本**完全冇 try 包住** — 而且用
+    # `a['id']` / `a['side']` / `a['level']` / `e['qty']` / `e['px']` 直接 index。
+    # log 欄位一缺 (舊版本寫落嘅 chain、人手改過) 就 KeyError →
+    # **成個報告 crash**, 連主系統嗰段都出唔到。只讀 script 唔影響落單,
+    # 但報告本身就係佢存在嘅意義 → 一定要出得到。
     try:
-        m = json.load(open(MART))
-    except Exception as e:
-        m = {}
-    a = m.get("active")
-    if a:
-        entries = a.get("entries") or []
-        tot_qty = sum(e["qty"] for e in entries)
-        tot_cost = sum(e["qty"] * e["px"] for e in entries)
-        avg = tot_cost / tot_qty if tot_qty else 0
-        # 現價浮動
         try:
-            px2 = current_price()
-            fl = sum((px2 - e["px"]) * e["qty"] for e in entries) if a.get("side") == "BUY" \
-                else sum((e["px"] - px2) * e["qty"] for e in entries)
-            fl_txt = f"浮動 {fl:+.2f} (現價 {px2:,.0f})"
-        except Exception:
-            fl_txt = f"avg {avg:,.0f}"
-        out.append(f"  🔵 馬丁: chain {a['id']} {a['side']} level {a['level']} "
-                   f"({len(entries)}注) {fl_txt} 目標 +${a.get('target_usd')}")
-        out.append(f"     開倉 {a.get('opened','?')[:16]}Z 已掛 {int((n - _hkt(a['opened'])).total_seconds()//3600)}h")
-    else:
-        out.append(f"  💤 馬丁: 無 active chain")
-    dly = m.get("daily") or {}
-    dd = dly.get(today) or {}
-    out.append(f"     今日 {dd.get('wins',0)}W/{dd.get('losses',0)}L 蝕${dd.get('loss_usd',0):.2f} ｜ "
-               f"累計 {sum(d.get('wins',0) for d in dly.values())}W/{sum(d.get('losses',0) for d in dly.values())}L")
+            m = json.load(open(MART))
+        except Exception as e:
+            m = {}
+            out.append(f"  ⚠️ 馬丁 log 讀唔到: {e}")
+        a = m.get("active")
+        if a:
+            entries = [e for e in (a.get("entries") or []) if isinstance(e, dict)]
+            # 缺 qty/px 嘅 entry 剔走 (唔好當 0, 否則 average 會計錯)
+            usable = [e for e in entries if e.get("qty") is not None and e.get("px") is not None]
+            tot_qty = sum(e["qty"] for e in usable)
+            tot_cost = sum(e["qty"] * e["px"] for e in usable)
+            avg = tot_cost / tot_qty if tot_qty else 0
+            # 現價浮動
+            try:
+                px2 = current_price()
+                fl = sum((px2 - e["px"]) * e["qty"] for e in usable) if a.get("side") == "BUY" \
+                    else sum((e["px"] - px2) * e["qty"] for e in usable)
+                fl_txt = f"浮動 {fl:+.2f} (現價 {px2:,.0f})"
+            except Exception:
+                fl_txt = f"avg {avg:,.0f}"
+            out.append(f"  🔵 馬丁: chain {a.get('id', '?')} {a.get('side', '?')} "
+                       f"level {a.get('level', '?')} "
+                       f"({len(entries)}注) {fl_txt} 目標 +${a.get('target_usd')}")
+            opened = a.get("opened")
+            t_open = _hkt(opened) if opened else None
+            if t_open:
+                held = f"已掛 {int((n - t_open).total_seconds() // 3600)}h"
+            else:
+                held = "已掛 ? (log 冇 opened 欄)"
+            out.append(f"     開倉 {str(opened or '?')[:16]}Z {held}")
+        else:
+            out.append("  💤 馬丁: 無 active chain")
+        dly = m.get("daily") or {}
+        dd = dly.get(today) or {}
+        out.append(f"     今日 {dd.get('wins',0)}W/{dd.get('losses',0)}L "
+                   f"蝕${(dd.get('loss_usd') or 0):.2f} ｜ "
+                   f"累計 {sum(d.get('wins',0) for d in dly.values())}W/"
+                   f"{sum(d.get('losses',0) for d in dly.values())}L")
+    except Exception as e:
+        # 報告永遠要出得到 — 馬丁段爆都要出主系統嗰段
+        out.append(f"  ⚠️ 馬丁段計唔到 ({type(e).__name__}: {e})")
 
     print("\n".join(out))
 

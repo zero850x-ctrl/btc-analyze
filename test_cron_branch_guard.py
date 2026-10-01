@@ -392,40 +392,61 @@ def test_lock():
         return
     check("有 _repo_lock() (共用 repo 復原互斥)", True)
 
-    # 獨佔中唔可以再攞 (獨佔或共享) — 否則兩個 cron 會同時做復原/落單
-    try:
-        with mod._repo_lock(exclusive=True, timeout=30):
-            try:
-                with mod._repo_lock(exclusive=True, timeout=2):
-                    excl_ok = False
-            except Exception:
-                excl_ok = True
-            check("獨佔鎖生效 — 期間唔可以再有獨佔 (唔會同時 re-clone)", excl_ok)
-            try:
-                with mod._repo_lock(exclusive=False, timeout=2):
-                    sh_ok = False
-            except Exception:
-                sh_ok = True
-            check("獨佔鎖擋住共享鎖 (復原中唔會落單)", sh_ok)
-    except Exception as e:
-        check("可以攞到獨佔鎖", False, f"{type(e).__name__}: {e}")
+    # ⚠️ 2026-10-01 GLM review LOW: 一定要 redirect 鎖檔去 tmp。
+    # 原本直接用 module-level _LOCK_PATH = production 鎖檔
+    # (~/.hermes/reports/.repo_recover_btc-analyze.lock) →
+    # 喺 production 機跑測試會同 live cron 爭鎖 (測試 timeout FAIL, 或者
+    # cron 嘅落單/復原要等測試)。
+    real_lock = getattr(mod, "_LOCK_PATH", None)
 
-    # 共享鎖之間可以並存 (兩個 cron 可以同時落單)
-    try:
-        with mod._repo_lock(exclusive=False, timeout=5):
-            with mod._repo_lock(exclusive=False, timeout=5):
-                pass
-        check("共享鎖可並存 (兩個 cron 可以同時落單)", True)
-    except Exception as e:
-        check("共享鎖可並存 (兩個 cron 可以同時落單)", False, f"{type(e).__name__}: {e}")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_lock = os.path.join(tmp, "repo.lock")
+        mod._LOCK_PATH = tmp_lock
+        try:
+            # 獨佔中唔可以再攞 (獨佔或共享) — 否則兩個 cron 會同時做復原/落單
+            try:
+                with mod._repo_lock(exclusive=True, timeout=30):
+                    check("測試期間鎖檔已 redirect 去 tmp (唔會同 live cron 爭鎖)",
+                          os.path.exists(tmp_lock) and mod._LOCK_PATH != real_lock,
+                          f"tmp_lock 存在={os.path.exists(tmp_lock)} "
+                          f"same_as_real={mod._LOCK_PATH == real_lock}")
+                    try:
+                        with mod._repo_lock(exclusive=True, timeout=2):
+                            excl_ok = False
+                    except Exception:
+                        excl_ok = True
+                    check("獨佔鎖生效 — 期間唔可以再有獨佔 (唔會同時 re-clone)", excl_ok)
+                    try:
+                        with mod._repo_lock(exclusive=False, timeout=2):
+                            sh_ok = False
+                    except Exception:
+                        sh_ok = True
+                    check("獨佔鎖擋住共享鎖 (復原中唔會落單)", sh_ok)
+            except Exception as e:
+                check("可以攞到獨佔鎖", False, f"{type(e).__name__}: {e}")
 
-    # 釋放後可以再攞 (唔會死鎖)
-    try:
-        with mod._repo_lock(exclusive=True, timeout=5):
-            pass
-        check("鎖釋放後可以重新攞 (冇死鎖)", True)
-    except Exception as e:
-        check("鎖釋放後可以重新攞 (冇死鎖)", False, f"{type(e).__name__}: {e}")
+            # 共享鎖之間可以並存 (兩個 cron 可以同時落單)
+            try:
+                with mod._repo_lock(exclusive=False, timeout=5):
+                    with mod._repo_lock(exclusive=False, timeout=5):
+                        pass
+                check("共享鎖可並存 (兩個 cron 可以同時落單)", True)
+            except Exception as e:
+                check("共享鎖可並存 (兩個 cron 可以同時落單)", False,
+                      f"{type(e).__name__}: {e}")
+
+            # 釋放後可以再攞 (唔會死鎖)
+            try:
+                with mod._repo_lock(exclusive=True, timeout=5):
+                    pass
+                check("鎖釋放後可以重新攞 (冇死鎖)", True)
+            except Exception as e:
+                check("鎖釋放後可以重新攞 (冇死鎖)", False, f"{type(e).__name__}: {e}")
+        finally:
+            mod._LOCK_PATH = real_lock
+
+    check("測試完回復原本 _LOCK_PATH (唔會污染其他測試)",
+          getattr(mod, "_LOCK_PATH", None) == real_lock, f"got={mod._LOCK_PATH}")
 
     # 落單入口真係有持共享鎖 (結構檢查)
     src = open(os.path.join(CRON, "btc_weekend_cron.py")).read()
@@ -473,6 +494,155 @@ def test_dual_report_import_purity():
           f"got={getattr(mod, 'BRANCH_PIN', None)}")
 
 
+# ── 10. pick_python: cache 唔可以喺 REPO + candidate 失敗唔可以炸 ──
+def test_pick_python():
+    print("\n【10】pick_python — cache 唔喺 REPO、candidate 失敗唔會炸")
+    mod = load_safe("btc_weekend_cron")
+    if mod is None or not callable(getattr(mod, "pick_python", None)):
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        rp = make_repo(os.path.join(tmp, "r"), "main", req_files(mod))
+        mod.REPO = rp
+        home = os.path.join(tmp, "home")
+        os.makedirs(home, exist_ok=True)
+
+        # redirect "~" 去 tmp, 免得污染真 ~/.hermes/reports
+        real_expanduser = os.path.expanduser
+        real_run = subprocess.run
+        os.path.expanduser = lambda p: (p.replace("~", home, 1)
+                                        if isinstance(p, str) and p.startswith("~")
+                                        else real_expanduser(p))
+        try:
+            # (a) 全部 candidate 都 timeout → 要回 None, 唔可以拋出去
+            def boom(cmd, *a, **kw):
+                parts = [str(c) for c in cmd] if isinstance(cmd, (list, tuple)) else [str(cmd)]
+                if "-c" in parts:
+                    raise subprocess.TimeoutExpired(cmd, 30)
+                return real_run(cmd, *a, **kw)
+
+            subprocess.run = boom
+            try:
+                res, crashed = mod.pick_python(), None
+            except BaseException as e:
+                res, crashed = None, e
+            check("全部 candidate timeout → 回 None (唔炸出 main)",
+                  crashed is None and res is None, f"res={res} raised={crashed!r}")
+
+            # (b) 全部 candidate 唔存在 / OSError → 一樣唔可以炸
+            def boom2(cmd, *a, **kw):
+                parts = [str(c) for c in cmd] if isinstance(cmd, (list, tuple)) else [str(cmd)]
+                if "-c" in parts:
+                    raise FileNotFoundError("simulated")
+                return real_run(cmd, *a, **kw)
+
+            subprocess.run = boom2
+            try:
+                res2, crashed2 = mod.pick_python(), None
+            except BaseException as e:
+                res2, crashed2 = None, e
+            check("candidate FileNotFoundError → 回 None (唔炸出 main)",
+                  crashed2 is None and res2 is None, f"res={res2} raised={crashed2!r}")
+
+            # (c) 正常路徑 → cache 一定要寫喺 REPO **以外**
+            subprocess.run = real_run
+            got = mod.pick_python()
+            new_cache = os.path.join(home, ".hermes", "reports", ".cron_python")
+            check("正常揀到 interpreter", bool(got), f"got={got}")
+            check("cache 唔會寫入 REPO (唔再污染 worktree)",
+                  not os.path.exists(os.path.join(rp, ".cron_python")))
+            check("cache 寫喺 ~/.hermes/reports (REPO 以外)", os.path.exists(new_cache),
+                  f"expect={new_cache}")
+
+            # (d) 舊位置 REPO/.cron_python 仍然讀得到 (migration)
+            # ⚠️ 唔好假設 new_cache 一定存在 — 未修版本唔會寫新位置,
+            #    直接 os.remove 會炸咗成份測試, 令後面嘅斷言跑唔到。
+            if os.path.exists(new_cache):
+                os.remove(new_cache)
+            legacy = os.path.join(rp, ".cron_python")
+            open(legacy, "w").write(got)
+            migrated = mod.pick_python()
+            check("讀得返舊位置 REPO/.cron_python (migration 唔會斷)",
+                  migrated == got, f"got={migrated}")
+            check("migration: 順手寫埋新位置",
+                  os.path.exists(new_cache), f"expect={new_cache}")
+        finally:
+            subprocess.run = real_run
+            os.path.expanduser = real_expanduser
+
+
+# ── 11. dual_report: 馬丁段缺欄 / 壞 log 都唔可以炸報告 ─────────────
+def test_dual_report_martingale_robust():
+    print("\n【11】btc_dual_report — 馬丁段缺欄/壞 log 唔可以令報告 crash")
+    import contextlib
+    import io
+    import json as _json
+
+    mod = load_safe("btc_dual_report")
+    if mod is None:
+        return
+
+    def run_with_mart(payload_text):
+        """用指定嘅馬丁 log 內容跑 main(), 回傳 (output, raised)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            mp = os.path.join(tmp, "mart.json")
+            with open(mp, "w") as f:
+                f.write(payload_text)
+            mod.MART = mp
+            mod.ORDERS = os.path.join(tmp, "orders.json")     # 唔存在 → 走 except
+            mod.HIST = os.path.join(tmp, "hist.json")
+            mod.PAUSED_MARKER = os.path.join(tmp, "no.txt")
+            mod.HIST_MARKER = os.path.join(tmp, "no2.txt")
+            mod.current_price = lambda: 100000.0            # 唔扯 network
+            mod.branch_warning = lambda: None
+            buf, raised = io.StringIO(), None
+            try:
+                with contextlib.redirect_stdout(buf):
+                    mod.main()
+            except BaseException as e:
+                raised = e
+            return buf.getvalue(), raised
+
+    # (a) 對照: 舊寫法喺呢啲資料上真係會爆 (證明 bug 真實, 唔係假想)
+    entries = [{"qty": 0.001}]                       # 缺 px
+    try:
+        sum(e["px"] for e in entries)
+        old_crashed = False
+    except KeyError:
+        old_crashed = True
+    check("對照: 舊寫法 `e['px']` 直接 index 會 KeyError (bug 真實)",
+          old_crashed)
+
+    # (b) entry 缺 px + active 缺 id/side/level/opened → 報告要照出
+    bad = _json.dumps({"active": {"entries": [{"qty": 0.001}, {"px": 90000.0}]},
+                       "daily": {"2026-10-01": {"wins": 1, "losses": 0,
+                                                "loss_usd": 2.5}}})
+    out, raised = run_with_mart(bad)
+    check("active 缺 id/side/level/opened + entry 缺 px → 唔會 crash",
+          raised is None, f"raised={raised!r}")
+    check("  → 報告仍然出到馬丁行", "🔵 馬丁" in out, f"out={out[:200]!r}")
+    check("  → 報告仍然出到 daily 行", "今日 1W/0L" in out, f"out={out[:200]!r}")
+
+    # (c) 壞 JSON → 出警告, 唔會 crash
+    out2, raised2 = run_with_mart("{ not json")
+    check("馬丁 log 係壞 JSON → 唔會 crash", raised2 is None, f"raised={raised2!r}")
+    check("  → 有出警告", "⚠️" in out2, f"out={out2[:200]!r}")
+
+    # (d) 空 log / 冇 active → 正常出「無 active chain」
+    out3, raised3 = run_with_mart("{}")
+    check("冇 active chain → 唔會 crash", raised3 is None, f"raised={raised3!r}")
+    check("  → 出「無 active chain」", "無 active chain" in out3, f"out={out3[:200]!r}")
+
+    # (e) entries 唔係 dict (人手改壞) → 唔會 crash
+    out4, raised4 = run_with_mart(_json.dumps(
+        {"active": {"entries": ["oops", None], "id": 1, "side": "BUY"}}))
+    check("entries 含非 dict → 唔會 crash", raised4 is None, f"raised={raised4!r}")
+    check("  → 報告仍然出得到", "🔵 馬丁" in out4, f"out={out4[:200]!r}")
+
+    # (f) 最重要: 報告一定要 print 到嘢 (main() 存在意義)
+    for label, o in (("缺欄", out), ("壞 JSON", out2), ("空 log", out3), ("壞 entries", out4)):
+        check(f"  ({label}) 報告有輸出 (唔會空白)", bool(o.strip()), f"out={o!r}")
+
+
 def main():
     print("=" * 76)
     print(f"cron branch guard 測試   CRON_DIR={CRON}")
@@ -481,7 +651,8 @@ def main():
     # (對未修版本跑時, 新函數唔存在會 AttributeError)
     for fn in (test_parity, test_weekend_health, test_weekend_recovery,
                test_rebalance, test_martingale, test_syntax_and_interface,
-               test_failsafe, test_lock, test_dual_report_import_purity):
+               test_failsafe, test_lock, test_dual_report_import_purity,
+               test_pick_python, test_dual_report_martingale_robust):
         try:
             fn()
         except Exception as e:

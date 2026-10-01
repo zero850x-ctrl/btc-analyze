@@ -84,22 +84,50 @@ def _repo_lock(exclusive, timeout=300):
 
 
 def pick_python():
-    """揀一個 import 到 numpy+yfinance 嘅 python (cached)."""
-    cache = os.path.join(REPO, ".cron_python")
-    if os.path.exists(cache):
-        p = open(cache).read().strip()
-        if os.path.exists(p):
-            return p
+    """揀一個 import 到 numpy+yfinance 嘅 python (cached).
+
+    ⚠️ cache 檔**唔可以**放喺 REPO 入面 (2026-10-01 GLM review LOW):
+      1. 佢係 untracked file → 令 `git status` 永遠 dirty, 同
+         `git checkout -- .` 嘅「還原」語義混淆
+      2. re-clone / rename 就會冇咗
+      3. 寫入共用 repo worktree 唔乾淨 (另一個 cron 可能同時 checkout)
+    舊位置 REPO/.cron_python 仍然會讀 (migration), 但只寫新位置。
+    """
+    cache_dir = os.path.expanduser("~/.hermes/reports")
+    cache = os.path.join(cache_dir, ".cron_python")
+    legacy = os.path.join(REPO, ".cron_python")
+    for c in (cache, legacy):
+        if os.path.exists(c):
+            try:
+                p = open(c).read().strip()
+            except OSError:
+                continue
+            if p and os.path.exists(p):
+                if c == legacy:                 # 順手 migrate 去新位置
+                    _write_cache(cache, p)
+                return p
     for cand in CANDIDATE_PY:
-        if not (cand and os.path.exists(cand.replace(" ", ""))):
+        if not (cand and os.path.exists(cand)):
             continue
-        r = subprocess.run([cand, "-c", "import numpy, pandas, yfinance, requests"],
-                           capture_output=True, timeout=30)
+        try:
+            r = subprocess.run([cand, "-c", "import numpy, pandas, yfinance, requests"],
+                               capture_output=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError):
+            continue                            # 呢個 candidate 唔得, 試下一個
         if r.returncode == 0:
-            with open(cache, "w") as f:
-                f.write(cand)
+            _write_cache(cache, cand)
             return cand
     return None
+
+
+def _write_cache(path, value):
+    """寫 cache — 失敗唔應該令 cron 死 (cache 只係加速)。"""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(value)
+    except OSError:
+        pass
 
 
 def in_window():
@@ -251,7 +279,12 @@ def main():
         print(f"❌ repo restore 失敗: {e}")
         return
 
-    py = pick_python()
+    py = None
+    try:
+        py = pick_python()
+    except (subprocess.TimeoutExpired, OSError) as e:
+        # 同「落單段」同類: unhandled traceback 會蓋過要出嘅訊息
+        print(f"❌ 揀 python interpreter 失敗: {type(e).__name__}: {e}")
     if not py:
         print("❌ 搵唔到有 numpy+yfinance 嘅 python interpreter")
         return
