@@ -677,6 +677,147 @@ def _run_mart_cases(mod, run_with_mart, _json):
         check(f"  ({label}) 報告有輸出 (唔會空白)", bool(o.strip()), f"out={o!r}")
 
 
+def test_mart_net_btc():
+    """【12】_mart_net_btc — 淨佔用計算 + gap 歸因唔可以亂認。**
+
+    2026-10-01 實際 bug: 報告寫「與實際帳戶差 −0.30003 BTC (馬丁格爾佔用)」,
+    但實際上馬丁只佔 −0.00052 (0.2%), 其餘 99.3% 係 phantom 事故殘餘。
+    根因: **完成咗嘅 chain 淨佔用 = 0** (開倉同平倉互相抵銷), 只有 active
+    chain 先真正佔用 —— 之前嘅寫法當咗「累計 qty = 佔用」, 完全錯。
+    """
+    print("\n【12】_mart_net_btc — 淨佔用 + gap 歸因")
+    import json as _json
+    mod = load_safe("btc_dual_report")
+    if mod is None or not callable(getattr(mod, "_mart_net_btc", None)):
+        check("有 _mart_net_btc()", False, "唔存在 → gap 歸因唔會準")
+        return
+    check("有 _mart_net_btc()", True)
+
+    real_mart = getattr(mod, "MART", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            mp = os.path.join(tmp, "m.json")
+            mod.MART = mp
+
+            def run(payload):
+                with open(mp, "w") as f:
+                    f.write(payload if isinstance(payload, str) else _json.dumps(payload))
+                return mod._mart_net_btc()
+
+            # (a) 冇 active → 0
+            check("冇 active → 0.0", run({"chains": [{"qty": 9}]}) == 0.0,
+                  "冇 active 唔應該有任何佔用")
+
+            # (b) SELL chain → 賣出 BTC → 負數
+            got = run({"active": {"side": "SELL",
+                                  "entries": [{"qty": 0.00017}, {"qty": 0.00035}]}})
+            check("SELL active → 負 (賣走 BTC)", abs(got + 0.00052) < 1e-9, f"got={got}")
+
+            # (c) BUY chain → 正數
+            got = run({"active": {"side": "BUY", "entries": [{"qty": 0.001}]}})
+            check("BUY active → 正 (買入 BTC)", abs(got - 0.001) < 1e-9, f"got={got}")
+
+            # (d) ⚠️ 核心: chains[] 有大量 qty 但 active 為空 → 佔用仍然係 0
+            got = run({"active": None,
+                       "chains": [{"side": "SELL", "state": "LOSS",
+                                   "entries": [{"qty": 0.0027}]} for _ in range(13)]})
+            check("完成 chain 唔算佔用 (開倉/平倉抵銷 → 0)", got == 0.0,
+                  f"got={got}  ← 呢個就係原本嘅 bug")
+
+            # (e) 壞 JSON → None (唔可以亂歸因)
+            with open(mp, "w") as f:
+                f.write("{壞")
+            check("壞 JSON → None (唔亂歸因)", mod._mart_net_btc() is None)
+
+            # (f) 缺 qty → 唔會 crash
+            got = run({"active": {"side": "SELL", "entries": [{"px": 1}, {"qty": 0.5}]}})
+            check("缺 qty → 唔 crash", got == -0.5, f"got={got} (應該只計 0.5)")
+
+            # (g) ⚠️ GLM review BLOCKER: side 唔可以辨識 → 一定要 None, 唔當 BUY。
+            #     原本寫 `-q if side=="SELL" else q` → 呢啲全部靜靜當 BUY →
+            #     符號反轉 → 報告將「賣走 BTC」講成「買入 BTC」= fail-wrong
+            for bad in (None, "LONG", "SHORT", 123, "  ", "SELLX"):
+                got = run({"active": {"side": bad, "entries": [{"qty": 0.001}]}})
+                check(f"side={bad!r} (無法辨識) → None 而唔係當 BUY",
+                      got is None, f"got={got} — 符號反轉風險")
+
+            # (h) side 大小寫 / 空白正常化 (唔算「唔知方向」)
+            for ok_side, want in (("Buy", 0.001), ("sell", -0.001), (" SELL ", -0.001)):
+                got = run({"active": {"side": ok_side, "entries": [{"qty": 0.001}]}})
+                check(f"side={ok_side!r} → 正常化 (唔當 None)",
+                      got == want, f"got={got} expect={want}")
+
+            # (i) active 存在但 entries 空 → 0 (唔係 crash / 唔係 None)
+            got = run({"active": {"side": "SELL", "entries": []}})
+            check("active 但 entries 空 → 0.0", got == 0.0, f"got={got}")
+
+            # (j) ⚠️ qty 係 nan / 字串 → 唔可以傳落去 (報告會印 nan)
+            got = run({"active": {"side": "SELL",
+                                  "entries": [{"qty": float("nan")}, {"qty": 0.001},
+                                              {"qty": "0.002"}, {"qty": True}]}})
+            check("nan/字串/bool qty → 過濾走 (唔會變 nan)", got == -0.001,
+                  f"got={got} — nan 會令報告印 'nan'")
+
+            # (j2) ⚠️ GLM R2 M1: 「有 entries 但全部讀唔到」= 唔知 → None,
+            #      唔可以回 0.0 (會低估佔用)。同 (i)「entries 空 = 未成交 → 0.0」唔同。
+            got = run({"active": {"side": "SELL",
+                                  "entries": [{"qty": float("nan")}, {"px": 1}]}})
+            check("有 entries 但全部 qty 讀唔到 → None (唔當 0 低估)",
+                  got is None, f"got={got}")
+
+            # (k) active 唔係 dict → None
+            got = run({"active": [1, 2]})
+            check("active 係 list → None", got is None, f"got={got}")
+
+            # (k2) GLM R3 M4: entries 唔係 list/tuple → None (唔好 TypeError 噪音)
+            got = run({"active": {"side": "SELL", "entries": 5}})
+            check("entries 係數字 → None (唔會 TypeError)", got is None, f"got={got}")
+            got = run({"active": {"side": "SELL", "entries": {"qty": 1}}})
+            check("entries 係 dict → None", got is None, f"got={got}")
+
+            # (l) 行為測試 _gap_attribution (取代 source-grep)
+            at = getattr(mod, "_gap_attribution", None)
+            if not callable(at):
+                check("有 _gap_attribution() (可行為測試)", False)
+            else:
+                check("有 _gap_attribution() (可行為測試)", True)
+                # 馬丁佔絕大多數 → 歸因馬丁
+                t1 = at(-0.0006, -0.00059)
+                check("gap≈馬丁 → 講『馬丁格爾佔用』", "馬丁格爾佔用" in t1, f"got={t1!r}")
+                # 馬丁佔極少 (實測個案) → 要講明比例
+                t2 = at(-0.29865, -0.00052)
+                check("gap≫馬丁 → 講『唔係馬丁』", "唔係馬丁" in t2, f"got={t2!r}")
+                check("  → 同時報比例 (0%)", "0%" in t2, f"got={t2!r}")
+                # ⚠️ GLM: 馬丁佔 90% 但絕對差 > 門檻 → 唔可以只講「唔係馬丁」誤導
+                t3 = at(-0.010, -0.0090)
+                check("馬丁佔 90% → 顯示 90% 而唔係只講『唔係』",
+                      "90%" in t3, f"got={t3!r}")
+                # mo=None → 歸因不明, 附排查提示
+                t4 = at(-0.3, None)
+                check("mo=None → 歸因不明 + 排查提示",
+                      "歸因不明" in t4 and "MART" in t4, f"got={t4!r}")
+                # gap=0 唔可以 ZeroDivisionError
+                try:
+                    t5 = at(0.0, 0.0)
+                    check("gap=0 → 唔會 ZeroDivisionError", True, f"got={t5!r}")
+                except Exception as e:
+                    check("gap=0 → 唔會 ZeroDivisionError", False, f"{type(e).__name__}")
+                # GLM R2 M2: mo 大過 gap / 符號相反 → frac 唔應該 >100%, 要明示
+                t6 = at(0.001, -0.002)
+                check("mo 方向相反 → 標明 (唔會顯示 200%)",
+                      "相反" in t6 and "200%" not in t6, f"got={t6!r}")
+                # GLM R3 M3: gap=0 但 mo 非零 → 唔可以出「佔 X (0%)」自相矛盾
+                t7 = at(0.0, -0.002)
+                check("gap=0 但 mo 非零 → 講唔對帳 (唔出 0%)",
+                      "唔對帳" in t7 and "(0%" not in t7, f"got={t7!r}")
+                t8 = at(0.0, 0.0001)
+                check("gap=0 且 mo≈0 → 正常講佔用", "馬丁格爾佔用" in t8, f"got={t8!r}")
+    finally:
+        # ⚠️ 一定要 finally: 中途 raise 會令 mod.MART 永久指住 tempfile,
+        #    之後用同一個 module 嘅測試全部讀到唔存在嘅檔案。
+        mod.MART = real_mart
+
+
 def main():
     print("=" * 76)
     print(f"cron branch guard 測試   CRON_DIR={CRON}")
@@ -686,7 +827,8 @@ def main():
     for fn in (test_parity, test_weekend_health, test_weekend_recovery,
                test_rebalance, test_martingale, test_syntax_and_interface,
                test_failsafe, test_lock, test_dual_report_import_purity,
-               test_pick_python, test_dual_report_martingale_robust):
+               test_pick_python, test_dual_report_martingale_robust,
+               test_mart_net_btc):
         try:
             fn()
         except Exception as e:

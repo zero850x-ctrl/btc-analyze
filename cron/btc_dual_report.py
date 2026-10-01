@@ -6,6 +6,7 @@
 靜默規則: 冇任何 active 倉 + 今日冇平倉 → print ⏳ 一句, 唔好太嘈.
 """
 import json
+import math
 import os
 import subprocess
 import sys
@@ -49,6 +50,107 @@ def _load_keys():
 
 def _signed_request(*a, **kw):
     return _bt()._signed_request(*a, **kw)
+
+
+def _mart_net_btc():
+    """馬丁 active chain 對共用帳戶 BTC 嘅**淨**佔用 (正 = 多咗 BTC)。
+
+    ⚠️ 2026-10-01 查帳時嘅關鍵發現: **完成咗嘅 chain 淨影響 ≈ 0**
+    (開倉買/賣幾多, 平倉就反向幾多, 只剩手續費), 所以只有 active chain
+    先真正佔用 BTC。之前報告寫「與實際帳戶差 −0.30003 BTC (馬丁格爾佔用)」
+    係錯嘅 —— 34 條完成 chain 累計 qty 0.047 BTC, 但佢哋開倉/平倉互相抵銷,
+    實際淨佔用係 0。真兇係 09-20~09-27 phantom 999001 事故殘餘 (99.3%)。
+
+    Spot 手續費由「收到嗰邊」資產扣 (買入扣 BTC), 所以完成 chain 嘅真實淨佔用
+    係 −Σfee_BTC 而唔係絕對 0 —— 量級 ~1e-5 BTC (34 條累計 ~7e-5), 遠低於
+    歸因門檻 5e-4, 唔影響結論。
+
+    本函數**信任 log 嘅 active 狀態**: log 話完成但實際未平倉 (部分成交 / 平倉
+    失敗) 嘅情況會被歸入「未對帳」殘餘, 唔會喺呢度反映。
+
+    回 None = 讀唔到 / 唔知方向 → caller 唔可以亂歸因。
+    """
+    try:
+        raw = json.load(open(MART)) or {}
+        if not isinstance(raw, dict):
+            return None
+        a = raw.get("active")
+        # 「冇 active chain」係**明確狀態** = 冇任何佔用 (0.0), 唔係「唔知」。
+        # (同「讀唔到 log」唔同 —— 後者才係 None。)
+        if not a:
+            return 0.0
+        if not isinstance(a, dict):
+            return None
+        # ⚠️ 唔可以「唔係 SELL 就當 BUY」。side 缺失 / "LONG" / 數字 都會靜靜
+        #    當 BUY → 符號反轉 → 報告將「賣走 BTC」講成「買入 BTC」。
+        #    呢個係 fail-*wrong*, 比 fail-safe 差得多 → 唔知方向就 return None。
+        #    (大小寫/空白唔同例如 "sell" / " SELL " 係可正常化嘅, 唔算「唔知」。)
+        side = str(a.get("side") or "").strip().upper()
+        if side not in ("BUY", "SELL"):
+            return None
+        q = 0.0
+        n_used = 0
+        raw_entries = a.get("entries")
+        # GLM R3 M4: entries 唔係 list/tuple 時 `for e in 5` 會 TypeError →
+        # 跌入外層 except → 印 stderr 噪音。呢個係「唔知」, 直接回 None 乾淨啲。
+        if raw_entries is None:
+            raw_entries = []
+        if not isinstance(raw_entries, (list, tuple)):
+            return None
+        for e in raw_entries:
+            if not isinstance(e, dict):
+                continue
+            v = e.get("qty")
+            # bool 係 int 嘅 subclass → 要明確排除; 字串 "0.001" 亦唔收
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            if not math.isfinite(v):      # nan / inf → 傳落去報告會印 "nan"
+                continue
+            q += v
+            n_used += 1
+        # ⚠️ 兩種「冇數」唔可以混:
+        #    entries 空 list   = 未成交, 明確冇佔用 → 0.0
+        #    有 entries 但全部讀唔到 = 唔知有幾多 → None (同「無法辨識 side」同一個原則)
+        #    GLM R2 M1 指出原本一律回 0.0 會低估佔用。
+        if n_used == 0:
+            return 0.0 if not raw_entries else None
+        return -q if side == "SELL" else q
+    except Exception as e:
+        # 唔可以全靜音 — log 路徑錯咗會令報告永遠顯示「歸因不明」而冇人知
+        print(f"  ⚠️ _mart_net_btc 讀唔到: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
+
+
+def _gap_attribution(gap, mo):
+    """帳本 vs 實際帳戶差額嘅歸因文字。
+
+    抽成獨立函數嘅原因: 原本 inline 喺 main() 入面, 只能夠用 source-grep 測
+    (「有冇『唔係馬丁』呢個字串」), 测唔到行為 —— 打錯分支邏輯都會 PASS。
+
+    mo=None → 讀唔到馬丁 log, 唔知方向, 唔可以亂認。
+    """
+    if mo is None:
+        return "馬丁 log 讀唔到 → 差額歸因不明 (檢查 MART log 路徑)"
+    tol = max(0.0005, abs(gap) * 0.05)
+    if gap == 0:
+        # GLM R3 M3: 帳本同帳戶完全對齊, 但馬丁 log 話有佔用 → 呢個本身就係矛盾,
+        # 唔可以照行落面出「佔 -0.002000 (0%)」咁自相矛盾嘅字。
+        if abs(mo) <= tol:
+            return f"馬丁格爾佔用 {mo:+.6f}"
+        return (f"帳本零差額但馬丁 log 話佔用 {mo:+.6f} → ⚠️ 唔對帳")
+    if abs(gap - mo) <= tol:
+        return f"馬丁格爾佔用 {mo:+.6f}"
+    # ⚠️ 一定要報比例: 馬丁佔 90% 但絕對差 > 門檻時, 只講「唔係馬丁」會誤導。
+    frac = abs(mo / gap) if gap else 0.0
+    # GLM R2 M2: frac 可以 >100% (gap 同 mo 符號相反 / mo 絕對值大過 gap) —
+    # 呢個本身就係「有嘢唔對帳」嘅信號, 唔應該收埋, 要明示。
+    if gap * mo < 0:
+        note = " ⚠️ 方向同差額相反"
+        frac = min(frac, 1.0)
+    else:
+        note, frac = "", min(frac, 1.0)
+    return (f"馬丁格爾佔 {mo:+.6f} ({frac:.0%}{note})｜其餘 {gap - mo:+.6f} "
+            f"唔係馬丁 (事故殘餘 / 未對帳)")
 
 
 def _qty_label(entries, usable):
@@ -202,7 +304,11 @@ def main():
                         ev_txt = "  ｜上次再平衡 ? (event 格式有問題)"
                 out.append(f"  ⚖️ 再平衡 60/40 (帳本): BTC {pct:.1f}% / {100 - pct:.1f}% USDT"
                            f" ｜偏離 {pct - 60:+.1f}% ｜總值 ${tot:,.0f}{ev_txt}")
-                out.append(f"     與實際帳戶差 {gap:+.6f} BTC (馬丁格爾佔用)")
+                # ⚠️ 唔可以一口咬定 gap = 馬丁佔用。2026-10-01 實測: gap −0.29865
+                # 之中馬丁只佔 −0.00052 (0.2%), 其餘 −0.29670 係 phantom 事故殘餘。
+                # 歸因邏輯抽做 _gap_attribution() 以便行為測試。
+                gap_txt = _gap_attribution(gap, _mart_net_btc())
+                out.append(f"     與實際帳戶差 {gap:+.6f} BTC — {gap_txt}")
     except Exception as e:
         out.append(f"  ⚖️ 再平衡: {e}")
 
