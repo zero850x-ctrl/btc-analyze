@@ -398,6 +398,15 @@ def test_lock():
     # 喺 production 機跑測試會同 live cron 爭鎖 (測試 timeout FAIL, 或者
     # cron 嘅落單/復原要等測試)。
     real_lock = getattr(mod, "_LOCK_PATH", None)
+    # ⚠️ 唔可以就咁當冇事: 若 module 冇 _LOCK_PATH (第日改名/重構),
+    #    下面 `mod._LOCK_PATH = tmp_lock` 只係**新造**一個 attribute,
+    #    _repo_lock 用嘅可能係另一個名嘅真 production 鎖 → 測試照樣 PASS
+    #    但根本冇 redirect 到, 而最後 `None == None` 亦會 PASS, 完全掩蓋問題。
+    if real_lock is None:
+        check("module 有 _LOCK_PATH (測試 redirect 嘅前提)", False,
+              "冇 _LOCK_PATH → redirect 唔到, 測試會假陽性")
+        return
+    check("module 有 _LOCK_PATH (測試 redirect 嘅前提)", True)
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_lock = os.path.join(tmp, "repo.lock")
@@ -502,7 +511,9 @@ def test_pick_python():
         return
     with tempfile.TemporaryDirectory() as tmp:
         rp = make_repo(os.path.join(tmp, "r"), "main", req_files(mod))
+        real_repo = getattr(mod, "REPO", None)
         mod.REPO = rp
+
         home = os.path.join(tmp, "home")
         os.makedirs(home, exist_ok=True)
 
@@ -548,6 +559,12 @@ def test_pick_python():
             got = mod.pick_python()
             new_cache = os.path.join(home, ".hermes", "reports", ".cron_python")
             check("正常揀到 interpreter", bool(got), f"got={got}")
+            if not got:
+                # ⚠️ 唔可以繼續行: 下面 open(legacy,"w").write(None) 會 TypeError,
+                #    炸咗成份 test function, 令之後嘅斷言全部跑唔到
+                check("（揀唔到 interpreter → 跳過 migration 檢查, 唔當 PASS）", False,
+                      "冇可用 interpreter — 唔可以當呢幾項 PASS")
+                return
             check("cache 唔會寫入 REPO (唔再污染 worktree)",
                   not os.path.exists(os.path.join(rp, ".cron_python")))
             check("cache 寫喺 ~/.hermes/reports (REPO 以外)", os.path.exists(new_cache),
@@ -568,6 +585,7 @@ def test_pick_python():
         finally:
             subprocess.run = real_run
             os.path.expanduser = real_expanduser
+            mod.REPO = real_repo          # 唔好污染之後用同一個 module 嘅測試
 
 
 # ── 11. dual_report: 馬丁段缺欄 / 壞 log 都唔可以炸報告 ─────────────
@@ -580,6 +598,12 @@ def test_dual_report_martingale_robust():
     mod = load_safe("btc_dual_report")
     if mod is None:
         return
+
+    # ⚠️ 唔可以靠「呢個係最後一個 test」保平安 — 第日有人加 test 喺後面就中招。
+    #    snapshot 全部會改嘅 module 全域, 最後還原。
+    _SAVED = {k: getattr(mod, k, None) for k in
+              ("MART", "ORDERS", "HIST", "PAUSED_MARKER", "HIST_MARKER",
+               "current_price", "branch_warning")}
 
     def run_with_mart(payload_text):
         """用指定嘅馬丁 log 內容跑 main(), 回傳 (output, raised)。"""
@@ -601,6 +625,16 @@ def test_dual_report_martingale_robust():
             except BaseException as e:
                 raised = e
             return buf.getvalue(), raised
+
+    try:
+        _run_mart_cases(mod, run_with_mart, _json)
+    finally:
+        for k, v in _SAVED.items():
+            setattr(mod, k, v)
+
+
+def _run_mart_cases(mod, run_with_mart, _json):
+    """【11】嘅實際斷言 — 抽出來令 module state 可以喺外面 finally 還原。"""
 
     # (a) 對照: 舊寫法喺呢啲資料上真係會爆 (證明 bug 真實, 唔係假想)
     entries = [{"qty": 0.001}]                       # 缺 px

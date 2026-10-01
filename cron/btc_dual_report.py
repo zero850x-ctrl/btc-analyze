@@ -51,6 +51,17 @@ def _signed_request(*a, **kw):
     return _bt()._signed_request(*a, **kw)
 
 
+def _qty_label(entries, usable):
+    """注數標籤 — 缺 qty/px 嘅注唔會計入浮動, 所以要標明口徑。
+
+    2026-10-01 GLM review LOW: 原本寫死 `({len(entries)}注)` 但浮動/avg 用
+    `usable` 計 → 有一注缺 px 時會顯示「(2注)」但浮動只計 1 注 = 誤導。
+    """
+    if len(usable) == len(entries):
+        return f"{len(entries)}注"
+    return f"{len(entries)}注/{len(usable)}可計"
+
+
 def branch_warning():
     """repo 唔喺 BRANCH_PIN → 回一句警告 (只讀 script: 唔修, 只提醒)。"""
     try:
@@ -181,9 +192,14 @@ def main():
                     raise RuntimeError(f"查帳戶失敗: {e}") from e
                 ev_txt = ""
                 if evs:
-                    d = _hkt(evs[-1].get("ts"))
-                    ev_txt = (f"  ｜上次再平衡 {d.strftime('%m-%d') if d else '?'} "
-                              f"{evs[-1].get('action')}")
+                    # 2026-10-01 GLM review LOW: _hkt 之前冇包 — 最後一個 event
+                    # 缺 ts / 格式奇怪會爆, 跌入外層 except 出 raw TypeError。
+                    try:
+                        d = _hkt(evs[-1].get("ts"))
+                        ev_txt = (f"  ｜上次再平衡 {d.strftime('%m-%d') if d else '?'} "
+                                  f"{evs[-1].get('action')}")
+                    except Exception:
+                        ev_txt = "  ｜上次再平衡 ? (event 格式有問題)"
                 out.append(f"  ⚖️ 再平衡 60/40 (帳本): BTC {pct:.1f}% / {100 - pct:.1f}% USDT"
                            f" ｜偏離 {pct - 60:+.1f}% ｜總值 ${tot:,.0f}{ev_txt}")
                 out.append(f"     與實際帳戶差 {gap:+.6f} BTC (馬丁格爾佔用)")
@@ -196,11 +212,13 @@ def main():
     # log 欄位一缺 (舊版本寫落嘅 chain、人手改過) 就 KeyError →
     # **成個報告 crash**, 連主系統嗰段都出唔到。只讀 script 唔影響落單,
     # 但報告本身就係佢存在嘅意義 → 一定要出得到。
+    log_ok = True
     try:
         try:
             m = json.load(open(MART))
         except Exception as e:
             m = {}
+            log_ok = False
             out.append(f"  ⚠️ 馬丁 log 讀唔到: {e}")
         a = m.get("active")
         if a:
@@ -220,7 +238,8 @@ def main():
                 fl_txt = f"avg {avg:,.0f}"
             out.append(f"  🔵 馬丁: chain {a.get('id', '?')} {a.get('side', '?')} "
                        f"level {a.get('level', '?')} "
-                       f"({len(entries)}注) {fl_txt} 目標 +${a.get('target_usd')}")
+                       f"({_qty_label(entries, usable)}) {fl_txt} "
+                       f"目標 +${a.get('target_usd')}")
             opened = a.get("opened")
             t_open = _hkt(opened) if opened else None
             if t_open:
@@ -229,13 +248,16 @@ def main():
                 held = "已掛 ? (log 冇 opened 欄)"
             out.append(f"     開倉 {str(opened or '?')[:16]}Z {held}")
         else:
-            out.append("  💤 馬丁: 無 active chain")
+            # 讀唔到 log ≠ 冇 chain — 唔好兩句並存令人以為真係冇倉
+            if log_ok:
+                out.append("  💤 馬丁: 無 active chain")
         dly = m.get("daily") or {}
         dd = dly.get(today) or {}
-        out.append(f"     今日 {dd.get('wins',0)}W/{dd.get('losses',0)}L "
-                   f"蝕${(dd.get('loss_usd') or 0):.2f} ｜ "
-                   f"累計 {sum(d.get('wins',0) for d in dly.values())}W/"
-                   f"{sum(d.get('losses',0) for d in dly.values())}L")
+        if log_ok:
+            out.append(f"     今日 {dd.get('wins',0)}W/{dd.get('losses',0)}L "
+                       f"蝕${(dd.get('loss_usd') or 0):.2f} ｜ "
+                       f"累計 {sum(d.get('wins',0) for d in dly.values())}W/"
+                       f"{sum(d.get('losses',0) for d in dly.values())}L")
     except Exception as e:
         # 報告永遠要出得到 — 馬丁段爆都要出主系統嗰段
         out.append(f"  ⚠️ 馬丁段計唔到 ({type(e).__name__}: {e})")
