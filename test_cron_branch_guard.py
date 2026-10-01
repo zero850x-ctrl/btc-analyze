@@ -677,6 +677,71 @@ def _run_mart_cases(mod, run_with_mart, _json):
         check(f"  ({label}) 報告有輸出 (唔會空白)", bool(o.strip()), f"out={o!r}")
 
 
+def test_mart_net_btc():
+    """【12】_mart_net_btc — 淨佔用計算 + gap 歸因唔可以亂認。**
+
+    2026-10-01 實際 bug: 報告寫「與實際帳戶差 −0.30003 BTC (馬丁格爾佔用)」,
+    但實際上馬丁只佔 −0.00052 (0.2%), 其餘 99.3% 係 phantom 事故殘餘。
+    根因: **完成咗嘅 chain 淨佔用 = 0** (開倉同平倉互相抵銷), 只有 active
+    chain 先真正佔用 —— 之前嘅寫法當咗「累計 qty = 佔用」, 完全錯。
+    """
+    print("\n【12】_mart_net_btc — 淨佔用 + gap 歸因")
+    import json as _json
+    mod = load_safe("btc_dual_report")
+    if mod is None or not callable(getattr(mod, "_mart_net_btc", None)):
+        check("有 _mart_net_btc()", False, "唔存在 → gap 歸因唔會準")
+        return
+    check("有 _mart_net_btc()", True)
+
+    real_mart = getattr(mod, "MART", None)
+    with tempfile.TemporaryDirectory() as tmp:
+        mp = os.path.join(tmp, "m.json")
+        mod.MART = mp
+
+        def run(payload):
+            with open(mp, "w") as f:
+                f.write(payload if isinstance(payload, str) else _json.dumps(payload))
+            return mod._mart_net_btc()
+
+        # (a) 冇 active → 0
+        check("冇 active → 0.0", run({"chains": [{"qty": 9}]}) == 0.0,
+              "冇 active 唔應該有任何佔用")
+
+        # (b) SELL chain → 賣出 BTC → 負數
+        got = run({"active": {"side": "SELL",
+                              "entries": [{"qty": 0.00017}, {"qty": 0.00035}]}})
+        check("SELL active → 負 (賣走 BTC)", abs(got + 0.00052) < 1e-9, f"got={got}")
+
+        # (c) BUY chain → 正數
+        got = run({"active": {"side": "BUY", "entries": [{"qty": 0.001}]}})
+        check("BUY active → 正 (買入 BTC)", abs(got - 0.001) < 1e-9, f"got={got}")
+
+        # (d) ⚠️ 核心: chains[] 有大量 qty 但 active 為空 → 佔用仍然係 0
+        got = run({"active": None,
+                   "chains": [{"side": "SELL", "state": "LOSS",
+                               "entries": [{"qty": 0.0027}]} for _ in range(13)]})
+        check("完成 chain 唔算佔用 (開倉/平倉抵銷 → 0)", got == 0.0,
+              f"got={got}  ← 呢個就係原本嘅 bug")
+
+        # (e) 壞 JSON → None (唔可以亂歸因)
+        with open(mp, "w") as f:
+            f.write("{壞")
+        check("壞 JSON → None (唔亂歸因)", mod._mart_net_btc() is None)
+
+        # (f) 缺 qty → 唔會 crash
+        got = run({"active": {"side": "SELL", "entries": [{"px": 1}, {"qty": 0.5}]}})
+        check("缺 qty → 唔 crash", got is not None, f"got={got}")
+
+        # (g) 歸因邏輯: gap 遠大於馬丁 → 一定要講「唔係馬丁」
+        src = open(os.path.join(CRON, "btc_dual_report.py")).read()
+        check("gap 歸因有「唔係馬丁」分支 (唔會一口咬定)",
+              "唔係馬丁" in src, "原本寫死 (馬丁格爾佔用)")
+        check("gap 歸因讀 _mart_net_btc()", "_mart_net_btc()" in src)
+        check("_mart_net_btc 讀唔到時唔亂歸因", "歸因不明" in src)
+
+    mod.MART = real_mart
+
+
 def main():
     print("=" * 76)
     print(f"cron branch guard 測試   CRON_DIR={CRON}")
@@ -686,7 +751,8 @@ def main():
     for fn in (test_parity, test_weekend_health, test_weekend_recovery,
                test_rebalance, test_martingale, test_syntax_and_interface,
                test_failsafe, test_lock, test_dual_report_import_purity,
-               test_pick_python, test_dual_report_martingale_robust):
+               test_pick_python, test_dual_report_martingale_robust,
+               test_mart_net_btc):
         try:
             fn()
         except Exception as e:

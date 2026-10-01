@@ -51,6 +51,28 @@ def _signed_request(*a, **kw):
     return _bt()._signed_request(*a, **kw)
 
 
+def _mart_net_btc():
+    """馬丁 active chain 對共用帳戶 BTC 嘅**淨**佔用 (正 = 多咗 BTC)。
+
+    ⚠️ 2026-10-01 查帳時嘅關鍵發現: **完成咗嘅 chain 淨影響 ≈ 0**
+    (開倉買/賣幾多, 平倉就反向幾多, 只剩手續費), 所以只有 active chain
+    先真正佔用 BTC。之前報告寫「與實際帳戶差 −0.30003 BTC (馬丁格爾佔用)」
+    係錯嘅 —— 34 條完成 chain 累計 qty 0.047 BTC, 但佢哋開倉/平倉互相抵銷,
+    實際淨佔用係 0。真兇係 09-20~09-27 phantom 999001 事故殘餘 (99.3%)。
+
+    回 None = 讀唔到 → 叫 caller 唔好亂歸因。
+    """
+    try:
+        a = (json.load(open(MART)) or {}).get("active") or {}
+        entries = [e for e in (a.get("entries") or []) if isinstance(e, dict)]
+        q = sum((e.get("qty") or 0) for e in entries)
+        if not q:
+            return 0.0
+        return -q if a.get("side") == "SELL" else q
+    except Exception:
+        return None
+
+
 def _qty_label(entries, usable):
     """注數標籤 — 缺 qty/px 嘅注唔會計入浮動, 所以要標明口徑。
 
@@ -202,7 +224,17 @@ def main():
                         ev_txt = "  ｜上次再平衡 ? (event 格式有問題)"
                 out.append(f"  ⚖️ 再平衡 60/40 (帳本): BTC {pct:.1f}% / {100 - pct:.1f}% USDT"
                            f" ｜偏離 {pct - 60:+.1f}% ｜總值 ${tot:,.0f}{ev_txt}")
-                out.append(f"     與實際帳戶差 {gap:+.6f} BTC (馬丁格爾佔用)")
+                # ⚠️ 唔可以一口咬定 gap = 馬丁佔用。2026-10-01 實測: gap −0.29865
+                # 之中馬丁只佔 −0.00052 (0.2%), 其餘 −0.29670 係 phantom 事故殘餘。
+                mo = _mart_net_btc()
+                if mo is None:
+                    why = "馬丁 log 讀唔到 → 差額歸因不明"
+                elif abs(gap - mo) <= max(0.0005, abs(gap) * 0.05):
+                    why = f"馬丁格爾佔用 {mo:+.6f}"
+                else:
+                    why = (f"馬丁格爾只佔 {mo:+.6f}｜其餘 {gap - mo:+.6f} "
+                           f"**唔係馬丁** (事故殘餘 / 未對帳)")
+                out.append(f"     與實際帳戶差 {gap:+.6f} BTC — {why}")
     except Exception as e:
         out.append(f"  ⚖️ 再平衡: {e}")
 
