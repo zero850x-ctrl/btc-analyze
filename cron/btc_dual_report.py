@@ -180,10 +180,14 @@ HKT = timezone(timedelta(hours=8))
 ORDERS = os.path.expanduser("~/.hermes/reports/btc_testnet_orders.json")
 HIST = os.path.expanduser("~/.hermes/reports/btc_testnet_closed_trades.json")
 MART = os.path.expanduser("~/.hermes/reports/btc_martingale_log.json")
-PAUSED_MARKER = os.path.expanduser("~/.hermes/reports/btc_main_system_paused.txt")
-# ⚠️ 呢個係停用標記嘅路徑, single source of truth 喺 `btc_pause.MARKER_PATH`。
-#    呢度刻意寫 literal (報告唔想因為 repo 載入失敗就連標記都睇唔到),
-#    靠 test_btc_pause_gate.py 嘅相等斷言綁住兩邊 —— 改咗一邊而冇改另一邊會 FAIL。
+PAUSED_MARKER = os.path.expanduser(
+    os.environ.get("BTC_PAUSE_MARKER") or "~/.hermes/reports/btc_main_system_paused.txt")
+# ⚠️ 同上。呢個係停用標記嘅路徑, single source of truth 喺 `btc_pause.MARKER_PATH`。
+#    呢度刻意寫 literal + 自己 honor `BTC_PAUSE_MARKER` (報告唔想因為 repo 載入
+#    失敗就連標記都睇唔到), 靠 test_btc_pause_gate.py 嘅相等斷言綁住兩邊 ——
+#    改咗一邊而冇改另一邊會 FAIL。
+#    ⚠️ 兩邊都讀 env 係刻意嘅: 否則用 env 改咗路徑, 報告嘅「標記存在」分支
+#       同 gate 結果會講兩回事 (2026-10-01 GLM review 指出)。
 HIST_MARKER = os.path.expanduser("~/.hermes/reports/btc_main_system_history.txt")
 
 

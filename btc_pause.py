@@ -72,6 +72,11 @@
 CLI (運維用):
     python3 btc_pause.py            # 印狀態 + exit code (0=照跑, 10=已停用)
     BTC_PAUSE_MARKER=/tmp/x python3 btc_pause.py
+
+⚠️ **恢復（重新開新倉）= 刪除 marker 檔。**
+   本 module 只認「檔案存在與否」, **冇**「內容寫 resume」呢條路 ——
+   避免「檔在但係話可以跑」嘅矛盾狀態。按設計要求, 重開要有記錄:
+   刪檔前請更新 `btc_main_system_history.txt` 加一行 (日期 + 依據)。
 """
 import os
 import sys
