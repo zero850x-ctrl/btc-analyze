@@ -21,24 +21,42 @@
 嘅路徑。停用期間唔跑 = 一旦有倉未平就會**冇人管**, 風險比唔停用更大。
 (2026-10-01: 當時 0 live 倉, 所以今日兩者等價; 但唔可以因此寫成「全部唔跑」。)
 
+⚠️ **「讀唔到標記」(uncertain) 都一樣照跑 reconcile。**
+2026-10-01 GLM review 捉到原本設計方向反咗: 原本 uncertain 連 reconcile 都跳,
+但「讀唔到 marker」同「知唔知有冇倉」完全無關 —— 佢唔會令 reconcile 變得唔安全
+(reconcile 唔開新倉)。停用唔確定 ≠ 管理現有倉唔安全。
+所以 uncertain = **同「已停用」一樣嘅行為, 只係大聲出聲**。
+
 ─────────────── Fail-safe 方向 ───────────────
-- 標記載明「已停用」→ 停 (paused=True, certain=True) → 常規訊息, 靜默
-- 標記唔存在 → 照跑 (paused=False)
-- **讀取標記出錯 (OSError) → 當停用 + 大聲講** (paused=True, certain=False)
+- 標記載明「已停用」→ 停落單 (paused=True, certain=True) → 常規訊息, 靜默
+- 標記唔存在 → 照跑 (paused=False, certain=True)
+- **讀取標記出錯 (OSError) → 停落單 + 大聲講** (paused=True, certain=False)
 
 最後一項係刻意嘅: 呢個 marker 係「opt-out」檔。讀唔到 = 唔知有冇被停用。
-喺唔知嘅情況下**落單**係風險行為, 唔落單唔係 → 所以 fail-closed, 而且
-`certain=False` 會令呼叫者出聲 (唔可以靜靜地永遠唔交易)。
+喺唔知嘅情況下**開新倉**係風險行為 → 所以 block 落單, 而且 `certain=False`
+會令呼叫者**出聲** (唔可以靜靜地永遠唔交易)。
+
+⚠️ fail-closed 只 apply 喺**有風險嘅動作 (開新倉)** 度, 唔係一刀切乜都唔做。
+
+─────────────── 靜默 vs 出聲 (唔好改 emoji) ───────────────
+`⏸️` (常規停用) **唔喺** cron wrapper 嘅 `NOTABLE_KEYS` → 每 15 分鐘 tick 靜默;
+`⚠️` (唔確定) **喺** → 推 Telegram。
+兩條不變式由 `test_btc_pause_gate.py` 釘住 —— 調亂 = 半夜 spam 或者靜默事故。
+
+⚠️ 因此 `check()` **刻意唔會**將 marker 檔內容注入訊息。marker 第一行係人手
+自由文本 (例如有人寫「❌ 唔好再開倉」), 一旦注入就會經 substring 過濾推 TG,
+令 anti-spam 設計靜靜雞失效。訊息只帶固定文字 + 路徑, 詳情叫人去睇 marker 檔。
 
 ─────────────── 用法 ───────────────
     from btc_pause import check
     paused, reason, certain = check()
-    if paused and not certain:
-        log(reason)          # 唔確定 → 一定要出聲
-        return
+    if not certain:              # 唔確定 → 一定要出聲 (⚠️ 會經 wrapper 推 TG)
+        log(reason)
+    ...
+    block_trading = paused or not certain    # fail-closed 寫明, 唔好靠隱含 invariant
     ...
     if paused:
-        log(reason)          # 常規停用 → 唔需要每次都推 TG
+        log(reason)              # 常規停用 → ⏸️ 靜默, 唔使每次推 TG
         return
 
 CLI (運維用):
@@ -85,17 +103,14 @@ def check(marker=None):
                 f"{type(e).__name__}: {e} — 無法確認, 為安全起見當停用",
                 False)
 
-    # 標記存在 → 停用。順手抽一句 header 令訊息有上下文 (讀唔到都唔算錯)
-    detail = ""
-    try:
-        with open(path, encoding="utf-8") as f:
-            head = f.readline().strip()
-        if head:
-            detail = f" ({head[:80]})"
-    except OSError:
-        pass
+    # 標記存在 → 停用。
+    # ⚠️ 刻意**唔**注入 marker 檔內容: 「靜默/出聲」係靠 log line substring
+    #    過濾 (wrapper NOTABLE_KEYS)。marker 第一行係人手自由文本, 有人寫
+    #    「❌ 唔好再開倉」就會經嗰個 filter 每 15 分鐘推 TG —— anti-spam
+    #    設計靜靜雞失效。而且咁樣 sanitize 都唔夠 ("FLATTENED" 係普通 \w 字)。
+    #    所以訊息只帶固定文字 + 路徑。
     return (True,
-            f"{PAUSED_EMOJI} 主系統已停用標記中{detail} — 跳過開新倉",
+            f"{PAUSED_EMOJI} 主系統已停用標記中（{path}）— 跳過開新倉",
             True)
 
 

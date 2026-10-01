@@ -698,14 +698,15 @@ def main():
     from binance_testnet_paper import _load_keys
 
     # 0. 停用硬閘 (2026-10-01)
-    #    呢個係**唯一**落新單嘅路徑 (step 3), 所以閘擺呢度就夠 cover cron + 手動。
-    #    ⚠️ 唔確定 (讀唔到 marker) 會 fail-safe 連 reconcile 都唔跑 ——
-    #       連「有冇倉」都講唔準嘅話, 落任何單都係錯。
-    #    閘擺喺 `_load_keys()` **之前**: 停用期間唔應該掂 credentials。
+    #    呢個係**唯一**落新單嘅路徑 (step 3)。
+    #    `block_trading` 寫明 `paused or not certain` —— fail-closed 唔靠
+    #    check() 嘅隱含 invariant (將來如果有人改到回 (False,"",False),
+    #    呢行仍然會擋, 唔會 fail-open)。
     paused, pause_reason, pause_certain = _pause_check()
-    if paused and not pause_certain:
+    block_trading = paused or not pause_certain
+    if not pause_certain:
+        # ⚠️ 唔確定 → 一定要出聲 (⚠️ 喺 wrapper NOTABLE_KEYS → 推 TG)
         log(pause_reason)
-        return
 
     key, secret = _load_keys()
     if not key or not secret:
@@ -715,6 +716,9 @@ def main():
     # 1. reconcile
     #    ⚠️ 停用期間**照跑**: 佢係管理/平掉**現有**倉 (exit leg / trailing /
     #       breakeven) 嘅唯一路徑。停用 = 唔開新倉, 唔係「唔理已開嘅倉」。
+    #    2026-10-01 GLM review 修正: 原本「唔確定」連 reconcile 都跳 —— 方向反咗。
+    #    「讀唔到 marker」同「知唔知有冇倉」無關, 唔會令 reconcile 變唔安全
+    #    (reconcile 唔開新倉)。停用唔確定 ≠ 管理現有倉唔安全。
     closed, wiped = reconcile_cycle(key, secret)
     for c in closed:
         st = c.get("status")
@@ -738,14 +742,14 @@ def main():
             f"(testnet 帳戶重置 — 終態 WIPED, 唔計入 sumR, cap 已釋放)")
 
     # 0b. 停用 → 喺呢度收工: 已經跑完 reconcile (管理現有倉), 但**唔開新倉**。
-    #     訊息用 "⏸️" 而唔係 "⚠️"/"❌" —— 常規停用每 15 分鐘出現一次,
-    #     落 cron wrapper 嘅 NOTABLE_KEYS 會變 TG spam。用 "⏸️" 走靜默,
-    #     狀態由 btc_dual_report 每日 4 次報。
-    if paused:
+    #     ⚠️ 只在 certain 時出「⏸️」—— 唔確定時上面已經出過「⚠️」,
+    #        唔需要出兩次。亦因為 "⏸️" 唔喺 NOTABLE_KEYS → 常規停用係靜默,
+    #        唔會每 15 分鐘 spam TG (狀態由 btc_dual_report 每日 4 次報)。
+    if paused and pause_certain:
         log(f"{pause_reason}（reconcile 照跑, 統計照出）")
 
-    # 2. 引擎掃描 —— ⛔ 停用期間跳過 (連帶跳過 step 3 落單)
-    if not paused:
+    # 2. 引擎掃描 —— ⛔ 停用/狀態不明期間跳過 (連帶跳過 step 3 落單)
+    if not block_trading:
         out = sh("python3 btc_engine.py 2>&1 | tail -30")
         if "Trade Setups" not in out:
             log(f"⚠️ 引擎冇 setups (可能數據問題): {out[-120:]}")

@@ -1130,6 +1130,22 @@ def main():
         return
 
     # 主流程: 引擎訊號 → 落單
+    # ⚠️ 停用硬閘 (2026-10-01) — defense in depth。
+    #    `btc_auto_trade_cycle.main()` 已經擋咗呢條路, 但呢個 script 有自己嘅
+    #    CLI entry, 直接 `python3 binance_testnet_paper.py` 會完全繞過 cycle 嘅閘。
+    #    所以真正落單嘅入口自己都要驗一次。
+    #    只擋「落新單」路徑 —— 上面 --status / --cancel-all / --reconcile 早退,
+    #    診斷同對帳唔受影響。
+    try:
+        import btc_pause
+        _paused, _why, _certain = btc_pause.check()
+    except Exception as _e:                 # noqa: BLE001 — 載唔到 = 唔知, 當停用
+        print(f"⛔ 停用硬閘無法確認 ({type(_e).__name__}: {_e}) — 為安全起見唔落單")
+        return
+    if _paused or not _certain:
+        print(f"⛔ {_why} — 唔落單（--status / --reconcile 仍然可用）")
+        return
+
     json_path = os.path.join(REPO, "btc_last_analysis.json")
     if not os.path.exists(json_path):
         print("⚠️ 冇 btc_last_analysis.json — 先跑 python3 btc_engine.py")

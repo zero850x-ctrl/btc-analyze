@@ -201,9 +201,12 @@ def _hkt(iso):
 def _pause_gate_status():
     """回 (enforced: bool, msg: str) — 停用硬閘係唔係**真**裝好。
 
-    ⚠️ 報告唔可以見到 marker 存在就寫「已封住落單」—— 要真驗過
-    `btc_pause` 喺 repo 載得到 + 標記讀得到。否則就會出現「報告講封咗、
-    實際冇封」嘅 fail-wrong (同 PR#10 個 `side` 符號反轉係同一類錯)。
+    ⚠️ 報告唔可以見到 marker 存在就寫「已封住」—— 要真驗過。否則就會出現
+    「報告講封咗、實際冇封」嘅 fail-wrong (同 PR#10 個 `side` 符號反轉同類)。
+
+    只聲明**真驗過**嘅嘢: btc_pause 載得到 + 標記讀得到 + paused。
+    ⚠️ 唔聲明「btc_auto_trade_cycle 一定會 call 佢」—— 驗唔到就唔講
+    (2026-10-01 GLM review: 與其用 source-grep 假驗證, 不如收窄聲明)。
     """
     if BTC_REPO not in sys.path:
         sys.path.insert(0, BTC_REPO)
@@ -213,14 +216,22 @@ def _pause_gate_status():
         return False, (f"     ⚠️ 停用硬閘**未生效**: 載入 btc_pause 失敗 "
                        f"({type(e).__name__}: {e}) — 落單路徑可能仍然開通")
     try:
-        _, _, certain = btc_pause.check()
+        paused, _, certain = btc_pause.check()
     except Exception as e:
         return False, (f"     ⚠️ 停用硬閘**未生效**: btc_pause.check() 出錯 "
                        f"({type(e).__name__}: {e})")
     if not certain:
         return False, ("     ⚠️ 停用標記讀唔到 → 硬閘會 fail-safe 擋落單 "
                        "（check 標記檔權限）")
-    return True, "     ⛔ 落單路徑已硬閘封住（cycle step 2/3 跳過；reconcile 照跑）"
+    if not paused:
+        # ⚠️ 2026-10-01 GLM review 捉到: 原本只睇 certain, 丟咗 paused。
+        #    marker 可以喺 main() 嘅 os.path.exists() 同呢次 check() 之間被刪,
+        #    或者兩邊 expanduser 後路徑唔一致 → check() 回 (False,...,True)
+        #    → 舊寫法會報「已封住」, 但實際閘全開、系統照落單。
+        return False, ("     ⚠️ 停用硬閘**未生效**: btc_pause 顯示系統**未**停用 "
+                       "（標記可能已刪／路徑唔一致）")
+    return True, ("     ⛔ 停用有效（btc_pause 在位 + 標記讀得到）"
+                  "— 落單入口會跳過")
 
 
 def main():
