@@ -21,7 +21,9 @@ OUT_DIR = os.path.expanduser("~/.hermes/reports")
 
 def fetch(interval="30m", days=540, symbol="BTCUSDT"):
     """分頁拎 K 線. Binance 每次上限 1000 根."""
-    ms_per_bar = {"30m": 30 * 60_000, "1h": 3_600_000, "15m": 15 * 60_000}[interval]
+    ms_per_bar = {"15m": 15 * 60_000, "30m": 30 * 60_000, "1h": 3_600_000,
+                  "2h": 2 * 3_600_000, "4h": 4 * 3_600_000, "6h": 6 * 3_600_000,
+                  "12h": 12 * 3_600_000, "1d": 86_400_000}[interval]
     end = int(time.time() * 1000)
     start = end - days * 86_400_000
     rows, cur = [], start
