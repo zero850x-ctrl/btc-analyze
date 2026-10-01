@@ -694,13 +694,33 @@ def reconcile_cycle(key, secret):
 
 
 def main():
+    from btc_pause import check as _pause_check
     from binance_testnet_paper import _load_keys
+
+    # 0. 停用硬閘 (2026-10-01)
+    #    呢個係**唯一**落新單嘅路徑 (step 3)。
+    #    `block_trading` 寫明 `paused or not certain` —— fail-closed 唔靠
+    #    check() 嘅隱含 invariant (將來如果有人改到回 (False,"",False),
+    #    呢行仍然會擋, 唔會 fail-open)。
+    paused, pause_reason, pause_certain = _pause_check()
+    block_trading = paused or not pause_certain
+    if not pause_certain:
+        # ⚠️ 唔確定 → 一定要出聲 (⚠️ 喺 wrapper NOTABLE_KEYS → 推 TG)
+        # `or ...` 防禦: 將來若 check() 回一個空 reason, 唔可以 log 出一行空白
+        log(pause_reason or
+            "⚠️ 停用狀態不明（btc_pause 冇提供理由）— 為安全起見唔開新倉")
+
     key, secret = _load_keys()
     if not key or not secret:
         log("❌ 冇 testnet keys")
         return
 
     # 1. reconcile
+    #    ⚠️ 停用期間**照跑**: 佢係管理/平掉**現有**倉 (exit leg / trailing /
+    #       breakeven) 嘅唯一路徑。停用 = 唔開新倉, 唔係「唔理已開嘅倉」。
+    #    2026-10-01 GLM review 修正: 原本「唔確定」連 reconcile 都跳 —— 方向反咗。
+    #    「讀唔到 marker」同「知唔知有冇倉」無關, 唔會令 reconcile 變唔安全
+    #    (reconcile 唔開新倉)。停用唔確定 ≠ 管理現有倉唔安全。
     closed, wiped = reconcile_cycle(key, secret)
     for c in closed:
         st = c.get("status")
@@ -723,19 +743,27 @@ def main():
             f"entry={w.get('entry_fill')} remaining={w.get('wiped_remaining_qty')} "
             f"(testnet 帳戶重置 — 終態 WIPED, 唔計入 sumR, cap 已釋放)")
 
-    # 2. 引擎掃描
-    out = sh("python3 btc_engine.py 2>&1 | tail -30")
-    if "Trade Setups" not in out:
-        log(f"⚠️ 引擎冇 setups (可能數據問題): {out[-120:]}")
-        return
+    # 0b. 停用 → 喺呢度收工: 已經跑完 reconcile (管理現有倉), 但**唔開新倉**。
+    #     ⚠️ 只在 certain 時出「⏸️」—— 唔確定時上面已經出過「⚠️」,
+    #        唔需要出兩次。亦因為 "⏸️" 唔喺 NOTABLE_KEYS → 常規停用係靜默,
+    #        唔會每 15 分鐘 spam TG (狀態由 btc_dual_report 每日 4 次報)。
+    if paused and pause_certain:
+        log(f"{pause_reason}（reconcile 照跑, 統計照出）")
 
-    # 3. 落單 (dedup + 風控內建)
-    out2 = sh("python3 binance_testnet_paper.py 2>&1 | tail -10")
-    if out2.strip():
-        log(f"掃描結果: {out2.strip().splitlines()[-1]}")
-    for line in out2.splitlines():
-        if any(k in line for k in ("✅", "🚫", "❌", "[DRY]", "📌", "⚠️")):
-            log(line.strip())
+    # 2. 引擎掃描 —— ⛔ 停用/狀態不明期間跳過 (連帶跳過 step 3 落單)
+    if not block_trading:
+        out = sh("python3 btc_engine.py 2>&1 | tail -30")
+        if "Trade Setups" not in out:
+            log(f"⚠️ 引擎冇 setups (可能數據問題): {out[-120:]}")
+            return
+
+        # 3. 落單 (dedup + 風控內建)
+        out2 = sh("python3 binance_testnet_paper.py 2>&1 | tail -10")
+        if out2.strip():
+            log(f"掃描結果: {out2.strip().splitlines()[-1]}")
+        for line in out2.splitlines():
+            if any(k in line for k in ("✅", "🚫", "❌", "[DRY]", "📌", "⚠️")):
+                log(line.strip())
 
     # 4. 每日統計
     if closed:

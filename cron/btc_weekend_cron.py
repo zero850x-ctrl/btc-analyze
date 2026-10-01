@@ -142,7 +142,10 @@ def in_window():
 
 
 REQUIRED_FILES = ("btc_auto_trade_cycle.py", "btc_engine.py",
-                  "binance_testnet_paper.py", "analyze_v3.py")
+                  "binance_testnet_paper.py", "analyze_v3.py",
+                  # 2026-10-01: 停用硬閘 module。缺咗嘅話落單路徑會 ImportError
+                  # (會出 ❌ 但係 crash 而唔係自動復原) → 當必需檔一齊驗。
+                  "btc_pause.py")
 
 
 def _repo_env():
