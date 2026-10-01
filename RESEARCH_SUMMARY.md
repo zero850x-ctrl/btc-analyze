@@ -177,3 +177,28 @@ M30/H4/D1 三個週期、11 個資產 — **全部唔係冇 alpha 就係 beta**�
 `pooled_validation.py`、`longshort_decomp.py`、`equity_sim.py`、`common_period_check.py`、
 `strategy_sweep.py`、`sweep_design.py` + 單元測試 (`test_pattern_detector.py` 26/26、
 `test_sweep_sim.py` 12/12 全 PASS)
+
+---
+
+## 7. ⚠️ 收檔時發現嘅 cron 風險（未修，需確認）
+
+4 個 BTC cron script 共用同一個 repo path（`~/repos/btc-analyze`），但 BRANCH_PIN 唔一致：
+
+| script | BRANCH_PIN |
+|---|---|
+| `btc_weekend_cron.py`（落單） | `main` ✅ |
+| `btc_rebalance_cron.py`（再平衡） | **`fix/btc-exit-symmetry`** ⚠️ 落後 main **7 commits** |
+| `btc_martingale_cron.py` | （無 pin，用現狀） |
+| `btc_dual_report.py` | （無 pin，用現狀） |
+
+**風險鏈**：repo 損壞時（macOS clean-tmps 有清過檔嘅先例）→ 邊個 cron 先撞到就由佢復原：
+若 rebalance 先 → `git clone -b fix/btc-exit-symmetry` 落**共用** path →
+repo 變成落後 7 commits、**缺少 PR#7 phantom-sell 修復**
+（`binance_testnet_paper.py` 少 222 行、`btc_auto_trade_cycle.py` 少 202 行）→
+之後落單 cron 嘅 `_repo_healthy()` **只檢查檔案存在 + HEAD 可解析，唔檢查 branch** →
+當佢健康 → **靜默跑舊 code 落單**。
+
+**現時未觸發**（repo 實際喺 `main` @ `17f2adf`，clean），屬**潛在**風險。
+建議修法（需用戶確認才做，因涉及 cron）：
+把 `btc_rebalance_cron.py` 嘅 BRANCH_PIN 改為 `main`，
+並在 `_repo_healthy()` 加 `git rev-parse --abbrev-ref HEAD == "main"` 驗證。
