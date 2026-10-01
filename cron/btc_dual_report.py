@@ -181,6 +181,9 @@ ORDERS = os.path.expanduser("~/.hermes/reports/btc_testnet_orders.json")
 HIST = os.path.expanduser("~/.hermes/reports/btc_testnet_closed_trades.json")
 MART = os.path.expanduser("~/.hermes/reports/btc_martingale_log.json")
 PAUSED_MARKER = os.path.expanduser("~/.hermes/reports/btc_main_system_paused.txt")
+# ⚠️ 呢個係停用標記嘅路徑, single source of truth 喺 `btc_pause.MARKER_PATH`。
+#    呢度刻意寫 literal (報告唔想因為 repo 載入失敗就連標記都睇唔到),
+#    靠 test_btc_pause_gate.py 嘅相等斷言綁住兩邊 —— 改咗一邊而冇改另一邊會 FAIL。
 HIST_MARKER = os.path.expanduser("~/.hermes/reports/btc_main_system_history.txt")
 
 
@@ -193,6 +196,31 @@ def _hkt(iso):
         return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(HKT)
     except Exception:
         return None
+
+
+def _pause_gate_status():
+    """回 (enforced: bool, msg: str) — 停用硬閘係唔係**真**裝好。
+
+    ⚠️ 報告唔可以見到 marker 存在就寫「已封住落單」—— 要真驗過
+    `btc_pause` 喺 repo 載得到 + 標記讀得到。否則就會出現「報告講封咗、
+    實際冇封」嘅 fail-wrong (同 PR#10 個 `side` 符號反轉係同一類錯)。
+    """
+    if BTC_REPO not in sys.path:
+        sys.path.insert(0, BTC_REPO)
+    try:
+        import btc_pause
+    except Exception as e:
+        return False, (f"     ⚠️ 停用硬閘**未生效**: 載入 btc_pause 失敗 "
+                       f"({type(e).__name__}: {e}) — 落單路徑可能仍然開通")
+    try:
+        _, _, certain = btc_pause.check()
+    except Exception as e:
+        return False, (f"     ⚠️ 停用硬閘**未生效**: btc_pause.check() 出錯 "
+                       f"({type(e).__name__}: {e})")
+    if not certain:
+        return False, ("     ⚠️ 停用標記讀唔到 → 硬閘會 fail-safe 擋落單 "
+                       "（check 標記檔權限）")
+    return True, "     ⛔ 落單路徑已硬閘封住（cycle step 2/3 跳過；reconcile 照跑）"
 
 
 def main():
@@ -251,7 +279,8 @@ def main():
             out.append(f"  ⏸️ 主: 已正式停用（{days} 日無新單；無可證實 edge）")
         else:
             out.append("  ⏸️ 主: 已正式停用（無可證實 edge）")
-        out.append("     ⚠️ 呢個係報告標記 — 落單路徑仍然存在（見 paused 檔）")
+        # ⚠️ 唔可以見 marker 就寫「已封住」—— 要真驗過閘裝好 (見 _pause_gate_status)
+        out.append(_pause_gate_status()[1])
     elif os.path.exists(HIST_MARKER):
         out.append(f"  📡 主: 0 live 倉 (09-18 曾停用, 09-20 重開)")
     else:
