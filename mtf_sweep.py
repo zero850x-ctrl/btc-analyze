@@ -158,7 +158,10 @@ def main():
         allrows += run(iv, cost, sl_mult)
 
     R = pd.DataFrame(allrows)
-    R.to_csv(os.path.join(REPO, f"mtf_sweep_cost{cost}_sl{sl_mult}.csv"), index=False)
+    # ⚠️ 檔名要包含週期 — 否則逐個週期跑會互相覆蓋 (2026-10-01 實證)
+    ivtag = "-".join(ivs)
+    out_csv = f"mtf_sweep_{ivtag}_cost{cost}_sl{sl_mult}.csv"
+    R.to_csv(os.path.join(REPO, out_csv), index=False)
 
     print("\n" + "=" * 112)
     print("總結")
@@ -190,7 +193,7 @@ def main():
         b = sub.loc[sub["meanR"].idxmax()]
         print(f"    {iv:>4}: {b['strategy']:>18} {b['exit']:>6}  meanR {b['meanR']:+.3f} "
               f"(t {b['t']:+.2f}, n {b['n']:.0f}, TRAIN {b['train']:+.3f} TEST {b['test']:+.3f})")
-    print(f"\n  saved mtf_sweep_cost{cost}_sl{sl_mult}.csv")
+    print(f"\n  saved {out_csv}")
 
 
 if __name__ == "__main__":
