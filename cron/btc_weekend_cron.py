@@ -6,9 +6,12 @@
 - 週六/日 10:00-22:50 每 15 分鐘 = `*/15 10-22 * * 6,0`
 行為: 跑一個 auto-trade cycle; 有 notable 事件先出聲, 冇嘢 = 靜默.
 """
+import fcntl
+import os
 import subprocess
 import sys
-import os
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
 # 2026-09-13: clone 已搬離 /tmp (macOS clean-tmps 會逐個 file 靜默清走 tracked file)
@@ -28,6 +31,52 @@ SILENT_ERROR_MARKERS = ("HTTP Error 502", "HTTP Error 503", "HTTP Error 504",
                         "HTTP Error 429", "HTTP Error 500", "HTTP Error 4001",
                         "urlopen error", "URLError", "timed out", "ConnectionResetError",
                         "getaddrinfo failed")
+
+
+class RepoUnavailable(RuntimeError):
+    """復原失敗 → 唔可以保證 repo 係預期版本 → **必須停止落單** (fail-safe).
+
+    2026-10-01 GLM review 捉到: 原本 branch checkout 失敗只係回傳一個 note,
+    main() 收到之後**照樣跑 trade cycle** — 即係喺已知跑緊錯版本嘅 repo 上落單,
+    正正就係呢個 PR 想修嘅「靜默跑舊 code」變種 (有出聲但照跑)。
+    改為 raise, 由 main() 嘅 except 統一 fail-safe。
+    """
+
+
+# 跨 cron 互斥鎖: btc_weekend_cron 同 btc_rebalance_cron **共用同一個 REPO**,
+# 兩者都可以觸發復原 (rename / clone / checkout)。冇鎖嘅話:
+#   - A 做緊 os.rename(REPO) 時, B 嘅 subprocess(cwd=REPO) → FileNotFoundError
+#   - 兩個同時 clone 落同一個 path → 一個半途而死
+#   - A 啱啱 checkout 好準備落單時, B 插入做 checkout → trade 讀到半更新 worktree
+# 用 flock: 復原 = LOCK_EX (獨佔), 落單 = LOCK_SH (共享, 可並存但擋住復原)。
+_LOCK_PATH = os.path.join(os.path.expanduser("~/.hermes/reports"),
+                          f".repo_recover_{os.path.basename(REPO)}.lock")
+
+
+@contextmanager
+def _repo_lock(exclusive, timeout=300):
+    """攞唔到鎖就 raise — 寧願唔跑, 都唔好喺狀態不明嘅 repo 上落單。"""
+    os.makedirs(os.path.dirname(_LOCK_PATH), exist_ok=True)
+    mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    f = open(_LOCK_PATH, "w")
+    try:
+        deadline = time.time() + timeout
+        while True:
+            try:
+                fcntl.flock(f, mode | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    raise RepoUnavailable(
+                        f"攞唔到 repo 鎖 ({_LOCK_PATH}, {'獨佔' if exclusive else '共享'}) "
+                        f"超過 {timeout}s — 另一個 cron 可能做緊復原")
+                time.sleep(1)
+        yield
+    finally:
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        finally:
+            f.close()
 
 
 def pick_python():
@@ -66,7 +115,8 @@ REQUIRED_FILES = ("btc_auto_trade_cycle.py", "btc_engine.py",
 
 def _repo_env():
     env = dict(os.environ)
-    env.setdefault("HOME", "/Users/gordonlui")
+    # expanduser 做 fallback: 唔好 hardcode user path (第部機 / 第個 user 會靜默錯)
+    env.setdefault("HOME", os.path.expanduser("~"))
     return env
 
 
@@ -85,7 +135,11 @@ def _head_ok():
 
 
 def _branch_ok():
-    """HEAD 喺 BRANCH_PIN (detached HEAD 當唔 OK).
+    """HEAD 喺 BRANCH_PIN (detached HEAD 當唔 OK)。
+
+    ⚠️ `rev-parse --abbrev-ref HEAD` 喺 detached HEAD 會**成功**回傳字面
+    "HEAD" (唔會報錯) — 所以係靠「output != BRANCH_PIN」攔住佢, 唔係靠
+    returncode。呢個行為係刻意嘅 (detached HEAD 一樣係「唔知跑緊邊個版本」)。
 
     2026-10-01 加: 同一個 REPO (~/repos/btc-analyze) 由多個 cron 共用,
     各自 BRANCH_PIN 唔一致時 — 邊個先撞到損壞就由佢 clone, 會令 repo
@@ -109,18 +163,32 @@ def _repo_healthy():
 
 
 def ensure_repo():
-    """確保 REPO 完整 (所有必需 file + 可用 .git).
+    """確保 REPO 完整 (所有必需 file + 可用 .git + 喺 BRANCH_PIN)。
+
+    回傳 (repo_cycle_path, note) — note 非 None 即做過恢復 (要通知用戶)。
+
+    ⚠️ 復原失敗會 raise RepoUnavailable — caller **唔可以**當無事發生照跑
+    (見 RepoUnavailable docstring)。
+    """
+    repo_cycle = os.path.join(REPO, "btc_auto_trade_cycle.py")
+    if _repo_healthy():
+        return repo_cycle, None
+    # 復原動作 (rename / clone / checkout) 必須互斥 — btc_rebalance_cron 用同一個 REPO
+    with _repo_lock(exclusive=True):
+        # 攞到鎖之後再驗一次: 另一個 cron 可能已經喺我哋等鎖期間修好咗
+        if _repo_healthy():
+            return repo_cycle, None
+        return _recover(repo_cycle)
+
+
+def _recover(repo_cycle):
+    """實際復原。呼叫者必須已持有 _repo_lock(exclusive=True)。
 
     恢復次序: git checkout 補 file → 唔得就成個 repo 改名做 backup 再
     re-clone + checkout BRANCH_PIN。trade log 喺 ~/.hermes/reports, 唔受
     影響; backup 保留 local-only 檔案例如 btc_last_analysis.json。
-
-    回傳 (repo_cycle_path, note) — note 非 None 即做過恢復 (要通知用戶)。
     """
     env = _repo_env()
-    repo_cycle = os.path.join(REPO, "btc_auto_trade_cycle.py")
-    if _repo_healthy():
-        return repo_cycle, None
     missing = [f for f in REQUIRED_FILES if not os.path.isfile(os.path.join(REPO, f))]
     if missing:
         why = f"缺 {', '.join(missing)}"
@@ -144,8 +212,10 @@ def ensure_repo():
                                capture_output=True, timeout=90, env=env)
             if _repo_healthy():
                 return repo_cycle, note + f" (branch 唔對 → checkout {BRANCH_PIN})"
-            return repo_cycle, (note + f" (⚠️ branch 唔對而且 checkout {BRANCH_PIN} 失敗: "
-                                       f"{(r.stdout + r.stderr)[-200:]!r})")
+            # ⚠️ fail-safe: 唔可以喺已知 branch 唔對 (即跑緊錯版本) 嘅 repo 上落單
+            raise RepoUnavailable(
+                note + f" (⚠️ branch 唔對而且 checkout {BRANCH_PIN} 失敗: "
+                       f"{(r.stdout + r.stderr)[-200:]!r}) — 為安全起見唔跑落單")
     # 2) .git 都爛埋 / file 唔喺 git 追蹤 → 原目錄改名做 backup 再 clone
     if os.path.isdir(REPO):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -158,7 +228,7 @@ def ensure_repo():
         subprocess.run(["git", "-C", REPO, "checkout", "-q", BRANCH_PIN],
                        capture_output=True, timeout=60, env=env)
     if not _repo_healthy():
-        raise RuntimeError(f"re-clone 失敗: {(r.stdout + r.stderr)[-300:]}")
+        raise RepoUnavailable(f"re-clone 失敗: {(r.stdout + r.stderr)[-300:]}")
     return repo_cycle, note + f" (re-clone {BRANCH_PIN} 完成)"
 
 
@@ -168,7 +238,7 @@ def main():
 
     # cron daemon 可能冇 HOME → python load 唔到 user site-packages (numpy 等)
     env = dict(os.environ)
-    env.setdefault("HOME", "/Users/gordonlui")
+    env.setdefault("HOME", os.path.expanduser("~"))
 
     recover_note = None
     try:
@@ -184,10 +254,18 @@ def main():
 
     prepend = [recover_note] if recover_note else []
 
-    r = subprocess.run(
-        [py, "btc_auto_trade_cycle.py"],
-        cwd=REPO, capture_output=True, text=True, timeout=280, env=env,
-    )
+    # 落單期間持**共享鎖**: 擋住另一個共用 REPO 嘅 cron 喺 trade 進行中做
+    # checkout/clone (trade 讀到半更新 worktree = 用錯版本落單)。
+    # 共享鎖之間可以並存, 所以唔會阻礙落單本身。
+    try:
+        with _repo_lock(exclusive=False, timeout=600):
+            r = subprocess.run(
+                [py, "btc_auto_trade_cycle.py"],
+                cwd=REPO, capture_output=True, text=True, timeout=280, env=env,
+            )
+    except RepoUnavailable as e:
+        print("\n".join(prepend + [f"❌ 唔夠安全跑落單 cycle: {e}"]))
+        return
     out = (r.stdout + r.stderr).strip()
     if r.returncode != 0:
         # 暫時性錯誤 (testnet down/network) → 靜默, 等 15min 後自然恢復

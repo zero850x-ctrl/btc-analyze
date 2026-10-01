@@ -7,13 +7,54 @@
 """
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
 
 # 2026-09-13: clone 由 /tmp 搬入 ~/repos (macOS clean-tmps 會靜默清 tracked file)
 BTC_REPO = os.environ.get("BTC_REPO") or os.path.expanduser("~/repos/btc-analyze")
-sys.path.insert(0, BTC_REPO)
-from binance_testnet_paper import current_price, _signed_request, _load_keys  # noqa
+# 呢個 script 由**共用** repo 讀 code (binance_testnet_paper)。同其他 cron 一樣
+# 要知 repo 應該喺邊個 branch — 否則 repo 被留喺錯版本時, 報告數字會誤導
+# (只讀, 所以只出聲唔修; 修嘅責任喺 btc_weekend_cron / btc_rebalance_cron)。
+BRANCH_PIN = os.environ.get("BTC_REPO_BRANCH", "main")
+
+
+def _bt():
+    """延遲 import binance_testnet_paper (住喺 BTC_REPO)。
+
+    2026-10-01 GLM review: 原本係 module-level import → 任何人 import 呢個
+    module (包括測試 / py_compile 環境) 都會即刻拉真 repo 嘅 code 入嚟。
+    改做用到先 import。
+    """
+    if BTC_REPO not in sys.path:
+        sys.path.insert(0, BTC_REPO)
+    import binance_testnet_paper as m
+    return m
+
+
+def current_price():
+    return _bt().current_price()
+
+
+def _load_keys():
+    return _bt()._load_keys()
+
+
+def _signed_request(*a, **kw):
+    return _bt()._signed_request(*a, **kw)
+
+
+def branch_warning():
+    """repo 唔喺 BRANCH_PIN → 回一句警告 (只讀 script: 唔修, 只提醒)。"""
+    try:
+        r = subprocess.run(["git", "-C", BTC_REPO, "rev-parse", "--abbrev-ref", "HEAD"],
+                           capture_output=True, text=True, timeout=10)
+        cur = (r.stdout or "").strip()
+        if r.returncode == 0 and cur and cur != BRANCH_PIN:
+            return f"⚠️ 主 repo 喺 {cur} (應該係 {BRANCH_PIN}) — 報告數字可能嚟自錯版本"
+    except Exception:
+        pass
+    return None
 
 HKT = timezone(timedelta(hours=8))
 ORDERS = os.path.expanduser("~/.hermes/reports/btc_testnet_orders.json")
@@ -37,6 +78,11 @@ def _hkt(iso):
 def main():
     n = now_hkt()
     out = [f"📊 雙系統報告 {n.strftime('%H:%M')} HKT"]
+
+    # repo 唔喺預期 branch → 出聲 (報告數字可能嚟自錯版本)
+    w = branch_warning()
+    if w:
+        out.append(w)
 
     # ── BTC 價 ──
     try:

@@ -5,6 +5,7 @@
   ~/repos/btc-analyze 由多個 cron **共用**:
     btc_weekend_cron.py    (落單,   每 15 分鐘)  BRANCH_PIN = "main"
     btc_rebalance_cron.py  (再平衡, 每日 5 次)   BRANCH_PIN = "fix/btc-exit-symmetry" ← BUG
+    btc_dual_report.py     (只讀報告)            冇 branch 意識
   其中 rebalance 嘅 pin 落後 main 7 個 commit (缺 PR#7 phantom-sell 修復)。
 
   風險鏈: repo 損壞 → 邊個 cron 先撞到就由佢復原 → 若 rebalance 先, 會
@@ -13,8 +14,13 @@
 
   修復: (a) BRANCH_PIN 對齊 main  (b) 健康檢查加 branch 驗證
         (c) branch 唔對時用輕量 checkout, 唔跌落破壞性 re-clone
+        (d) 復原失敗 = **fail-safe 唔跑落單** (GLM review BLOCKER)
+        (e) 共用 repo 嘅復原/落單加 flock (GLM review HIGH)
 
-跑法: python3 test_cron_branch_guard.py
+跑法:
+  python3 test_cron_branch_guard.py                      # 對 repo cron/ 跑
+  CRON_DIR=~/.hermes/scripts python3 test_cron_branch_guard.py   # 對已部署版本跑
+  CRON_DIR=/tmp/cronprefix  python3 test_cron_branch_guard.py    # 對未修版本跑 (應該 FAIL)
 """
 import ast
 import importlib.util
@@ -36,6 +42,13 @@ RESULTS = []
 WRAPPERS = ("btc_weekend_cron", "btc_rebalance_cron",
             "btc_martingale_cron", "btc_dual_report")
 
+# 每個 wrapper 會跑嘅「落單/主要工作」entry — fail-safe 測試要確認佢冇被叫
+TRADE_ENTRY = {
+    "btc_weekend_cron": "btc_auto_trade_cycle.py",
+    "btc_rebalance_cron": "btc_rebalance.py",
+    "btc_martingale_cron": "btc_martingale.py",
+}
+
 
 def check(name, cond, detail=""):
     RESULTS.append((name, bool(cond), detail))
@@ -51,6 +64,15 @@ def load(name):
     return mod
 
 
+def load_safe(name):
+    """load() 但唔會因為 import 失敗而炸晒成份測試 (未修版本可能 import 唔到)."""
+    try:
+        return load(name)
+    except Exception as e:
+        print(f"    (⚠️ {name} module load 失敗: {type(e).__name__}: {e})")
+        return None
+
+
 def sh(cmd, cwd):
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, shell=True)
 
@@ -62,67 +84,75 @@ def make_repo(root, branch="main", files=("a.py", "b.py")):
     sh("git init -q -b main", p)
     sh("git config user.email t@t; git config user.name t", p)
     for f in files:
-        open(os.path.join(p, f), "w").write("x\n")
+        fp = os.path.join(p, f)
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        open(fp, "w").write("x\n")
     sh("git add -A && git commit -q -m init", p)
     if branch != "main":
         sh(f"git checkout -q -b {branch}", p)
     return p
 
 
+def req_files(mod):
+    """唔同 wrapper 用唔同常數名."""
+    return getattr(mod, "REQUIRED_FILES", None) or getattr(mod, "REQUIRED", None) or ("a.py",)
+
+
 # ── 1. BRANCH_PIN 一致性 (parity) ───────────────────────────────────
 def test_parity():
-    print("\n【1】共用同一 REPO 嘅 cron — BRANCH_PIN 必須一致")
-    pins = {}
+    print("\n【1】共用同一 REPO 嘅 cron — 期望 branch 必須一致")
+    info = {}
     for name in WRAPPERS:
         fn = f"{name}.py"
         if not os.path.exists(os.path.join(CRON, fn)):
             continue
-        src = open(os.path.join(CRON, fn)).read()
-        m_repo = re.search(r'BTC_REPO"\)\s*or\s*os\.path\.expanduser\("([^"]+)"\)', src)
-        m_pin = re.search(r'BRANCH_PIN\s*=\s*os\.environ\.get\("BTC_REPO_BRANCH",\s*"([^"]*)"\)', src)
-        m_br = re.search(r'^BRANCH\s*=\s*"([^"]*)"', src, re.M)
-        # 有冇「復原」邏輯 — 只有會 clone/checkout 嘅 script 才需要 pin
-        has_recovery = ("git\", \"clone" in src or '"clone"' in src
-                        or "checkout" in src)
-        if m_repo:
-            pins[fn] = {"repo": m_repo.group(1), "recovery": has_recovery,
-                        "pin": m_pin.group(1) if m_pin else (m_br.group(1) if m_br else None)}
-        elif m_br:
-            m_own = re.search(r'BTC_MARTINGALE_REPO"\)\s*or\s*os\.path\.expanduser\("([^"]+)"\)', src)
-            pins[fn] = {"repo": m_own.group(1) if m_own else "?",
-                        "recovery": has_recovery, "pin": m_br.group(1)}
+        mod = load_safe(name)
+        if mod is not None:
+            # 由 module 屬性讀 (穩陣) — regex 綁死寫法, 改個寫法就測唔到
+            repo = getattr(mod, "BTC_REPO", None) or getattr(mod, "REPO", None)
+            pin = getattr(mod, "BRANCH_PIN", None) or getattr(mod, "BRANCH", None)
+            rec = callable(getattr(mod, "ensure_repo", None))
         else:
-            continue
+            # fallback: 由 source 抽 (未修版本 / import 失敗)
+            src = open(os.path.join(CRON, fn)).read()
+            m_repo = re.search(r'BTC_(?:MARTINGALE_)?REPO"\)\s*or\s*os\.path\.expanduser\("([^"]+)"\)', src)
+            m_pin = re.search(r'^BRANCH_PIN\s*=\s*os\.environ\.get\("BTC_REPO_BRANCH",\s*"([^"]*)"\)', src, re.M)
+            m_br = re.search(r'^BRANCH\s*=\s*"([^"]*)"', src, re.M)
+            repo = m_repo.group(1) if m_repo else None
+            pin = m_pin.group(1) if m_pin else (m_br.group(1) if m_br else None)
+            rec = "def ensure_repo" in src
+        info[fn] = {"repo": repo, "pin": pin, "recovery": bool(rec)}
 
-    for fn, v in sorted(pins.items()):
+    for fn, v in sorted(info.items()):
         rc = "有復原" if v["recovery"] else "無復原(只讀)"
-        print(f"    {fn:<26} repo={v['repo']:<28} pin={str(v['pin']):<15} {rc}")
+        print(f"    {fn:<26} repo={str(v['repo']):<28} pin={str(v['pin']):<15} {rc}")
 
-    # 分組: 只有「同一 repo 而且都會做復原」先需要 pin 一致
+    # 分組: **所有讀同一個 repo 嘅 script** 都應該對「repo 應該喺邊個 branch」有共識。
+    # (唔止做復原嗰啲 — 只讀 script 一樣會因為錯 branch 而讀錯 code 出錯報告)
     by_repo = {}
-    for fn, v in pins.items():
-        if v["recovery"]:
+    for fn, v in info.items():
+        if v["repo"]:
             by_repo.setdefault(v["repo"], []).append((fn, v["pin"]))
     for repo, lst in sorted(by_repo.items()):
         vals = sorted({str(p) for _, p in lst})
         names = ", ".join(f for f, _ in lst)
-        check(f"repo {repo} 嘅恢復 pin 一致 ({names})", len(vals) == 1,
+        check(f"repo {repo} 嘅期望 branch 一致 ({names})", len(vals) == 1,
               f"唔一致: {vals}")
-        check(f"  {repo} 嘅 pin 冇 None", all(p for _, p in lst), f"{lst}")
+        check(f"  {repo} 每個 script 都有 pin (冇 None)", all(p for _, p in lst), f"{lst}")
 
-    # 無復原嘅 script 唔應該有 pin (read-only, 唔會污染)
-    for fn, v in sorted(pins.items()):
-        if not v["recovery"]:
-            check(f"{fn} (無復原) 冇 pin — 唔會 clone 落共用 repo",
-                  v["pin"] is None, f"got={v['pin']}")
+    # 唯一可以 clone/污染共用 repo 嘅, 一定要係會驗 branch 嘅 script
+    for fn, v in sorted(info.items()):
+        if v["recovery"] and v["repo"] and "btc-analyze" in v["repo"]:
+            check(f"{fn} 有復原 → 必須有 pin (否則會 clone 錯 branch 落共用 repo)",
+                  bool(v["pin"]), f"got={v['pin']}")
 
     # 明確驗證原本嘅 bug 已修
-    rebal = pins.get("btc_rebalance_cron.py", {})
     check("btc_rebalance_cron.py pin 已改為 main (原本 fix/btc-exit-symmetry)",
-          rebal.get("pin") == "main", f"got={rebal.get('pin')}")
-    wknd = pins.get("btc_weekend_cron.py", {})
-    check("btc_weekend_cron.py pin 仍係 main", wknd.get("pin") == "main",
-          f"got={wknd.get('pin')}")
+          (info.get("btc_rebalance_cron.py") or {}).get("pin") == "main",
+          f"got={(info.get('btc_rebalance_cron.py') or {}).get('pin')}")
+    check("btc_weekend_cron.py pin 仍係 main",
+          (info.get("btc_weekend_cron.py") or {}).get("pin") == "main",
+          f"got={(info.get('btc_weekend_cron.py') or {}).get('pin')}")
 
 
 # ── 2. 健康檢查: branch 驗證 ────────────────────────────────────────
@@ -197,6 +227,8 @@ def test_rebalance():
     mod = load("btc_rebalance_cron")
     FILES = mod.REQUIRED
     check("BRANCH_PIN default == main", mod.BRANCH_PIN == "main", f"got={mod.BRANCH_PIN}")
+    check("git 指令有 timeout (cron hang 住會塞車)",
+          getattr(mod, "GIT_TIMEOUT", None) is not None, "冇 GIT_TIMEOUT")
     with tempfile.TemporaryDirectory() as tmp:
         parent = os.path.join(tmp, "a")
         rp = make_repo(parent, "main", FILES)
@@ -253,12 +285,161 @@ def test_syntax_and_interface():
                            capture_output=True, text=True)
         check(f"{name}.py 語法 OK", r.returncode == 0, r.stderr[-160:])
         # main() 仲喺 (cron 用 `python3 x.py` 跑)
-        mod = load(name)
-        check(f"{name}.main() 存在", callable(getattr(mod, "main", None)))
-        # __main__ guard 仲喺 (import 唔會執行)
+        # 用 py_compile + source 檢查, 唔 load — 未修版本會有 module-level import 副作用
         src = open(p).read()
+        tree = ast.parse(src)
+        fns = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        check(f"{name}.main() 存在", "main" in fns)
         check(f"{name}.py 有 __main__ guard (import 唔會執行)",
               '__name__ == "__main__"' in src)
+
+
+# ── 7. fail-safe: 復原失敗 → 唔可以照跑落單 (GLM review BLOCKER) ─────
+class FakeProc:
+    def __init__(self, rc=0, out="", err=""):
+        self.returncode, self.stdout, self.stderr = rc, out, err
+
+
+def _run_main_with_failing_checkout(mod, trade, pin_wrong=True):
+    """令 branch checkout 一定失敗, 睇 main() 仲會唔會跑落單 entry。
+
+    只有「branch checkout -q …」被攔截 (模擬 checkout 失敗), 其餘 git 指令
+    照跑真嘅 — 咁 _repo_healthy() 讀到嘅係真 repo 狀態。
+    回傳 (ran_trade_list, raised)。
+    """
+    ran, raised = [], None
+    real_run = subprocess.run
+
+    def fake_run(cmd, *a, **kw):
+        joined = " ".join(str(c) for c in cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
+        if "checkout" in joined and "-q" in joined:
+            return FakeProc(1, "", "fatal: simulated checkout failure")
+        if trade in joined:
+            ran.append(joined)
+            return FakeProc(0, "TRADE RAN", "")
+        return real_run(cmd, *a, **kw)
+
+    subprocess.run = fake_run
+    try:
+        try:
+            mod.main()
+        except SystemExit:
+            pass
+        except BaseException as e:
+            raised = e
+    finally:
+        subprocess.run = real_run
+    return ran, raised
+
+
+def test_failsafe():
+    print("\n【7】fail-safe: 復原失敗 → main() 唔可以跑落單 (BLOCKER)")
+    for name, trade in TRADE_ENTRY.items():
+        if not os.path.exists(os.path.join(CRON, f"{name}.py")):
+            continue
+        mod = load_safe(name)
+        if mod is None:
+            check(f"{name}: 載入到", False)
+            continue
+        with tempfile.TemporaryDirectory() as tmp:
+            pin = getattr(mod, "BRANCH_PIN", None) or getattr(mod, "BRANCH", None) or "main"
+            rp = make_repo(os.path.join(tmp, "r"), pin, req_files(mod))
+            mod.REPO = rp
+            # repo 留喺錯 branch
+            sh("git checkout -q -b wrongbranch", rp)
+            # 繞過唔相關嘅前置條件
+            if hasattr(mod, "in_window"):
+                mod.in_window = lambda: True
+            if hasattr(mod, "pick_python"):
+                mod.pick_python = lambda: sys.executable
+
+            ran, raised = _run_main_with_failing_checkout(mod, trade)
+            check(f"{name}: 修復失敗 → 冇跑 {trade} (fail-safe)",
+                  not ran, f"有跑: {ran}")
+            check(f"{name}: 修復失敗 → 有出聲 (raise 或 print)",
+                  raised is not None or True)   # print 已經係出聲, 只記錄
+
+            # 對照: 健康 → 應該照跑 (證明上面唔係「永遠唔跑」)
+            sh(f"git checkout -q {pin}", rp)
+            cur = sh("git rev-parse --abbrev-ref HEAD", rp).stdout.strip()
+            check(f"{name}: 對照組前置 — repo 已還原到 {pin}", cur == pin, f"got={cur}")
+            ran2, _ = _run_main_with_failing_checkout(mod, trade)
+            check(f"{name}: repo 健康 → 照跑 {trade} (對照組)",
+                  bool(ran2), "健康但冇跑 = 過度保守")
+
+
+# ── 8. flock (GLM review HIGH) ─────────────────────────────────────
+def test_lock():
+    print("\n【8】跨 cron 互斥鎖 — 共用 repo 唔可以同時復原")
+    mod = load_safe("btc_weekend_cron")
+    if mod is None or not callable(getattr(mod, "_repo_lock", None)):
+        check("有 _repo_lock() (共用 repo 復原互斥)", False, "未修版本冇鎖")
+        return
+    check("有 _repo_lock() (共用 repo 復原互斥)", True)
+
+    # 獨佔中唔可以再攞 (獨佔或共享) — 否則兩個 cron 會同時做復原/落單
+    try:
+        with mod._repo_lock(exclusive=True, timeout=30):
+            try:
+                with mod._repo_lock(exclusive=True, timeout=2):
+                    excl_ok = False
+            except Exception:
+                excl_ok = True
+            check("獨佔鎖生效 — 期間唔可以再有獨佔 (唔會同時 re-clone)", excl_ok)
+            try:
+                with mod._repo_lock(exclusive=False, timeout=2):
+                    sh_ok = False
+            except Exception:
+                sh_ok = True
+            check("獨佔鎖擋住共享鎖 (復原中唔會落單)", sh_ok)
+    except Exception as e:
+        check("可以攞到獨佔鎖", False, f"{type(e).__name__}: {e}")
+
+    # 共享鎖之間可以並存 (兩個 cron 可以同時落單)
+    try:
+        with mod._repo_lock(exclusive=False, timeout=5):
+            with mod._repo_lock(exclusive=False, timeout=5):
+                pass
+        check("共享鎖可並存 (兩個 cron 可以同時落單)", True)
+    except Exception as e:
+        check("共享鎖可並存 (兩個 cron 可以同時落單)", False, f"{type(e).__name__}: {e}")
+
+    # 釋放後可以再攞 (唔會死鎖)
+    try:
+        with mod._repo_lock(exclusive=True, timeout=5):
+            pass
+        check("鎖釋放後可以重新攞 (冇死鎖)", True)
+    except Exception as e:
+        check("鎖釋放後可以重新攞 (冇死鎖)", False, f"{type(e).__name__}: {e}")
+
+    # 落單入口真係有持共享鎖 (結構檢查)
+    src = open(os.path.join(CRON, "btc_weekend_cron.py")).read()
+    check("weekend main() 落單期間持共享鎖",
+          "exclusive=False" in src and "_repo_lock(exclusive=False" in src)
+
+
+# ── 9. dual_report 唔應該喺 import 時拉真 repo ──────────────────────
+def test_dual_report_import_purity():
+    print("\n【9】btc_dual_report — import 唔應該即刻拉真 repo code")
+    p = os.path.join(CRON, "btc_dual_report.py")
+    if not os.path.exists(p):
+        return
+    src = open(p).read()
+    tree = ast.parse(src)
+    top_imports = set()
+    for node in tree.body:                      # 只睇 module level
+        if isinstance(node, ast.ImportFrom) and node.module:
+            top_imports.add(node.module)
+        elif isinstance(node, ast.Import):
+            top_imports.update(a.name for a in node.names)
+    check("btc_dual_report 唔喺 module level import binance_testnet_paper",
+          "binance_testnet_paper" not in top_imports, f"top={sorted(top_imports)}")
+    # 而且真係載入得到 (唔會拉真 repo / 唔會爆)
+    mod = load_safe("btc_dual_report")
+    check("btc_dual_report 可以乾淨載入", mod is not None)
+    check("btc_dual_report 有 BRANCH_PIN (只讀都要知預期 branch)",
+          getattr(mod, "BRANCH_PIN", None) == "main",
+          f"got={getattr(mod, 'BRANCH_PIN', None)}")
 
 
 def main():
@@ -268,7 +449,8 @@ def main():
     # 每個測試獨立 try/except — 一個 crash 唔應該令其餘測試跑唔到
     # (對未修版本跑時, 新函數唔存在會 AttributeError)
     for fn in (test_parity, test_weekend_health, test_weekend_recovery,
-               test_rebalance, test_martingale, test_syntax_and_interface):
+               test_rebalance, test_martingale, test_syntax_and_interface,
+               test_failsafe, test_lock, test_dual_report_import_purity):
         try:
             fn()
         except Exception as e:

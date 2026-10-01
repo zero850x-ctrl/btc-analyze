@@ -2,14 +2,17 @@
 """btc_martingale_cron.py — 馬丁格爾實驗 cron 入口 (no_agent watchdog)
 
 Repo 獨立 clone 喺 ~/repos/btc-martingale (exp/martingale branch):
-唔影響主系統 ~/repos/btc-analyze (fix/btc-exit-symmetry).
+唔影響主系統 ~/repos/btc-analyze (main).
 2026-09-13: 兩個 clone 都由 /tmp 搬入 ~/repos (macOS clean-tmps 會靜默清 tracked file).
 缺失時自動 re-clone (GitHub 係 source of truth).
 訊息: 有 🔵/➕/✅/❌/🛑 先出聲; ⏳ 靜默 = 正常.
 """
+import fcntl
 import os
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from datetime import datetime
 
 # 2026-09-13: clone 由 /tmp 搬入 ~/repos (macOS clean-tmps 會靜默清 tracked file)
@@ -27,9 +30,49 @@ SILENT_ERROR_MARKERS = ("HTTP Error 502", "HTTP Error 503", "HTTP Error 504",
 REQUIRED_FILES = ("btc_martingale.py", "binance_testnet_paper.py")
 
 
+class RepoUnavailable(RuntimeError):
+    """復原失敗 → 唔可以保證 repo 係預期版本 → **必須停止落單** (fail-safe).
+
+    2026-10-01 GLM review 捉到: 原本 branch checkout 失敗只係回傳 note,
+    main() 收到之後**照樣跑** — 即係喺已知跑緊錯版本嘅 repo 上落單。
+    """
+
+
+# 同主系統一樣用 flock: 防止 cron tick 同人手執行重疊時同時做 re-clone。
+_LOCK_PATH = os.path.join(os.path.expanduser("~/.hermes/reports"),
+                          f".repo_recover_{os.path.basename(REPO)}.lock")
+
+
+@contextmanager
+def _repo_lock(exclusive, timeout=300):
+    """攞唔到鎖就 raise — 寧願唔跑, 都唔好喺狀態不明嘅 repo 上落單。"""
+    os.makedirs(os.path.dirname(_LOCK_PATH), exist_ok=True)
+    mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    f = open(_LOCK_PATH, "w")
+    try:
+        deadline = time.time() + timeout
+        while True:
+            try:
+                fcntl.flock(f, mode | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    raise RepoUnavailable(
+                        f"攞唔到 repo 鎖 ({_LOCK_PATH}, {'獨佔' if exclusive else '共享'}) "
+                        f"超過 {timeout}s")
+                time.sleep(1)
+        yield
+    finally:
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
 def _repo_env():
     env = dict(os.environ)
-    env.setdefault("HOME", "/Users/gordonlui")
+    # expanduser 做 fallback: 唔好 hardcode user path (第部機 / 第個 user 會靜默錯)
+    env.setdefault("HOME", os.path.expanduser("~"))
     return env
 
 
@@ -63,11 +106,22 @@ def _repo_healthy():
 
 
 def ensure_repo():
-    """確保馬丁 repo 完整, 回傳 note (非 None = 做過恢復, 要通知用戶)."""
-    env = _repo_env()
-    entry = os.path.join(REPO, "btc_martingale.py")
+    """確保馬丁 repo 完整, 回傳 note (非 None = 做過恢復, 要通知用戶).
+
+    ⚠️ 復原失敗會 raise RepoUnavailable — caller **唔可以**當無事發生照跑。
+    """
     if _repo_healthy():
         return None
+    with _repo_lock(exclusive=True):
+        # 攞到鎖之後再驗一次: 可能喺等鎖期間已經被修好
+        if _repo_healthy():
+            return None
+        return _recover()
+
+
+def _recover():
+    """實際復原。呼叫者必須已持有 _repo_lock(exclusive=True)。"""
+    env = _repo_env()
     missing = [f for f in REQUIRED_FILES if not os.path.isfile(os.path.join(REPO, f))]
     if missing:
         why = f"缺 {', '.join(missing)}"
@@ -89,14 +143,17 @@ def ensure_repo():
                                capture_output=True, timeout=90, env=env)
             if _repo_healthy():
                 return note + f" (branch 唔對 → checkout {BRANCH})"
-            return note + f" (⚠️ branch checkout {BRANCH} 失敗: {(r.stdout + r.stderr)[-200:]!r})"
+            # ⚠️ fail-safe: 唔可以喺已知 branch 唔對 (即跑緊錯版本) 嘅 repo 上落單
+            raise RepoUnavailable(
+                note + f" (⚠️ branch checkout {BRANCH} 失敗: "
+                       f"{(r.stdout + r.stderr)[-200:]!r}) — 為安全起見唔跑")
     if os.path.isdir(REPO):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         os.rename(REPO, f"{REPO}.bak.{stamp}")
     r = subprocess.run(["git", "clone", "-b", BRANCH, GIT_URL, REPO],
                        capture_output=True, timeout=180, env=env)
     if not _repo_healthy():
-        raise RuntimeError(f"re-clone 失敗: {(r.stdout + r.stderr)[-300:]}")
+        raise RepoUnavailable(f"re-clone 失敗: {(r.stdout + r.stderr)[-300:]}")
     return note + f" (re-clone {BRANCH} 完成)"
 
 
@@ -109,8 +166,14 @@ def main():
     prepend = [recover_note] if recover_note else []
     env = _repo_env()
     py = "/opt/homebrew/bin/python3.11"
-    r = subprocess.run([py, os.path.join(REPO, "btc_martingale.py")],
-                       cwd=REPO, capture_output=True, text=True, timeout=120, env=env)
+    # 落單期間持共享鎖: 擋住重疊執行 (人手/cron) 做 checkout / re-clone
+    try:
+        with _repo_lock(exclusive=False, timeout=600):
+            r = subprocess.run([py, os.path.join(REPO, "btc_martingale.py")],
+                               cwd=REPO, capture_output=True, text=True, timeout=120, env=env)
+    except RepoUnavailable as e:
+        print("\n".join(prepend + [f"❌ 唔夠安全跑馬丁: {e}"]))
+        return
     out = (r.stdout + r.stderr).strip()
     if r.returncode != 0:
         # 暫時性錯誤 (testnet down/network) → 靜默, 等 15min 後自然恢復
