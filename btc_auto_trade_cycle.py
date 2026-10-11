@@ -126,8 +126,8 @@ def _other_system_known_ids():
     同一 account 有三個系統出入 (主系統 + 再平衡 + 馬丁格爾); detector 只識
     主系統 log 嘅 id → 另外兩者嘅正常成交永遠「唔對應」→ 誤報無限復發
     (2026-10-11 實證: 9 筆誤報全部有主, 0 unexplained)。
-    回傳 set[str]; 任何讀取失敗 → 空 set (fail-open 在「已知」側 = 寧可誤報,
-    唔可以因讀唔到就當冇成交 —— 沿用現有 fail-closed 方向)。
+    回傳 set[str]; 任何讀取失敗 → 空 set (寧可誤報 / fail toward false-positive:
+    唔可以因讀唔到就當成交「有主」而吞真 phantom —— 沿用現有 fail-closed 方向)。
     env 可覆寫路徑 (測試用): BTC_MART_LOG / BTC_REBALANCE_LOG。
     """
     ids = set()
@@ -156,8 +156,15 @@ def _other_system_known_ids():
                 for e in evs:
                     if (isinstance(e, dict) and e.get("order_id") is not None):
                         ids.add(str(e["order_id"]))
-    except Exception:                           # noqa: BLE001
-        pass                                    # 讀唔到 = 當冇 extra, 照誤報方向
+    except Exception as e:                    # noqa: BLE001
+        # 讀唔到 = 當冇 extra, 照誤報方向。但唔可以靜默降級: 否則有人清走
+        # log 檔 / 磁碟滿, detector 無聲退回修正前狀態, 誤報復發都唔知點解。
+        # (print 而唔係 log(): 呢個 helper 喺 sell_reconcile_alerts 入面被叫,
+        # caller 會經 log() 輸出; 直接 print 保證測試 redirect_stdout 見到。)
+        try:
+            print(f"⚠️ _other_system_known_ids 讀取失敗 ({e!r}) — extra known 唔生效, 誤報可能復發")
+        except Exception:                       # noqa: BLE001
+            pass
     return ids
 
 
@@ -177,6 +184,8 @@ def find_unmatched_sells(trades, log_d, since_ms=None, extra_known=None):
     否則舊記錄嘅 leg 成交會誤報。
     另一已知限制: 馬丁舊 chains (2026-10-11 之前) 冇 close_order_id —— 佢哋嘅
     平倉 fills 喺 24h 窗跌出前依然會響, 唔係 bug, 係歷史數據補唔返。
+    型別註記: known 集全部 str(); trades 嘅 orderId 係 int → 比較位用
+    str(oid), 唔好改做直接比較 (會令 int ids 永遠唔 match 而全響)。
     """
     from binance_testnet_paper import record_known_ids   # 單一來源 (btp), 唔重複維護
     known = set()

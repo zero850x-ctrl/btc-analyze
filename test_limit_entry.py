@@ -398,9 +398,8 @@ _real9 = [_mk_sell2(o) for o in
 # 805500 係真實再平衡 buy —— isBuyer=True 應該被跳過 (就算唔喺 known 都唔響)。
 _real9.append({"orderId": 805500, "isBuyer": True,
                "time": int(time.time() * 1000) - 60_000})
-# 註: 769647 係真實再平衡 sell 但 fixture 冇寫入 rb.json (模擬「log 唔齊」);
-# 805500 係真實再平衡 buy (isBuyer 應被跳過, 就算唔喺 known 都唔響)。
-# 所以預期: 769647 仍然響 (缺 log = 照誤報方向), 其餘 8 筆靜默。
+# 註: 769647 係真實再平衡 sell 但 fixture 冇寫入 rb.json (模擬「log 唔齊」)。
+# 所以預期: 769647 仍然響 (缺 log = 照誤報方向), 其餘 8 筆靜默 (含 buy-skip)。
 _u11 = cyc.find_unmatched_sells(_real9, {"orders": []}, since_ms=None)
 result("R11a 真實誤報 9 筆 → 只剩缺 log 嘅 769647 響",
        _u11 == [769647], f"({_u11})")
@@ -428,6 +427,22 @@ result("R11d extra_known 明傳照用 (111 認得, 222 響)",
 # R11e: 唔傳 extra_known + env 冇設 → 讀真 log 路徑 (存在) 唔爆
 _u11e = cyc.find_unmatched_sells([], {"orders": []}, since_ms=None)
 result("R11e 空 trades + 真路徑 → 空結果唔爆", _u11e == [], f"({_u11e})")
+
+# R11f (GLM review): 讀取失敗要有聲 —— 爛 log 唔可以靜默降級
+# (用 999003: 唔喺任何 fixture / 真 log, 排除 R11e 真路徑污染)
+import io as _io11
+import contextlib as _cl11
+os.environ["BTC_MART_LOG"] = os.path.join(_fx, "no-such-file.json")
+os.environ["BTC_REBALANCE_LOG"] = os.path.join(_fx, "rb.json")
+open(os.path.join(_fx, "rb.json"), "w").write("{broken json")
+_buf11 = _io11.StringIO()
+with _cl11.redirect_stdout(_buf11):
+    _u11f = cyc.find_unmatched_sells([_mk_sell2(999003)], {"orders": []}, since_ms=None)
+result("R11f log 讀唔到 → 照響 + 出 warning (唔靜默降級)",
+       _u11f == [999003] and "_other_system_known_ids 讀取失敗" in _buf11.getvalue(),
+       f"({_u11f}, warn={'有' if '讀取失敗' in _buf11.getvalue() else '冇'})")
+os.environ.pop("BTC_MART_LOG", None)
+os.environ.pop("BTC_REBALANCE_LOG", None)
 
 cyc.HISTORY = HIST_PATH
 
