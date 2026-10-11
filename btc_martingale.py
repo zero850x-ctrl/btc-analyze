@@ -220,7 +220,8 @@ def tick(key, secret, dry=False):
                 o = _mk_order(close_side, total_qty, key, secret)
                 profit = chain_net(chain, o["fill_px"], entries) - (o["fee"] * o["fill_px"] if o["fill_px"] else 0)
                 chain.update({"state": "WIN", "closed_px": o["fill_px"], "profit_usd": round(profit, 2),
-                              "closed_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+                              "closed_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                              "close_order_id": o.get("order_id")})
                 s["chains"].append(chain)
                 daily["wins"] += 1
                 out.append(f"✅ 馬丁 WIN +${profit:.2f} — {chain['side']} {len(entries)}注 close@{o['fill_px']:.0f}")
@@ -237,7 +238,8 @@ def tick(key, secret, dry=False):
                 o = _mk_order(close_side, total_qty, key, secret)
                 loss = chain_net(chain, o["fill_px"], entries) - (o["fee"] * o["fill_px"] if o["fill_px"] else 0)
                 chain.update({"state": "LOSS", "closed_px": o["fill_px"], "profit_usd": round(loss, 2),
-                              "closed_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+                              "closed_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                              "close_order_id": o.get("order_id")})
                 s["chains"].append(chain)
                 daily["losses"] += 1
                 daily["loss_usd"] = round(daily["loss_usd"] + abs(loss), 2)
