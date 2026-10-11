@@ -120,21 +120,69 @@ def reconcile_alerts(summary, acct_btc):
     return msgs
 
 
-def find_unmatched_sells(trades, log_d, since_ms=None):
+def _other_system_known_ids():
+    """同一個 testnet account 另外兩個系統嘅已知 order id。
+
+    同一 account 有三個系統出入 (主系統 + 再平衡 + 馬丁格爾); detector 只識
+    主系統 log 嘅 id → 另外兩者嘅正常成交永遠「唔對應」→ 誤報無限復發
+    (2026-10-11 實證: 9 筆誤報全部有主, 0 unexplained)。
+    回傳 set[str]; 任何讀取失敗 → 空 set (fail-open 在「已知」側 = 寧可誤報,
+    唔可以因讀唔到就當冇成交 —— 沿用現有 fail-closed 方向)。
+    env 可覆寫路徑 (測試用): BTC_MART_LOG / BTC_REBALANCE_LOG。
+    """
+    ids = set()
+    try:
+        mart_p = (os.environ.get("BTC_MART_LOG")
+                  or os.path.expanduser("~/.hermes/reports/btc_martingale_log.json"))
+        if os.path.exists(mart_p):
+            m = json.load(open(mart_p)) or {}
+            chains = m.get("chains", [])
+            if isinstance(chains, list):
+                for c in chains:
+                    if not isinstance(c, dict):
+                        continue
+                    v = c.get("close_order_id")
+                    if v is not None:
+                        ids.add(str(v))
+                    for e in (c.get("entries") or []):
+                        if isinstance(e, dict) and e.get("order_id") is not None:
+                            ids.add(str(e["order_id"]))
+        rb_p = (os.environ.get("BTC_REBALANCE_LOG")
+                or os.path.expanduser("~/.hermes/reports/btc_rebalance_log.json"))
+        if os.path.exists(rb_p):
+            r = json.load(open(rb_p)) or {}
+            evs = r.get("events") or []
+            if isinstance(evs, list):
+                for e in evs:
+                    if (isinstance(e, dict) and e.get("order_id") is not None):
+                        ids.add(str(e["order_id"]))
+    except Exception:                           # noqa: BLE001
+        pass                                    # 讀唔到 = 當冇 extra, 照誤報方向
+    return ids
+
+
+def find_unmatched_sells(trades, log_d, since_ms=None, extra_known=None):
     """賣出成交 (isBuyer=False) 但 orderId 唔對應任何本地記錄 → list[orderId]。
 
     2026-09-27 GLM round-2 P2 (phantom 同類偵測): 本地「已知 order」= 所有記錄嘅
     order_id / oco_id / l3_id / flatten_order_id + 全部 leg id 欄位。任何其他賣出
     成交都係未對帳賣出 —— 今次事故嘅 270 筆市價平倉正正全部係咁 (冇入 log)。
 
+    2026-10-11: 同一 account 仲有再平衡 + 馬丁格爾出入 —— 佢哋嘅正常成交唔喺
+    log_d 入面。`extra_known` (set[str], 無則自動讀兩個 log) 併入已知集;
+    舊調用 (唔傳) 行為不變, 只是自動多識兩個系統。
+
     假設 (GLM round-3 LOW 註明): 已完成記錄會一直留喺 log_d["orders"] (現行
     不變量, 冇 archive/rotation)。若日後加 log rotation, 要改為掃埋 archive,
     否則舊記錄嘅 leg 成交會誤報。
+    另一已知限制: 馬丁舊 chains (2026-10-11 之前) 冇 close_order_id —— 佢哋嘅
+    平倉 fills 喺 24h 窗跌出前依然會響, 唔係 bug, 係歷史數據補唔返。
     """
     from binance_testnet_paper import record_known_ids   # 單一來源 (btp), 唔重複維護
     known = set()
     for r in (log_d or {}).get("orders", []):
         known |= record_known_ids(r)
+    known |= (extra_known if extra_known is not None else _other_system_known_ids())
     out = []
     for t in trades or []:
         if t.get("isBuyer"):
