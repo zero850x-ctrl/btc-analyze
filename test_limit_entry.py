@@ -360,6 +360,90 @@ result("R10 freeze 專屬警報 🚨", any("🚨" in m and "凍結" in m for m i
 _m11 = cyc.reconcile_alerts({"needs_legs": 1}, None)
 result("R10b 冇 frozen 就唔會出 🚨", not any("🚨" in m for m in _m11), f"({_m11})")
 
+# R11 (2026-10-11): detector 要識另外兩個系統 —— 真實誤報 fixture。
+# 10-10 嗰次 alert 嘅 9 筆候選: 3 再平衡 sell (647235/711766/1158861) +
+# 3 馬丁 SELL entries (744524/764949/774103) + 1 馬丁 close (816025, 新字段) +
+# 1 buy (805500, isBuyer 應被跳過) + 1 缺 fixture 嘅再平衡 sell (769647,
+# 模擬「log 唔齊」)。預期: 769647 仍然響, 其餘 8 筆靜默。
+# 用 env 指向假 log, 唔掂 production 真檔; 行為測試, 唔做 source-grep。
+import tempfile as _tf11
+_fx = _tf11.mkdtemp(prefix="unmatch_fx_")
+_mart_fx = {"chains": [
+    {"id": "m-422369", "side": "SELL", "state": "LOSS",
+     "entries": [{"qty": 0.00036, "px": 82688.0, "order_id": 744524},
+                 {"qty": 0.00072, "px": 83002.0, "order_id": 764949},
+                 {"qty": 0.00144, "px": 83290.0, "order_id": 774103}]},
+    {"id": "m-782722", "side": "BUY", "state": "WIN", "close_order_id": 816025,
+     "entries": [{"qty": 0.00018, "px": 83046.19, "order_id": 782722},
+                 {"qty": 0.00036, "px": 82542.01, "order_id": 800295}]},
+]}
+_rb_fx = {"events": [
+    {"ts": "2026-10-09T12:00:14+08:00", "action": "sell", "order_id": 647235},
+    {"ts": "2026-10-09T16:00:12+08:00", "action": "sell", "order_id": 711766},
+    {"ts": "2026-10-10T20:00:14+08:00", "action": "sell", "order_id": 1158861},
+]}
+json.dump(_mart_fx, open(os.path.join(_fx, "mart.json"), "w"))
+json.dump(_rb_fx, open(os.path.join(_fx, "rb.json"), "w"))
+os.environ["BTC_MART_LOG"] = os.path.join(_fx, "mart.json")
+os.environ["BTC_REBALANCE_LOG"] = os.path.join(_fx, "rb.json")
+
+
+def _mk_sell2(oid, age=60):
+    return {"orderId": oid, "isBuyer": False,
+            "time": int(time.time() * 1000) - age * 1000}
+
+
+_real9 = [_mk_sell2(o) for o in
+          (647235, 711766, 769647, 744524, 764949, 774103, 816025, 1158861)]
+# 805500 係真實再平衡 buy —— isBuyer=True 應該被跳過 (就算唔喺 known 都唔響)。
+_real9.append({"orderId": 805500, "isBuyer": True,
+               "time": int(time.time() * 1000) - 60_000})
+# 註: 769647 係真實再平衡 sell 但 fixture 冇寫入 rb.json (模擬「log 唔齊」)。
+# 所以預期: 769647 仍然響 (缺 log = 照誤報方向), 其餘 8 筆靜默 (含 buy-skip)。
+_u11 = cyc.find_unmatched_sells(_real9, {"orders": []}, since_ms=None)
+result("R11a 真實誤報 9 筆 → 只剩缺 log 嘅 769647 響",
+       _u11 == [769647], f"({_u11})")
+
+_phantom = [_mk_sell2(999001), _mk_sell2(999002)]
+_u11b = cyc.find_unmatched_sells(_phantom, {"orders": []}, since_ms=None)
+result("R11b 真 phantom (唔喺任何 log) 照樣揪到",
+       _u11b == [999001, 999002], f"({_u11b})")
+
+# R11c: fail-safe —— log 檔爛 / 唔存在 → 當冇 extra (照誤報, 唔靜默)
+os.environ["BTC_MART_LOG"] = os.path.join(_fx, "no-such-file.json")
+open(os.path.join(_fx, "rb.json"), "w").write("{broken json")
+_u11c = cyc.find_unmatched_sells([_mk_sell2(647235)], {"orders": []}, since_ms=None)
+result("R11c log 讀唔到 → 照響 (fail-closed, 唔當冇成交)",
+       _u11c == [647235], f"({_u11c})")
+
+# R11d: 舊調用兼容 —— 明傳 extra_known=None 以外嘅 set 照用, 唔讀檔
+os.environ.pop("BTC_MART_LOG", None)
+os.environ.pop("BTC_REBALANCE_LOG", None)
+_u11d = cyc.find_unmatched_sells([_mk_sell2(111), _mk_sell2(222)], {"orders": []},
+                                 since_ms=None, extra_known={"111"})
+result("R11d extra_known 明傳照用 (111 認得, 222 響)",
+       _u11d == [222], f"({_u11d})")
+
+# R11e: 唔傳 extra_known + env 冇設 → 讀真 log 路徑 (存在) 唔爆
+_u11e = cyc.find_unmatched_sells([], {"orders": []}, since_ms=None)
+result("R11e 空 trades + 真路徑 → 空結果唔爆", _u11e == [], f"({_u11e})")
+
+# R11f (GLM review): 讀取失敗要有聲 —— 爛 log 唔可以靜默降級
+# (用 999003: 唔喺任何 fixture / 真 log, 排除 R11e 真路徑污染)
+import io as _io11
+import contextlib as _cl11
+os.environ["BTC_MART_LOG"] = os.path.join(_fx, "no-such-file.json")
+os.environ["BTC_REBALANCE_LOG"] = os.path.join(_fx, "rb.json")
+open(os.path.join(_fx, "rb.json"), "w").write("{broken json")
+_buf11 = _io11.StringIO()
+with _cl11.redirect_stdout(_buf11):
+    _u11f = cyc.find_unmatched_sells([_mk_sell2(999003)], {"orders": []}, since_ms=None)
+result("R11f log 讀唔到 → 照響 + 出 warning (唔靜默降級)",
+       _u11f == [999003] and "_other_system_known_ids 讀取失敗" in _buf11.getvalue(),
+       f"({_u11f}, warn={'有' if '讀取失敗' in _buf11.getvalue() else '冇'})")
+os.environ.pop("BTC_MART_LOG", None)
+os.environ.pop("BTC_REBALANCE_LOG", None)
+
 cyc.HISTORY = HIST_PATH
 
 print(f"\n{sum(1 for _, ok in RESULTS if ok)}/{len(RESULTS)} PASS")
