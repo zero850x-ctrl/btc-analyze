@@ -216,11 +216,14 @@ result("ENGINE_PIN 同 pin 檔 commit 一致 (Haiku P2)",
        bool(_pin_commit_m) and _bb.ENGINE_PIN.startswith(_pin_commit_m.group(1)[:12]),
        f"(backtest={_bb.ENGINE_PIN[:12]} pin={(_pin_commit_m.group(1)[:12] if _pin_commit_m else '?')})")
 # ── Haiku P1: negative control 寫入測試 ──
-# 舊引擎 (origin/main 版 analyze_v3) 一定缺 push_eligible + rr_tp2_cell。
-# 由 git 撈出嚟 load，唔靠記憶、唔靠 source-grep。
+# 舊引擎 (sync 前版 analyze_v3) 一定缺 push_eligible + rr_tp2_cell。
+# Pin 死舊 commit (唔用 origin/main —— merge 後 main 已經係新引擎，
+# 撈出嚟唔會缺，control 會變假 FAIL)。由 git 撈出嚟 load，
+# 唔靠記憶、唔靠 source-grep。
+_NEG_CTRL_COMMIT = "8b8c1cc"  # Initial: merge PR#15 前嘅 main 版 analyze_v3
 import subprocess as _sp
 try:
-    _old_src = _sp.run(["git", "show", "origin/main:analyze_v3.py"],
+    _old_src = _sp.run(["git", "show", f"{_NEG_CTRL_COMMIT}:analyze_v3.py"],
                        capture_output=True, text=True, cwd=REPO,
                        timeout=60).stdout
     import types as _types
