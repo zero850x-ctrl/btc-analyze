@@ -11,6 +11,7 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - Daily:   MA20/MA50 + RSI(14) → trend direction + strength
   - H1:      MA20/MA50 + RSI(14) → intermediate trend
   - M15:     micro entry timing (trend, RSI, swing points, per-pattern suggestions)
+  - M5:      quick microstructure (trend, RSI, swings — informational only, never gates pushes)
   - Multi-TF alignment check: aligned_with_trends()
 
 📈 INDICATORS (add_indicators)
@@ -108,7 +109,7 @@ Architecture: fetch_data → add_indicators → find_swings → detect patterns
 → inject kline scores (step 7b) → generate report (reuses kline_* fields)
 """
 
-import os, json, argparse
+import os, json, argparse, sys
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 import numpy as np
@@ -133,6 +134,7 @@ PAXG_DATA_SOURCE = "Yahoo Finance PAXG-USD (現貨錨定)"
 DATA_SOURCE = "TradingView (OANDA:XAUUSD)"  # updated at runtime (M30/H1 intraday)
 DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"  # daily bars; prefer TV spot when available
 M15_DATA_SOURCE = None  # set in fetch_data; None = M15 disabled
+M5_DATA_SOURCE = None   # set in fetch_data; None = M5 disabled
 # Mixed-venue basis (spot M30 close vs futures daily close). None = same venue.
 SPOT_FUTURES_BASIS = None
 BASIS_CRON_BLOCKED = False
@@ -142,9 +144,159 @@ TV_OHLC_MAP = {
     'open': 'Open', 'high': 'High', 'low': 'Low',
     'close': 'Close', 'volume': 'Volume',
 }
-MIN_BARS = {'m30': 50, 'h1': 30, 'm15': 30, 'day': 20}
-TRAIL_PROFIT_ATR = float(os.environ.get('TRAIL_PROFIT_ATR', '2.0'))
-TRAIL_STOP_ATR = float(os.environ.get('TRAIL_STOP_ATR', '1.5'))
+MIN_BARS = {'m30': 50, 'h1': 30, 'm15': 30, 'm5': 100, 'day': 20}
+
+
+def _env_float(name, default, tag, allow_zero=False):
+    """Parse-safe, DOMAIN-safe float env read.
+
+    同 paper_trade.py 嘅同名 helper **行為必須一致**（test_exit_plan_display.py
+    有 behavioral parity 守衛，逐個壞值對比，唔係對比源碼字面）。
+
+    唔可以淨係 catch ValueError：`nan` 會 parse 成功但令所有比較變 False（規則
+    靜靜消失），`inf` 就永遠觸發 —— 兩者都係「靜默反轉」而唔係 crash。而
+    analyze_v3 係 cron 每支 tick 跑嘅 signal producer，一個 typo 令 import
+    crash 就等於**完全冇信號**。無效值一律 warn + 用預設。
+    """
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        print(f"⚠️ [{tag}] {name}={raw!r} 唔係數字 — 用預設 {default}")
+        return float(default)
+    if (val != val) or val in (float("inf"), float("-inf")) \
+            or val < 0 or (val == 0 and not allow_zero):
+        desc = "唔係有限非負數" if allow_zero else "唔係有限正數"
+        print(f"⚠️ [{tag}] {name}={raw!r} {desc} — 用預設 {default}")
+        return float(default)
+    return val
+
+
+TRAIL_PROFIT_ATR = _env_float('TRAIL_PROFIT_ATR', 2.0, '出場')
+TRAIL_STOP_ATR = _env_float('TRAIL_STOP_ATR', 1.5, '出場')
+
+# ── 出場模式（2026-09-28）────────────────────────────────────────────────
+# paper_trade.py 擁有**行為**；呢度係**讀者**，唔係第二份實作。兩邊預設必須
+# 一致 —— test_exit_plan_display.py 會逐字對比 source literal 釘住，唔靠記憶。
+#
+# momentum-hold（預設開）: TP1 之後餘下 2/3 掛移動止損跟勢，TP2 喺 TP1 之後
+# 唔會 fire（paper_trade.py 條件短路；tp1<=0 嘅退化 setup 例外）。legacy (=0)
+# 先會 TP2 止賺 1/3、尾倉 1/3，而且唔會喺 TP1 後把止損移去 breakeven。
+MOMENTUM_HOLD_EXIT = os.environ.get('MOMENTUM_HOLD_EXIT', '1') == '1'
+# 2026-09-28 第 2 項修好之前，paper_trade.py 嘅 momentum-hold 路徑**硬編碼
+# 1.5**、唔讀 TRAIL_STOP_ATR，所以呢度唯有如實寫死 1.5。修好之後兩邊都讀
+# 同一個 TRAIL_STOP_ATR ⇒ 直接引用，改環境變數顯示同實際一齊變。
+MOM_HOLD_TRAIL_ATR = TRAIL_STOP_ATR
+
+
+def exit_fields(tp2_price, tp2_label, tp3_trail_legacy, rr1=None):
+    """回傳 (tp2, tp3, exit_plan) 三個成品字串 —— 出場計劃文字嘅**單一入口**。
+
+    2026-09-28 事故: 報告同時寫「tp2 ... 止賺 1/3」同「exit_plan ... 餘下 2/3
+    無固定TP」。兩個都出自同一份報告，但只有後者同 ledger 一致（momentum-hold
+    令 TP2 短路），用戶按前者以為仲有 TP2/TP3 兩級止賺。所以三個欄要由同一個
+    函數產生，令佢哋**唔可能互相矛盾**。
+
+    legacy (=0) 分支: tp2/tp3 文字**逐字保留**原本寫法；`exit_plan` 就**刻意改咗**——
+    原本嗰句「餘下 2/3 無固定TP」係照抄 momentum-hold 版本，但 legacy 之下 TP2 係
+    有效目標，所以嗰句本身係錯。今次一併改準（唔係「唔改行為之外嘅嘢」，而係
+    「兩個模式嘅文字都要同實際一致」—— 呢個正正就係今次修嘅目的）。
+    """
+    if MOMENTUM_HOLD_EXIT:
+        tp2 = (f"${tp2_price:.0f} ({tp2_label})"
+               f" — ⚠️ 停用 (momentum-hold，TP1 後唔會 fire)")
+        tp3 = (f"TP1 後餘下 2/3 跟 {MOM_HOLD_TRAIL_ATR:g}×ATR 移動止損跟勢"
+               f" (無固定目標，唔會止賺)")
+        if rr1 is not None:
+            plan = (f"TP1 (+{rr1:.1f}R) 後 SL→BE; 餘下 2/3 無固定TP, "
+                    f"{MOM_HOLD_TRAIL_ATR:g} ATR trailing 跟勢 "
+                    f"(前輩式放飛: 平均贏$126/輸$27)")
+        else:
+            plan = (f"TP1 後 SL→BE; 餘下 2/3 無固定TP, "
+                    f"{MOM_HOLD_TRAIL_ATR:g} ATR trailing 跟勢")
+        return tp2, tp3, plan
+
+    tp2 = f"${tp2_price:.0f} ({tp2_label}, 止賺 1/3)"
+    tp3 = f"放飛 + {tp3_trail_legacy} (尾倉 1/3)"
+    # ⚠️ legacy 嘅 exit_plan 原本係照抄 momentum-hold 版本（「餘下 2/3 無固定TP」），
+    # 但 legacy 之下 TP2 係**有效**目標 ⇒ 嗰句係錯嘅。呢度改成準確描述，
+    # 令兩個模式嘅文字都同實際一致（呢個就係今次修嘅目的）。
+    # legacy 唔會喺 TP1 後把止損移去 breakeven（嗰步只存在於 momentum-hold）。
+    # trail 距離跟 TRAIL_STOP_ATR，唔可以再寫死 1.5 —— 否則一設 env，tp3
+    # （trail_stop_text）同 exit_plan 即刻互相矛盾。
+    if rr1 is not None:
+        plan = (f"TP1 (+{rr1:.1f}R) 後餘下 2/3: 1/3 到 TP2, "
+                f"1/3 跟 {TRAIL_STOP_ATR:g} ATR 移動止損 "
+                f"(前輩式放飛: 平均贏$126/輸$27)")
+    else:
+        plan = (f"TP1 後餘下 2/3: 1/3 到 TP2, "
+                f"1/3 跟 {TRAIL_STOP_ATR:g} ATR 移動止損")
+    return tp2, tp3, plan
+
+
+def rr_tp2_cell(setup):
+    """Markdown 表嘅「R:R TP2」格 —— 三態（生效／停用／未確認）。
+
+    2026-09-28: 以前無條件印 `{rr_tp2}:1`。但 momentum-hold（預設開）之下 TP2
+    **永遠唔會 fire** ⇒ 呢個係一個永遠唔會實現嘅回報風險比 = 假數字。同 `tp2`
+    欄一樣要講清楚。
+
+    ⚠️ 缺 key 唔可以當 False：舊 JSON（09-28 前）冇 `rr_tp2_active`，當 False 會
+    反過來印成「停用」—— 由「假目標」變「假停用」，即係事故嘅鏡像版。所以三態。
+    """
+    rr = setup.get('rr_tp2')
+    active = setup.get('rr_tp2_active')
+    if active is True:
+        return f"{rr}:1"
+    if active is False:
+        return f"{rr}:1 — ⚠️ 停用 (TP2 唔會 fire)"
+    return f"{rr}:1 — ⚠️ 未確認 (記錄缺 rr_tp2_active)"
+
+
+def setup_share_labels(setup):
+    """Signal 表嘅 TP2／TP3 列名。份額跟 `tp2_active`，唔可以寫死 (1/3)。
+
+    True → 兩級各 1/3。False → TP2 已停用，尾倉係餘下 2/3（再寫 (1/3) 就係
+    今次事故）。缺欄位 → 未確認，兩邊都唔主張。
+    """
+    active = setup.get("tp2_active") if isinstance(setup, dict) else None
+    if active is True:
+        return "🎯 TP2 (1/3)", "🎯 TP3 (1/3)"
+    if active is False:
+        return "🎯 TP2 (停用)", "🎯 尾倉 (餘下 2/3)"
+    return "🎯 TP2 (未確認)", "🎯 TP3 (未確認)"
+
+
+def static_exit_copy(atr):
+    """法則表、日誌範本、追蹤止損列。模式跟 MOMENTUM_HOLD_EXIT。
+
+    momentum-hold 嘅 trail 由 TP1 起 arm，距離係 MOM_HOLD_TRAIL_ATR。
+    legacy 先用「利潤達 TRAIL_PROFIT_ATR 先 arm、距離 TRAIL_STOP_ATR」。
+    """
+    if MOMENTUM_HOLD_EXIT:
+        mult = f"{MOM_HOLD_TRAIL_ATR:g}"
+        return {
+            "rule_tp2": "停用（TP1 後唔會 fire；價位只供參考）",
+            "rule_tp3": f"TP1 後餘下 2/3 跟 {mult}×ATR 移動止損（無固定目標）",
+            "journal_tp2": "🎯 TP2: 停用 (momentum-hold)",
+            "journal_tp3": f"🎯 尾倉 (餘下 2/3): 跟 {mult}×ATR 移動止損",
+            "trail_rule": (
+                f"TP1 後餘下 2/3 跟 {mult}×ATR 移動止損"
+                f"（由 TP1 起 arm，唔係等 +{TRAIL_PROFIT_ATR:g}×ATR）"
+            ),
+        }
+    return {
+        "rule_tp2": "2:1 RR 或 1.0 Fib ext (取較遠，比 TP1 更遠)，止賺 1/3",
+        "rule_tp3": (
+            f"放飛 + {TRAIL_STOP_ATR:g}×ATR 移動止損"
+            f"（尾倉 1/3；利潤達 {TRAIL_PROFIT_ATR:g}×ATR 先 arm）"
+        ),
+        "journal_tp2": "🎯 TP2 (1/3): ___",
+        "journal_tp3": "🎯 TP3 (1/3): 放飛 (追蹤止損)",
+        "trail_rule": trail_stop_text(atr),
+    }
 
 
 def _log(msg):
@@ -262,6 +414,38 @@ def trail_stop_text(atr):
         f"追蹤止損: 每 +${atr * TRAIL_PROFIT_ATR:.0f} 利潤, "
         f"止損移 ${atr * TRAIL_STOP_ATR:.0f}"
     )
+
+
+def apply_trail_overrides(trail_profit, trail_stop):
+    """CLI `--trail-profit` / `--trail-stop`.
+
+    `MOM_HOLD_TRAIL_ATR = TRAIL_STOP_ATR` 係 import 時抄咗個 float。之後只改
+    `TRAIL_STOP_ATR` 會令 momentum 文字停喺舊倍數、legacy `tp3` 用新倍數。
+    呢度兩個一齊改。`argparse` 嘅 `type=float` 會接受 nan；無效值唔寫入，
+    同 `_env_float` 一樣留低原值。
+    """
+    global TRAIL_PROFIT_ATR, TRAIL_STOP_ATR, MOM_HOLD_TRAIL_ATR
+
+    def _accept(flag, val):
+        if val is None:
+            return None
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            _log(f"⚠️ [出場] {flag}={val!r} 唔係數字 — 保持原值")
+            return None
+        if (num != num) or num in (float("inf"), float("-inf")) or num <= 0:
+            _log(f"⚠️ [出場] {flag}={val!r} 唔係有限正數 — 保持原值")
+            return None
+        return num
+
+    profit = _accept("--trail-profit", trail_profit)
+    stop = _accept("--trail-stop", trail_stop)
+    if profit is not None:
+        TRAIL_PROFIT_ATR = profit
+    if stop is not None:
+        TRAIL_STOP_ATR = stop
+        MOM_HOLD_TRAIL_ATR = TRAIL_STOP_ATR
 
 
 def _breakout_status(df, direction, support=None, resistance=None, tol=0, points=None):
@@ -440,12 +624,13 @@ def fetch_data():
     used when M30 is spot-anchored. GC=F M30 stays on GC=F daily so labels
     match bars and mixed-venue basis checks still run.
     """
-    global DATA_SOURCE, DAILY_DATA_SOURCE, M15_DATA_SOURCE
+    global DATA_SOURCE, DAILY_DATA_SOURCE, M15_DATA_SOURCE, M5_DATA_SOURCE
 
-    df_m30 = df_h1 = df_day = None
+    df_m30 = df_h1 = df_day = df_m15 = df_m5 = None
     DATA_SOURCE = "TradingView (OANDA:XAUUSD)"
     DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
     M15_DATA_SOURCE = None
+    M5_DATA_SOURCE = None
     m30_is_spot = False
     m30_from_tv = False
 
@@ -612,8 +797,48 @@ def fetch_data():
         df_m15 = None
         M15_DATA_SOURCE = None
 
-    _log(f"   📡 Final: M30={len(df_m30)} bars | H1={len(df_h1)} | M15={len(df_m15) if df_m15 is not None else 0} | Daily={len(df_day)} | Source: {src_note}")
-    return df_m30, df_h1, df_m15, df_day
+    # --- M5: native fetch (TV or yfinance); do not upsample M30 ---
+    # Same venue rule as M15: spot M30 (TV or PAXG) → PAXG 5m fallback;
+    # GC=F M30 → GC=F 5m. M5 is informational only (fast structure / trigger
+    # timing) and NEVER feeds the push gate (2026-09-03 decision).
+    df_m5 = None
+    if _TV_AVAILABLE and m30_from_tv:
+        try:
+            df_m5 = _tv.get_hist(TV_SYMBOL, TV_EXCHANGE, interval=TVInterval.in_5_minute, n_bars=500)
+            df_m5 = _normalize_tv_ohlc(df_m5)
+            if df_m5 is not None:
+                M5_DATA_SOURCE = DATA_SOURCE
+                _log(f"   TV M5: {len(df_m5)} bars")
+        except Exception as e:
+            _log(f"   TV M5 failed: {e}")
+            df_m5 = None
+
+    if df_m5 is None:
+        m5_ticker = PAXG_TICKER if m30_is_spot else YF_TICKER
+        try:
+            _log(f"[*] M5 fallback: Yahoo Finance {m5_ticker} 5m...")
+            # 5d (not 2d): GC=F has <100 5m bars in the last 2 calendar days
+            # after a weekend, which silently disabled M5 every Monday.
+            df_m5 = _yf_ohlc(m5_ticker, '5d', '5m')
+            if df_m5 is not None and not df_m5.empty:
+                M5_DATA_SOURCE = (
+                    PAXG_DATA_SOURCE if m5_ticker == PAXG_TICKER
+                    else "Yahoo Finance GC=F (紐約期貨)"
+                )
+                _log(f"   YF M5 ({m5_ticker}): {len(df_m5)} bars")
+            else:
+                df_m5 = None
+        except Exception as e:
+            _log(f"   YF M5 failed: {e}")
+            df_m5 = None
+
+    if df_m5 is not None and (df_m5.empty or len(df_m5) < MIN_BARS['m5']):
+        _log(f"   M5 insufficient ({0 if df_m5 is None else len(df_m5)} bars) — M5 quick structure disabled")
+        df_m5 = None
+        M5_DATA_SOURCE = None
+
+    _log(f"   📡 Final: M30={len(df_m30)} bars | H1={len(df_h1)} | M15={len(df_m15) if df_m15 is not None else 0} | M5={len(df_m5) if df_m5 is not None else 0} | Daily={len(df_day)} | Source: {src_note}")
+    return df_m30, df_h1, df_m15, df_m5, df_day
 
 # ═══════════════════════════════════════════════════════════
 # INDICATORS (lightweight — just what we need)
@@ -1640,25 +1865,26 @@ def analyze_h1_trend(df_h1):
 # M15 ENTRY TIMING
 # ═══════════════════════════════════════════════════════════
 
-def analyze_m15_entry_timing(df_m15, patterns, points, current_price, atr):
+def _analyze_mini_tf(df, patterns, points, current_price, atr, atr_scale=0.7):
     """
-    Analyze M15 timeframe for refined entry timing.
-    Returns dict with m15_trend, m15_rsi, m15_swings, and per-pattern entry_suggestions.
+    Core mini-timeframe (M5/M15) structure + per-pattern entry timing.
+    Informational ONLY — never feeds cron_push_eligible (2026-09-03 decision).
+    Returns dict with neutral keys: trend, rsi, swings, suggestions.
     """
-    if df_m15 is None or df_m15.empty or len(df_m15) < 20:
+    if df is None or df.empty or len(df) < 20:
         return {
-            'm15_trend': 'N/A (數據不足)',
-            'm15_rsi': None,
-            'm15_swings': None,
-            'entry_suggestions': [],
+            'trend': 'N/A (數據不足)',
+            'rsi': None,
+            'swings': None,
+            'suggestions': [],
         }
 
-    close = df_m15['Close'].values
-    high = df_m15['High'].values
-    low = df_m15['Low'].values
+    close = df['Close'].values
+    high = df['High'].values
+    low = df['Low'].values
     n = len(close)
 
-    # --- M15 short-term trend from last 20 bars ---
+    # --- Short-term trend from last 20 bars ---
     lookback = min(20, n)
     recent = close[-lookback:]
     ma10 = np.mean(recent[-min(10, lookback):])
@@ -1666,38 +1892,38 @@ def analyze_m15_entry_timing(df_m15, patterns, points, current_price, atr):
         first_half = np.mean(recent[:10])
         second_half = np.mean(recent[10:])
         if second_half > first_half * 1.001:
-            m15_trend = '🟢 BULLISH'
+            trend = '🟢 BULLISH'
         elif second_half < first_half * 0.999:
-            m15_trend = '🔴 BEARISH'
+            trend = '🔴 BEARISH'
         else:
-            m15_trend = '🟡 NEUTRAL'
+            trend = '🟡 NEUTRAL'
     else:
         if close[-1] > ma10:
-            m15_trend = '🟢 BULLISH'
+            trend = '🟢 BULLISH'
         elif close[-1] < ma10:
-            m15_trend = '🔴 BEARISH'
+            trend = '🔴 BEARISH'
         else:
-            m15_trend = '🟡 NEUTRAL'
+            trend = '🟡 NEUTRAL'
 
-    # --- M15 RSI ---
-    m15_rsi = None
+    # --- RSI ---
+    rsi = None
     try:
-        if 'RSI' in df_m15.columns:
-            rsi_val = float(df_m15['RSI'].iloc[-1])
+        if 'RSI' in df.columns:
+            rsi_val = float(df['RSI'].iloc[-1])
             if not np.isnan(rsi_val):
-                m15_rsi = round(rsi_val, 1)
+                rsi = round(rsi_val, 1)
     except Exception:
         pass
-    if m15_rsi is None:
+    if rsi is None:
         try:
             rsi_series = ta.momentum.RSIIndicator(close, window=14).rsi()
-            m15_rsi = round(float(rsi_series[-1]), 1) if not pd.isna(rsi_series[-1]) else None
+            rsi = round(float(rsi_series[-1]), 1) if not pd.isna(rsi_series[-1]) else None
         except Exception:
             pass
 
-    # --- M15 swing points: simple swing detection on last ~40 bars ---
+    # --- Swing points: simple swing detection on last ~40 bars ---
     swing_lookback = min(40, n - 4)
-    m15_swings = {'highs': [], 'lows': []}
+    swings = {'highs': [], 'lows': []}
     for i in range(n - swing_lookback + 2, n - 2):
         lb = 3
         if i < lb or i >= n - lb:
@@ -1709,83 +1935,185 @@ def analyze_m15_entry_timing(df_m15, patterns, points, current_price, atr):
         is_low = all(l <= float(low[i - j]) for j in range(1, lb + 1)) and \
                  all(l <= float(low[i + j]) for j in range(1, lb + 1))
         if is_high:
-            m15_swings['highs'].append(round(h, 2))
+            swings['highs'].append(round(h, 2))
         elif is_low:
-            m15_swings['lows'].append(round(l, 2))
+            swings['lows'].append(round(l, 2))
 
     # Nearest swing high/low relative to current price
     nearest_high = None
     nearest_low = None
-    if m15_swings['highs']:
-        above = [h for h in m15_swings['highs'] if h > current_price]
+    if swings['highs']:
+        above = [h for h in swings['highs'] if h > current_price]
         if above:
             nearest_high = min(above)
         else:
-            nearest_high = max(m15_swings['highs'])  # all below — use highest
-    if m15_swings['lows']:
-        below = [l for l in m15_swings['lows'] if l < current_price]
+            nearest_high = max(swings['highs'])  # all below — use highest
+    if swings['lows']:
+        below = [l for l in swings['lows'] if l < current_price]
         if below:
             nearest_low = max(below)
         else:
-            nearest_low = min(m15_swings['lows'])  # all above — use lowest
+            nearest_low = min(swings['lows'])  # all above — use lowest
 
     # --- Per-pattern entry suggestions ---
     entry_suggestions = []
-    m15_atr = None
+    mini_atr = None
     try:
-        if 'ATR' in df_m15.columns:
-            val = float(df_m15['ATR'].iloc[-1])
+        if 'ATR' in df.columns:
+            val = float(df['ATR'].iloc[-1])
             if not np.isnan(val):
-                m15_atr = val
+                mini_atr = val
     except Exception:
         pass
-    if m15_atr is None:
-        # Estimate M15 ATR as roughly half of M30 ATR
-        m15_atr = atr * 0.7
+    if mini_atr is None:
+        # Estimate mini ATR as a fraction of M30 ATR (M15 ~0.7x, M5 ~0.5x)
+        mini_atr = atr * atr_scale
 
     for p in patterns:
         direction = p.get('direction', 'NEUTRAL')
         ptype = p.get('type', 'Unknown')
 
-        # Tighter entry zone: use M15 ATR for refinement
+        # Tighter entry zone: use mini ATR for refinement
         if 'BULL' in direction.upper() or 'LONG' in direction.upper():
-            # For longs: entry zone near recent M15 low + buffer
-            entry_low = round(current_price - m15_atr * 0.5, 2)
-            entry_high = round(current_price + m15_atr * 0.3, 2)
-            sl = round(current_price - m15_atr * 1.5, 2) if nearest_low is None else round(min(current_price - m15_atr * 1.5, nearest_low - m15_atr * 0.3), 2)
+            # For longs: entry zone near recent low + buffer
+            entry_low = round(current_price - mini_atr * 0.5, 2)
+            entry_high = round(current_price + mini_atr * 0.3, 2)
+            sl = round(current_price - mini_atr * 1.5, 2) if nearest_low is None else round(min(current_price - mini_atr * 1.5, nearest_low - mini_atr * 0.3), 2)
         elif 'BEAR' in direction.upper() or 'SHORT' in direction.upper():
-            entry_low = round(current_price - m15_atr * 0.3, 2)
-            entry_high = round(current_price + m15_atr * 0.5, 2)
-            sl = round(current_price + m15_atr * 1.5, 2) if nearest_high is None else round(max(current_price + m15_atr * 1.5, nearest_high + m15_atr * 0.3), 2)
+            entry_low = round(current_price - mini_atr * 0.3, 2)
+            entry_high = round(current_price + mini_atr * 0.5, 2)
+            sl = round(current_price + mini_atr * 1.5, 2) if nearest_high is None else round(max(current_price + mini_atr * 1.5, nearest_high + mini_atr * 0.3), 2)
         else:
-            entry_low = round(current_price - m15_atr * 0.5, 2)
-            entry_high = round(current_price + m15_atr * 0.5, 2)
-            sl = round(current_price - m15_atr * 1.5, 2)
+            entry_low = round(current_price - mini_atr * 0.5, 2)
+            entry_high = round(current_price + mini_atr * 0.5, 2)
+            sl = round(current_price - mini_atr * 1.5, 2)
 
         entry_suggestions.append({
             'pattern_type': ptype,
             'direction': direction,
-            'm15_entry_zone': f'${entry_low:.0f} – ${entry_high:.0f}',
-            'm15_sl': f'${sl:.0f}',
-            'm15_atr': round(m15_atr, 2),
+            'entry_zone': f'${entry_low:.0f} – ${entry_high:.0f}',
+            'sl': f'${sl:.0f}',
+            'mini_atr': round(mini_atr, 2),
         })
 
     return {
-        'm15_trend': m15_trend,
-        'm15_rsi': m15_rsi,
-        'm15_swings': {
+        'trend': trend,
+        'rsi': rsi,
+        'swings': {
             'nearest_high': nearest_high,
             'nearest_low': nearest_low,
-            'highs': m15_swings['highs'][-5:],
-            'lows': m15_swings['lows'][-5:],
+            'highs': swings['highs'][-5:],
+            'lows': swings['lows'][-5:],
         },
-        'entry_suggestions': entry_suggestions,
+        'suggestions': entry_suggestions,
+    }
+
+
+def analyze_m15_entry_timing(df_m15, patterns, points, current_price, atr):
+    """M15 wrapper — keeps m15_* key shape for existing report/JSON consumers."""
+    core = _analyze_mini_tf(df_m15, patterns, points, current_price, atr, atr_scale=0.7)
+    return {
+        'm15_trend': core['trend'],
+        'm15_rsi': core['rsi'],
+        'm15_swings': core['swings'],
+        'entry_suggestions': [
+            {
+                'pattern_type': s['pattern_type'],
+                'direction': s['direction'],
+                'm15_entry_zone': s['entry_zone'],
+                'm15_sl': s['sl'],
+                'm15_atr': s['mini_atr'],
+            }
+            for s in core['suggestions']
+        ],
+    }
+
+
+def analyze_m5_entry_timing(df_m5, patterns, points, current_price, atr):
+    """M5 wrapper — mirrors M15 keys with m5_* prefix (informational only)."""
+    core = _analyze_mini_tf(df_m5, patterns, points, current_price, atr, atr_scale=0.5)
+    return {
+        'm5_trend': core['trend'],
+        'm5_rsi': core['rsi'],
+        'm5_swings': core['swings'],
+        'entry_suggestions': [
+            {
+                'pattern_type': s['pattern_type'],
+                'direction': s['direction'],
+                'm5_entry_zone': s['entry_zone'],
+                'm5_sl': s['sl'],
+                'm5_atr': s['mini_atr'],
+            }
+            for s in core['suggestions']
+        ],
     }
 
 
 # ═══════════════════════════════════════════════════════════
 # CANDLESTICK PATTERN DETECTION
 # ═══════════════════════════════════════════════════════════
+
+_REBOUND_EMPTY = {
+    'signal': False, 'reason': 'M15 數據不足', 'bar_time': None, 'entry': None,
+    'sma10': None, 'prev_high3': None,
+}
+
+
+def detect_rebound_signal(df_m15):
+    """
+    S3 反彈確認信號 (2026-09-03):
+    15m bar: 陽燭 + close > SMA10 + close > 前3bar最高 → 之後 10 分鐘 snapshot。
+    ⚠️ 歷史回測協議曾現 look-ahead bias (entry 早於信號確認) — 修正後勝率
+    ~47% ≈ baseline ~50%, 即歷史上無 edge。真實勝率由 live paper sim
+    (paper_martingale.json) 收集驗證。配合 3 級馬丁 (0.01→0.04) 模擬。
+    純資訊 + paper_trade 模擬 — 唔影響 cron_push_eligible。
+
+    2026-09-03 fix: 必須 evaluate 最後一條「已收市」15m bar — tvDatafeed 最後
+    一行係形成中 (未收市) bar, cron 10min tick 對 15m bar 永遠撞唔正。舊 code
+    用 forming bar 計信號 → 全日 12 個真確認信號全部 miss (實測證實)。
+    """
+    if df_m15 is None or df_m15.empty or len(df_m15) < 20:
+        return dict(_REBOUND_EMPTY)
+    close = df_m15['Close'].values
+    high = df_m15['High'].values
+    open_ = df_m15['Open'].values
+
+    # --- 只睇已收市 bar (naive index = UTC, same convention as M30/H1) ---
+    try:
+        last_start = pd.Timestamp(df_m15.index[-1])
+        if last_start.tzinfo is not None:
+            last_start = last_start.tz_convert('UTC').tz_localize(None)
+        interval = pd.Timedelta(minutes=15)
+        now_ts = pd.Timestamp.now(tz='UTC').tz_localize(None)
+        if last_start + interval > now_ts:
+            bar_idx = len(df_m15) - 2      # 最後一行未收市 → 用上一條 (已收市)
+        else:
+            bar_idx = len(df_m15) - 1
+    except Exception:
+        bar_idx = len(df_m15) - 2          # 判斷失敗 → 保守用上一條
+    if bar_idx < 5:
+        return dict(_REBOUND_EMPTY)
+
+    last = bar_idx
+    sma10 = float(np.mean(close[last - 9:last + 1]))     # 含評估 bar, 同研究 rolling(10) 一致
+    prev_high3 = float(np.max(high[last - 3:last]))      # 前 3 支 bar 最高 (唔含評估 bar)
+    bullish = close[last] > open_[last]
+    signal = bool(bullish and close[last] > sma10 and close[last] > prev_high3)
+    bar_time = None
+    try:
+        bar_time = str(df_m15.index[last])
+    except Exception:
+        pass
+    return {
+        'signal': signal,
+        'reason': 'S3 陽燭+站上MA10+破3bar高' if signal else '未確認',
+        'bar_time': bar_time,
+        'entry': round(float(close[last]), 2),
+        'sma10': round(sma10, 2),
+        'prev_high3': round(prev_high3, 2),
+    }
+
+
 
 def _body(o, c):
     """Absolute body size."""
@@ -2076,6 +2404,10 @@ def cron_push_eligible(setup):
     # Danger hour block (07:00/18:00 — 138-sample); advisory hours allowed through
     if setup.get('time_quality') == 'danger':
         return False
+    # Post-spike chase gate (2026-09-04, mentor 9/1-9/4): 急跌/急升後短窗口
+    # 內追同一方向 = V 型反彈陷阱 (9/4 追沽 6 筆全滅 −$2,200+)
+    if setup.get('post_spike_blocked'):
+        return False
     # Must have TP targets — no naked entries
     tp1_str = str(setup.get('tp1', ''))
     if not tp1_str or tp1_str == '0' or '$0' in tp1_str:
@@ -2089,6 +2421,70 @@ def cron_push_eligible(setup):
     if entry_mode in ('pullback', 'boundary', 'fib', 'fib0786'):
         return priority <= 3
     return priority <= 2
+
+
+_CONTRACT_GAP_SEEN = set()
+
+
+def _report_contract_gap(setup):
+    """「eligible 但缺 push_suppressed」= producer 契約破損，要出聲（唔可以靜默）。
+
+    刻意保留 `push_eligible()` 嘅 fail-open 回傳值（要 mirror 歷史，見其
+    docstring），但唔可以連警告都冇：新 producer 若唔記得跑
+    `_inject_push_metadata`，一個 0-15% 勝率嘅限價訊號會被當成可推送
+    → 直接去真錢用戶。守衛唔可以係 no-op（同類：重試語義／靜默失敗家族）。
+
+    警告去 **stderr** —— 唔污染 stdout（cron 報告由 stdout／JSON 驅動），
+    並按 (entry_mode, pattern) 去重，免得掃 79 日歷史報告時洗版。
+    """
+    key = (setup.get('entry_mode'), setup.get('pattern'))
+    if key in _CONTRACT_GAP_SEEN:
+        return
+    _CONTRACT_GAP_SEEN.add(key)
+    print(f"⚠️ producer contract: eligible setup 缺 push_suppressed "
+          f"(entry_mode={setup.get('entry_mode')!r}, pattern={setup.get('pattern')!r}) "
+          f"— fail-open 放行; 若見於**新**報告 = _inject_push_metadata 冇跑",
+          file=sys.stderr)
+
+
+def push_eligible(setup):
+    """最終推送規則 — 「呢個 setup 會被推去 WhatsApp／Hermes 嗎？」嘅唯一真相。
+
+    2026-09-24 抽出：原本 `main()` 嘅 `push_candidates` 係 inline 兩條件，
+    `backtest.py` 只抄咗第一條（`cron_push_eligible`）而漏咗 `push_suppressed`
+    → 回測會 trade 四個限價模式（boundary/pullback/fib/fib0786），而**現行策略**
+    唔推呢批。實測同一 6 個月：97 單 vs 82 單（15 單 = 15% 係推唔到嘅），
+    勝率 45.4% vs 53.7%。n=15 本身喺噪音範圍 —— 呢個修嘅價值係 **fidelity**
+    （回測要 mirror live 實際會推嘅嘢），唔係「回測變好咗」，唔好當 alpha 證據。
+
+    抽出單一真相函數嘅目的係令「兩份實作各自漂移」唔會再無聲發生（本次事故
+    正是如此：一個條件被抄漏，冇任何東西會發現）。
+
+    回測 mirror 嘅係**現行**推送政策（`_inject_push_metadata` 每個 bar 都寫
+    bool），唔係 09-08 之前嗰段日曆。`run_backtest` 唔會行到缺 key 分支。
+
+    ⚠️ 缺 `push_suppressed` key 時 fail-open（回 True）只服務**舊 JSON**：
+    09-08 之前嘅報告有 `cron_push_eligible=True` 但冇呢個欄（當時限價係有推）。
+    key **存在但唔係 bool**（`null` / `1` / `"True"`）係契約破損，**fail-closed**
+    （只有明確 `False` 先當「冇壓制」），同時 `_report_contract_gap()` 出聲。
+    缺 key 都出聲，但回傳值保持 fail-open，先唔會改寫嗰批舊報告。
+
+    ⚠️ 同 `cron_push_eligible` 嘅分工（兩者係唔同問題，唔可以互換）:
+      • `cron_push_eligible` = 紀律閘／「可執行嗎」→ paper_trade seeding 用佢。
+        限價模式經 walk-forward 證實無 edge，唔推送但要照 seed（累積真 fill
+        樣本做裁決）。
+      • `push_eligible` = 推送閘 → 報告／cron／回測用佢。
+    任何「決定會被推嗎」嘅消費者（含 backtest harness）一律 call 呢個，
+    唔好自己讀 `cron_push_eligible`（2026-09-24 事故正是如此）。
+    """
+    cron_ok = setup.get('cron_push_eligible') is True
+    has_key = 'push_suppressed' in setup
+    val = setup.get('push_suppressed')
+    if cron_ok and not isinstance(val, bool):
+        _report_contract_gap(setup)
+    if not has_key:
+        return cron_ok
+    return cron_ok and val is False
 
 
 def _parse_entry_price_from_setup(setup, current_price=None):
@@ -2142,26 +2538,215 @@ def _setup_seedable(setup, current_price=None):
     return False
 
 
+def _spike_window(closes, atr):
+    """Shared precondition check for the post-spike window.
+
+    Returns `(window, None)` when the window is usable, otherwise
+    `(None, reason)`. The REASON is the whole point: an unusable window and a
+    quiet market both used to surface as `None`, and the gate treated both as
+    "no spike" — i.e. it failed OPEN on the exact guard the 09-04 incident
+    (six consecutive chasing losses) produced. Callers that must not guess use
+    `_post_spike_indeterminate()` and block instead.
+
+    Two precision rules (2026-10-11 review):
+      * ATR must be a finite positive number. `nan <= 0` is False, so the old
+        `atr <= 0` test let a NaN ATR through, and `abs(move) <= mult * nan` is
+        then also False — a flat series became a fabricated "up" spike that
+        blocked BUY and let SELL through. NaN / inf ATR is unusable.
+      * Every COMPLETED close in the window must be finite, but the final value
+        is the still-forming bar: live already expects it to be NaN sometimes
+        (it falls back to the last valid close) and the math never reads it
+        (`window[-2]` is the reference, `window[0]` the base). Requiring it
+        finite turned one NaN forming bar into a blocked tick for every push
+        and every seed. A NaN among the completed bars still means a gappy /
+        corrupt series, so that stays indeterminate (fail closed).
+    """
+    if closes is None:
+        return None, "no M30 close series"
+    try:
+        atr_f = float(atr)
+    except (TypeError, ValueError):
+        atr_f = float("nan")
+    if atr is None or not np.isfinite(atr_f) or atr_f <= 0:
+        return None, f"ATR unusable ({atr})"
+    need = SPIKE_WINDOW_BARS + 2  # 4 收市 bar + last(forming) + 前 1 參考
+    if len(closes) < need:
+        return None, f"only {len(closes)} M30 bars (< {need})"
+    # Index by position (never compact), so a bad value cannot shift the window.
+    tail = []
+    for c in list(closes[-need:]):
+        try:
+            tail.append(float(c))
+        except (TypeError, ValueError):
+            tail.append(float("nan"))
+    if not all(np.isfinite(c) for c in tail[:-1]):   # tail[-1] = forming bar
+        return None, "non-finite close inside the window"
+    return tail, None
+
+
+def _post_spike_indeterminate(closes, atr):
+    """Why the post-spike window could NOT be evaluated (None when it could).
+
+    Kept separate from `_post_spike_state` so the gate can fail CLOSED without
+    changing that function's long-standing contract (`None` == "no spike"),
+    which the existing unit tests assert.
+    """
+    return _spike_window(closes, atr)[1]
+
+
+def _post_spike_state(closes, atr):
+    """Post-sharp-move mean-reversion window (see SPIKE_* constants).
+
+    2026-09-04 (mentor 9/1-9/4, 132 trades): 9/4 金價急插 4470→4375 後 2 小時
+    內追沽 6 筆全滅 (−$2,200+)。急跌/急升後短窗口內追同一方向 = V 型反彈
+    陷阱。本函數檢查「最近 SPIKE_WINDOW_BARS 條已收市 M30 bar」嘅累計變動
+    (close-to-close, 唔含 forming bar), > SPIKE_ATR_MULT×ATR 即返回 spike
+    方向。setup 方向同 spike 方向一致 → post_spike_blocked=True (唔推送)。
+
+    closes: M30 close 序列 (numpy array 或 list, 最後一個可能係 forming bar)
+    atr:    M30 ATR 值 (float)
+    """
+    window, reason = _spike_window(closes, atr)
+    if reason is not None or window is None:
+        return None
+    # closes[-1] = forming bar (未收市, tvDatafeed 最後一行), closes[-2] = 最後已收市
+    ref = window[-2]
+    base = window[-2 - SPIKE_WINDOW_BARS]
+    move = ref - base
+    if abs(move) <= SPIKE_ATR_MULT * float(atr):
+        return None
+    return {"direction": "down" if move < 0 else "up", "move": round(move, 2)}
+
+
+_UNSET = object()   # 「caller 冇接線呢個參數」哨兵，唔可以同「明確傳 None」混淆
+
+
 def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
-                          time_quality_override=None):
+                          time_quality_override=None, points=None, atr=_UNSET,
+                          closes=_UNSET, bar_time=None):
     """Attach counter-trend severity, recommended volume, time quality, and cron gate.
 
     time_quality_override: when set (e.g. walk-forward backtest), use this level
     instead of wall-clock _time_quality_score() so historical bars aren't gated
     by the hour the script happens to run.
+    bar_time: the BAR being evaluated, for a replay. Without it every replayed
+    bar is scored with the run hour (session_bonus + golden-hour volume became
+    constants); a live run leaves it None and keeps the wall clock.
+
+    2026-10-10 外審 follow-up: `atr` / `closes` 用 `_UNSET` 哨兵，令兩種情況
+    分得開 ——
+      • 冇接線（default `_UNSET`）→ 唔 block，只記 `post_spike_indeterminate`。
+        漏一個參數唔應該變成靜默推送乾旱。
+      • 明確傳入但唔可用（None／NaN／ATR<=0／bar 不足）→ BLOCK。
+        呢個係資料問題，同「冇接線」係兩件事。
+    之前 `atr=None` 同 `closes=None` 一律當「冇接線」（唔 block），而
+    `atr=None` 又其實會被 `_spike_window` 當唔可用 —— 兩個方向都唔一致。
     """
     if time_quality_override is not None:
         tq_level = time_quality_override
     else:
         tq_level, _ = _time_quality_score()
+    broker_hour = _broker_hour(bar_time)
+    session_bonus = (
+        tq_level != 'danger'
+        and broker_hour in SESSION_BONUS_HOURS
+    )
+    unwired = []
+    if atr is _UNSET:
+        unwired.append("atr")
+    if closes is _UNSET:
+        unwired.append("closes")
+    if unwired:
+        spike = None
+        spike_unknown = None
+        spike_unwired = "caller 冇接線: " + ", ".join(unwired)
+    else:
+        spike = _post_spike_state(closes, atr)
+        # 2026-10-10 review: an UNUSABLE window is not a quiet market. The gate
+        # used to read both as "no spike" and push anyway — fail-OPEN on the
+        # guard that exists because of the 09-04 chasing losses. Unknown blocks.
+        spike_unknown = (_post_spike_indeterminate(closes, atr)
+                         if spike is None else None)
+        spike_unwired = None
     for s in setups:
         side = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
         is_sell = side == 'BEARISH'
         severity = counter_trend_severity(side, daily_trend, h1_trend)
-        vol, _ = _volume_risk_tier(severity)
+        vol, _ = _volume_risk_tier(severity, tq_level=tq_level)
         s['counter_trend_severity'] = severity
         s['recommended_volume'] = vol
         s['time_quality'] = tq_level
+        # 2026-09-01 regime metadata: D1+H1 both oppose side. This is exactly
+        # counter_trend_severity == 'SEVERE' — which cron_push_eligible already
+        # blocks via the ALIGNED gate — so regime_blocked is informational only,
+        # never an additional push gate (no dead-code duplicate guard).
+        d_trend = (daily_trend or {}).get('trend', 'NEUTRAL')
+        h1_t = (h1_trend or {}).get('trend', 'NEUTRAL')
+        if side == 'BEARISH':
+            both_opp = d_trend == 'BULLISH' and h1_t == 'BULLISH'
+        else:
+            both_opp = d_trend == 'BEARISH' and h1_t == 'BEARISH'
+        s['regime_blocked'] = bool(both_opp)
+        # 2026-09-01: mentor-sample session bonus — priority bump for aligned
+        # setups during the mentor's strongest hours. Bonus applies only when
+        # the setup would already be pushed (post cron_push_eligible below);
+        # danger/advisory gating is never lifted by the bonus.
+        s['session_bonus'] = bool(
+            session_bonus and severity == 'ALIGNED'
+        )
+        # 2026-09-02 zone-rejection (mentor H1 charts: he sold $4420-4449
+        # resistance 38 times — repeatedly-tested zones hold). Setups whose
+        # entry sits on a swing-high/low cluster (>=2 touches within 1.0 ATR
+        # either side, from find_swings_ordered) get a priority boost.
+        # Breakout/已突破 setups: _parse_entry_price_from_setup falls back to
+        # current_price, so their zone is scored at the live price (entry ==
+        # 2026-09-08 review: breakout setups fall back to current_price, and
+        # after a break the price sits at the *opposite* swing type (SELL
+        # breakout → near swing lows), so counting highs there is meaningless.
+        # Score only limit-style modes whose entry is a real level.
+        zone_modes = ('boundary', 'pullback', 'fib', 'fib0786')
+        if points is not None and atr and s.get('entry_mode', 'breakout') in zone_modes:
+            ep = s.get('entry_price') or _parse_entry_price_from_setup(s, current_price)
+            if ep is not None:
+                touches, zlabel, _ztouch_idx = _zone_rejection_score(
+                    side, float(ep), points, atr
+                )
+                s['zone_touches'] = touches
+                s['zone_label'] = zlabel
+            else:
+                s['zone_touches'] = 0
+                s['zone_label'] = ''
+        else:
+            s['zone_touches'] = 0
+            s['zone_label'] = ''
+
+        # 2026-09-04 post-spike chase gate: 急跌/急升後短窗口內追同一方向 →
+        # 唔推送 (V 型反彈陷阱, mentor 9/1-9/4: 9/4 追沽 6 筆全滅 −$2,200+)
+        if spike is not None:
+            same_dir = (spike['direction'] == 'down' and is_sell) or \
+                       (spike['direction'] == 'up' and not is_sell)
+            s['post_spike_blocked'] = bool(same_dir)
+            s['post_spike_note'] = (
+                f"⚠️ 最近 {SPIKE_WINDOW_BARS} bar 急{'跌' if spike['direction']=='down' else '升'} "
+                f"{abs(spike['move']):.0f} 點 — 追{'沽' if is_sell else '買'}風險窗口內, 唔推送"
+                if same_dir else ""
+            )
+            s['post_spike_indeterminate'] = None
+        elif spike_unknown is not None:
+            # 2026-10-10 review: 舊碼喺呢個情況當「冇 spike」照推 = fail-OPEN。
+            # 呢個閘係 09-04 追勢六連敗 (−$2,200+) 之後加嘅；睇唔到就當有風險。
+            s['post_spike_blocked'] = True
+            s['post_spike_note'] = (
+                f"⚠️ 急升/急跌窗口無法判斷（{spike_unknown}）— 保守起見唔推送"
+            )
+            s['post_spike_indeterminate'] = spike_unknown
+        else:
+            s['post_spike_blocked'] = False
+            s['post_spike_note'] = ""
+            # Audible either way: a wiring gap ("no series provided") is recorded
+            # next to a real "window unusable" reason, so a silent no-gate state
+            # is greppable in the JSON instead of invisible.
+            s['post_spike_indeterminate'] = spike_unwired
 
         if s.get('entry_price') is None:
             ep = _parse_entry_price_from_setup(s, current_price)
@@ -2186,12 +2771,65 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         # Limit modes with a machine entry_price may also be pushed so Hermes
         # can place a pending order — paper_trade still requires seedable.
         base = cron_push_eligible(s)
+        # 2026-09-08 walk-forward review (claude-fable-5-1 + Cursor 3-model):
+        # limit-style entries have NO demonstrated edge — 2y walk-forward with
+        # limit-fill verification shows boundary 0-15% win (both segments
+        # negative R), pullback/fib have ~0 fills.
+        #
+        # DESIGN (Cursor review round 2): cron_push_eligible keeps its meaning
+        # "executable by paper_trade" — it stays the discipline gate, so limit
+        # modes ARE still seeded and recorded (paper_trade accumulates real
+        # fill samples for the 3-month verdict). The PUSH layer reads the
+        # separate push_suppressed flag instead. Env LIMIT_MODE_PUSH=1
+        # restores pushing without a git revert.
+        suppress_push = mode in ('boundary', 'pullback', 'fib', 'fib0786')
+        if os.environ.get('LIMIT_MODE_PUSH') == '1':
+            suppress_push = False
+        if suppress_push:
+            s['push_suppressed'] = True
+            s['limit_mode_blocked'] = True
+            s['limit_mode_note'] = (
+                '🔒 限價模式經 walk-forward 證實無 edge（boundary 真 fill 後 0-15% '
+                '勝率, pullback/fib 近乎零成交）— paper 照記錄, 唔推送; '
+                '三個月後再裁決 (LIMIT_MODE_PUSH=1 可恢復)'
+            )
+        else:
+            s['push_suppressed'] = False
+        # cron_push_eligible = discipline gate for paper_trade (executable).
+        # seedable or limit-mode-with-levels passes; everything else False.
+        # NOTE (Cursor round-2): keep this exactly on ('boundary','fib0786') as
+        # in main — widening to all 4 limit modes would make untriggered
+        # pullback/fib eligible once LIMIT_MODE_PUSH=1, which main never did.
+        # push_suppressed still covers all 4 modes, so the suppression layer
+        # is unaffected; this guard only limits what an explicit re-enable
+        # (LIMIT_MODE_PUSH=1) can surface.
         if s['seedable']:
             s['cron_push_eligible'] = base
         elif mode in ('boundary', 'fib0786') and s.get('entry_price') is not None:
             s['cron_push_eligible'] = base
         else:
             s['cron_push_eligible'] = False
+
+        # rank_priority: display/sort only — must not widen cron_push_eligible
+        rp = s.get('priority', 99)
+        if s.get('session_bonus') and rp > 1:
+            rp -= 1
+        if s.get('zone_touches', 0) >= 2 and rp > 1:
+            rp -= 1
+        s['rank_priority'] = rp
+
+    # 2026-10-10 外審 follow-up: fail-closed 唔可以有靜默乾旱。真 spike 擋單係
+    # 預期行為（有 log 亦入 gate_summary），但「數據用唔到而擋晒所有單」係事故
+    # —— 只寫落 JSON 而冇人讀，就係上次靜默乾旱嘅翻版。所以喺 operator 真係睇
+    # 得到嘅 stdout 出 warning（cron output 亦會capture）。
+    _indet_blocked = [s for s in setups
+                      if s.get('post_spike_blocked') and s.get('post_spike_indeterminate')]
+    if _indet_blocked and spike is None:
+        _log(f"⚠️  post-spike gate 擋咗 {len(_indet_blocked)} 個 setup，但唔係因為偵測到"
+             f"真 spike — 而係 M30 窗／ATR 用唔到。原因：{_indet_blocked[0]['post_spike_indeterminate']}")
+
+    setups.sort(key=lambda s: (s.get('rank_priority', s.get('priority', 99)), -s.get('rr_tp1', 0)))
+    return spike
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2379,6 +3017,22 @@ def _counter_trend_note(side, daily_trend, h1_trend, prefix=''):
 
 # Broker timezone offset from UTC (hours). Override via BROKER_UTC_OFFSET_HOURS env.
 BROKER_UTC_OFFSET_HOURS = int(os.environ.get('BROKER_UTC_OFFSET_HOURS', '-3'))
+HKT_LOCAL = timezone(timedelta(hours=8))  # trade-day timezone (cron window)
+
+# 2026-09-04 post-spike chase gate (mentor 9/1-9/4, 132 trades):
+#   - 9/4: 金價 13:00-13:37 急插 4470→4375 (≈9.5 ATR) 後 2 小時內追沽 6 筆全滅
+#     (−$2,200+), 全部被 V 型反彈夾爆 (13:32 SELL@4395→−$365, 13:37→−$461,
+#     14:18→−$236, 14:24→−$466 ...)
+#   - 9/1 崩盤日嘅贏家 sell 全部係 spike 前入 (07:47 SELL@4429 +$869), 唔係
+#     spike 後追 — 所以 block 追 direction 唔會誤殺 trend-follow 入場
+#   - Gate 只 block「追 spike 方向」嘅 setup 推送; 反方向 (搏反彈) 唔 block,
+#     因為 counter-trend severity gate 已處理佢
+SPIKE_WINDOW_BARS = 4          # 最近 4 條已收市 M30 bar 嘅累計變動窗口
+# 2026-09-08 review: 2.0×ATR over 4 bars fires on ordinary trend continuation
+# (0.5 ATR/bar). The motivating 9/4 move was ≈9.5 ATR. 3.0 keeps the gate for
+# genuine spikes while letting normal trend-follow pushes through. Hit rate is
+# exported in JSON (`post_spike`) so the threshold can be tuned on data.
+SPIKE_ATR_MULT = float(os.environ.get('SPIKE_ATR_MULT', '3.0'))
 MAX_PATTERNS_PER_DIRECTION = 2  # top-N patterns per side before setup generation
 
 # Broker-local hours below (UTC + offset).
@@ -2386,16 +3040,71 @@ GOLDEN_HOURS = {17}          # 17:00 (64.3% win, +$339 — 138-sample 2026-07-30
 ADVISORY_HOURS_0408 = {4, 5, 6, 8}
 # 17:00 promoted to GOLDEN (64.3% win, +$339 net, 14 trades — 138-sample)
 ADVISORY_HOUR_1700 = set()  # vacated; 17:00 now golden
+# 2026-09-01 mentor 129-trade sample (8/24-9/1): strong hours in BROKER time.
+# NOTE (2026-09-02 review): mentor chart times are MT5 SERVER time = GMT+3 =
+# BROKER_UTC_OFFSET_HOURS; so mentor "07:00/18:00 strong" maps directly onto
+# broker hours {7,18} — which CONFLICT with the 138-sample DANGER_HOURS {7,18}
+# (25%/21.4% win). The 9/1 crash-day trades dominate the mentor hour PnL, so
+# those hours are NOT reliable as bonus hours. Only broker 03:00/06:00 are
+# both mentor-positive and not contradicted — and 06:00 is in ADVISORY_HOURS.
+# Final: bonus ONLY at broker 03:00 (+$1,354, 14 trades) when ALIGNED; the
+# 07:00/18:00 mentor "edge" is rejected as outlier-driven, not added.
+SESSION_BONUS_HOURS = {3}  # broker 03:00 only (mentor +$1,354, n=14; no conflict)
 DANGER_HOURS = {7, 18}       # 07:00 (25% win, -$212 — 0.12 lot massacre); 18:00 (21.4%, -$98)
-DANGER_ADVISORY_HOURS = ADVISORY_HOURS_0408 | DANGER_HOURS  # 07, 18 added as hard-block
 MAX_DAILY_TRADES = 8         # Overtrading threshold (123 trades/week = ~17/day avg)
 RAPID_FIRE_WINDOW_MIN = 5    # 2+ opens within 5min — see scripts/compute_mentor_stats.py
 RAPID_FIRE_MAX_TRADES = 2    # Max trades allowed within RAPID_FIRE_WINDOW_MIN
 
 
-def _broker_hour():
-    """Current hour in broker-local time (UTC + BROKER_UTC_OFFSET_HOURS)."""
-    utc = datetime.now(timezone.utc)
+_BAD_BAR_TIME_SEEN = set()   # dedupe：同一個壞 timestamp 唔洗版
+
+
+def _note_bad_bar_time(when, exc):
+    """Warn once per distinct unparseable bar stamp (see `_broker_hour`)."""
+    key = repr(when)
+    if key in _BAD_BAR_TIME_SEEN:
+        return
+    _BAD_BAR_TIME_SEEN.add(key)
+    print(f"⚠️ _broker_hour: 解析唔到 bar 時間 {key} ({type(exc).__name__}: {exc}) "
+          f"— 呢個 bar 退回 wall clock，session_bonus／volume tier 可能失真",
+          file=sys.stderr)
+
+
+def _broker_hour(when=None):
+    """Hour in broker-local time (UTC + BROKER_UTC_OFFSET_HOURS).
+
+    `when` (2026-10-10 review): a walk-forward replay must score the BAR it is
+    replaying, not the moment the script happens to run. Reading the wall clock
+    made `session_bonus` a constant across the whole replay (whatever hour the
+    operator started it), so the session term carried no information at all.
+    Naive stamps are read as UTC — the engine's convention for broker
+    timestamps — and aware ones are converted, so a caller cannot silently get
+    a third interpretation.
+
+    2026-10-10 外審 follow-up: an unparseable `when` used to fall back to the
+    wall clock with NO trace — i.e. exactly the bug this function exists to
+    remove, reinstated silently for that bar (`pd.NaT.hour` raises). The
+    fallback is kept (a replay shouldn't die on one bad row) but it now prints
+    a deduped warning, so "which bars fell back" is answerable from the log
+    instead of invisible.
+    """
+    if when is None:
+        utc = datetime.now(timezone.utc)
+    else:
+        try:
+            ts = pd.Timestamp(when)
+            # `pd.NaT` is the trap: Timestamp(NaT) does NOT raise, tz_localize
+            # and tz_convert pass it through, and `NaT.hour` returns **nan** —
+            # so a missing bar stamp used to yield a NaN broker hour with no
+            # exception at all (session_bonus silently False). Catch it here.
+            if pd.isna(ts):
+                raise ValueError("NaT / NaN bar timestamp")
+            if ts.tzinfo is None:
+                ts = ts.tz_localize('UTC')
+            utc = ts.tz_convert('UTC').to_pydatetime()
+        except Exception as e:
+            _note_bad_bar_time(when, e)
+            utc = datetime.now(timezone.utc)
     return (utc.hour + BROKER_UTC_OFFSET_HOURS) % 24
 
 
@@ -2411,8 +3120,11 @@ def _time_quality_score():
 
     Returns: ('golden'|'danger'|'advisory'|'normal', advisory_text)
     """
-    broker_hour = _broker_hour()
+    return _time_quality_for_hour(_broker_hour())
 
+
+def _time_quality_for_hour(broker_hour):
+    """Time-quality rating for an explicit broker-local hour (backtest-safe)."""
     if broker_hour in GOLDEN_HOURS:
         return ('golden', '🌅 黃金時段 (17:00 broker, 64.3% 勝, +$339 — 138-sample) — 適合入場')
     if broker_hour in DANGER_HOURS:
@@ -2443,8 +3155,13 @@ def _scalp_risk_warning():
     )
 
 
-def _volume_risk_tier(severity='ALIGNED', vol=0.02):
+def _volume_risk_tier(severity='ALIGNED', vol=0.02, tq_level=None):
     """Recommend position size with volume-aware risk tiers.
+
+    tq_level (2026-10-10 review): pass the SAME session level the caller already
+    resolved. Left None it re-reads the wall clock, so a replay scored the
+    golden-hour 0.03 tier from whatever hour the script ran at — the exact
+    divergence `time_quality_override` exists to remove.
 
     Updated 2026-07-31 (138-trade combined; see scripts/compute_mentor_stats.py):
     - 0.01: 50.0% win, +$59 (22 trades)
@@ -2469,7 +3186,7 @@ def _volume_risk_tier(severity='ALIGNED', vol=0.02):
     elif severity == 'MILD':
         return 0.01, '⚠️ 逆勢半倉 0.01 (歷史: 逆勢虧損率 65%)'
     else:
-        tq, _ = _time_quality_score()
+        tq = tq_level if tq_level is not None else _time_quality_score()[0]
         if tq == 'golden':
             return 0.03, '🌅 順勢 + 黃金時段, 0.03 倉 (138-sample 17:00 n=14, 64.3% 勝; 0.16+ 避免)'
         return 0.02, '順勢 0.02 倉'
@@ -2578,6 +3295,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
 
     if side == 'BEARISH':
         swing_label = f"前頂 ${fib['swing_start']:.0f}"
+        _ef = exit_fields(tp2, '2:1 RR', tp3_trail)
         return {
             'direction': '🔴 SELL',
             'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
@@ -2592,16 +3310,18 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
             'stop_loss': f"${stop_level:.0f}",
             'stop_rationale': f"{swing_label} + 1 ATR",
             'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
-            'tp2': f"${tp2:.0f} (2:1 RR, 止賺 1/3)",
-            'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+            'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+            'tp3': _ef[1],
+            'exit_plan': _ef[2],
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
-            'rr_tp2': round(rr_tp2, 1),
+            'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
             'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
             'note': '' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='Fib'),
         }
 
     swing_label = f"前底 ${fib['swing_start']:.0f}"
+    _ef = exit_fields(tp2, '2:1 RR', tp3_trail)
     return {
         'direction': '🟢 BUY',
         'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
@@ -2616,18 +3336,19 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
         'stop_loss': f"${stop_level:.0f}",
         'stop_rationale': f"{swing_label} - 1 ATR",
         'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
-        'tp2': f"${tp2:.0f} (2:1 RR, 止賺 1/3)",
-        'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+        'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+        'tp3': _ef[1],
+        'exit_plan': _ef[2],
         'risk_amount': round(risk, 1),
         'rr_tp1': round(rr_tp1, 1),
-        'rr_tp2': round(rr_tp2, 1),
+        'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
         'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
         'note': '' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='Fib'),
     }
 
 
 def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp3_trail,
-                           daily_trend, h1_trend, atr, current_price=None):
+                          daily_trend, h1_trend, atr, current_price=None):
     """Build 0.786 deep retracement setup — derived from HK stock Fib 0.786 playbook.
 
     Strategy: When price retraces deeply to 0.786 Fib level (deep wash-out),
@@ -2668,6 +3389,7 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
             entry_status = '⏳ 接近 0.786 Fib (待觸及)'
         else:
             entry_status = _entry_status_bearish(False, aligned, quality, 'fib0786', severity)
+        _ef = exit_fields(tp2, '跌浪最低點', tp3_trail)
         return {
             'direction': '🔴 SELL',
             'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
@@ -2685,11 +3407,12 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
             'stop_loss': f"${stop_level:.0f}",
             'stop_rationale': f"前頂 ${fib['swing_start']:.0f} (回調浪最高點) + 1 ATR",
             'tp1': f"${tp1:.0f} (0.618 Fib 位, 止賺 1/3)",
-            'tp2': f"${tp2:.0f} (跌浪最低點, 止賺 1/3)",
-            'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+            'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+            'tp3': _ef[1],
+            'exit_plan': _ef[2],
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
-            'rr_tp2': round(rr_tp2, 1),
+            'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
             'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
             'note': '0.786 深度回調 — 實驗性（港股 playbook；未經 XAUUSD 138-sample 驗證）' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='0.786 Fib'),
         }
@@ -2701,6 +3424,7 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
         entry_status = '⏳ 接近 0.786 Fib (待觸及)'
     else:
         entry_status = _entry_status_bullish(False, aligned, quality, 'fib0786', severity)
+    _ef = exit_fields(tp2, '升浪最高點', tp3_trail)
     return {
         'direction': '🟢 BUY',
         'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
@@ -2718,11 +3442,12 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
         'stop_loss': f"${stop_level:.0f}",
         'stop_rationale': f"前底 ${fib['swing_start']:.0f} (回調浪最低點) - 1 ATR",
         'tp1': f"${tp1:.0f} (0.618 Fib 位, 止賺 1/3)",
-        'tp2': f"${tp2:.0f} (升浪最高點, 止賺 1/3)",
-        'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+        'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+        'tp3': _ef[1],
+        'exit_plan': _ef[2],
         'risk_amount': round(risk, 1),
         'rr_tp1': round(rr_tp1, 1),
-        'rr_tp2': round(rr_tp2, 1),
+        'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
         'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
         'note': '0.786 深度回調 — 實驗性（港股 playbook；未經 XAUUSD 138-sample 驗證）' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='0.786 Fib'),
     }
@@ -3107,6 +3832,11 @@ def _make_setup(side, pattern, daily_trend, h1_trend, tp3_trail, *,
     broken_for_priority = already_broken if priority_broken is None else priority_broken
     if note is None:
         note = '' if aligned else _counter_trend_note(side, daily_trend, h1_trend)
+    _ef = exit_fields(
+        targets['tp2'],
+        _tp_method_label(pattern, targets['tp2'], targets['fib_tp'], targets['rr_tp'],
+                         targets['tp2_fib'], targets['tp2_rr']),
+        tp3_trail, rr1=targets['rr1'])
     rec = {
         'direction': '🔴 SELL' if order == 'SELL' else '🟢 BUY',
         'priority': setup_priority(side, broken_for_priority, daily_trend, h1_trend, quality),
@@ -3121,11 +3851,12 @@ def _make_setup(side, pattern, daily_trend, h1_trend, tp3_trail, *,
         'stop_loss': f"${stop_loss:.0f}",
         'stop_rationale': stop_rationale,
         'tp1': f"${targets['tp1']:.0f} ({_tp_method_label(pattern, targets['tp1'], targets['fib_tp'], targets['rr_tp'])}, 止賺 1/3)",
-        'tp2': f"${targets['tp2']:.0f} ({_tp_method_label(pattern, targets['tp2'], targets['fib_tp'], targets['rr_tp'], targets['tp2_fib'], targets['tp2_rr'])}, 止賺 1/3)",
-        'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+        'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+        'tp3': _ef[1],
+        'exit_plan': _ef[2],
         'risk_amount': round(risk, 1),
         'rr_tp1': round(targets['rr1'], 1),
-        'rr_tp2': round(targets['rr2'], 1),
+        'rr_tp2': round(targets['rr2'], 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
         'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
         'note': note,
     }
@@ -3138,6 +3869,16 @@ def _make_setup(side, pattern, daily_trend, h1_trend, tp3_trail, *,
     return rec
 
 
+def _boundary_max_distance(atr):
+    """Max distance (in ATR) between current price and a boundary limit entry.
+
+    2026-09-04 fix: 之前冇距離上限 — Double Bottom 喺低位形成後價格升走,
+    setup 永遠指返舊 bottom ($4418 vs 現價 $4485, 偏離 6.4 ATR) 照 emit +
+    push。限價單射程外嘅 boundary = stale, 唔 actionable。
+    """
+    return atr * 2.5
+
+
 def _emit_boundary(side, pattern, current_price, atr, daily_trend, h1_trend,
                    tp3_trail, add_vol, aligned):
     """Limit entry at pattern boundary. None if not fillable / risk too wide."""
@@ -3148,6 +3889,11 @@ def _emit_boundary(side, pattern, current_price, atr, daily_trend, h1_trend,
     if order == 'SELL' and not (bd_entry > current_price):
         return None
     if order == 'BUY' and not (bd_entry < current_price):
+        return None
+    # 2026-09-04: distance cap — boundary 太遠 = stale, 唔 emit
+    max_dist = _boundary_max_distance(atr)
+    dist = (bd_entry - current_price) if order == 'SELL' else (current_price - bd_entry)
+    if dist > max_dist:
         return None
     bd_stop = _boundary_entry_sl(pattern, order, atr, current_price)
     bd_risk = (bd_stop - bd_entry) if order == 'SELL' else (bd_entry - bd_stop)
@@ -3173,9 +3919,14 @@ def _emit_boundary(side, pattern, current_price, atr, daily_trend, h1_trend,
         )
     add_default = (bd_entry - bd_risk) if order == 'SELL' else (bd_entry + bd_risk)
     add_level = pattern.get('neckline', add_default)
+    # 2026-09-01 pyramiding (mentor 129-trade: winners scale UP with trend, e.g.
+    # 0.05→0.2→0.35 on 9/1 crash day; losers stay at base size). Add only when
+    # the first tranche is >= +1R in profit, capped at 2 extra tranches total.
+    pyr_add_vol = round(add_vol * 0.5, 3)
     add_position = (
-        f"跌穿 ${add_level:.0f} 加注 {add_vol}" if order == 'SELL'
-        else f"突破 ${add_level:.0f} 加注 {add_vol}"
+        f"跌穿 ${add_level:.0f} 加注 {add_vol}；金字塔: 浮盈≥1R後同向加注 {pyr_add_vol}×2 (上限3注)"
+        if order == 'SELL'
+        else f"突破 ${add_level:.0f} 加注 {add_vol}；金字塔: 浮盈≥1R後同向加注 {pyr_add_vol}×2 (上限3注)"
     )
     if aligned:
         note = (
@@ -3456,6 +4207,39 @@ def _emit_pattern_setups(side, pattern, current_price, atr, daily_trend, h1_tren
     return out
 
 
+
+def _zone_rejection_score(side, entry_level, points, atr, band_mult=1.0):
+    """Count swing extremes clustering at the entry level (mentor 129-trade:
+    he sold the SAME $4420-4449 resistance band 38 times — repeatedly tested
+    zones are the ones that hold. A setup at a zone with >=2 prior touches is
+    a 'rejection zone' and deserves a priority boost.
+
+    side: 'BEARISH' (SELL at resistance) or 'BULLISH' (BUY at support)
+    entry_level: the setup entry price
+    points: swing list from find_swings_ordered
+    band_mult: zone half-width in ATR multiples (default 1.0 ATR either side)
+    Returns (touches, zone_label, last_touch_idx).
+    """
+    band = atr * band_mult
+    wtype = 'high' if side == 'BEARISH' else 'low'
+    touches = 0
+    last_touch_idx = -1
+    for p in points:
+        if p['type'] != wtype:
+            continue
+        if abs(p['price'] - entry_level) <= band:
+            touches += 1
+            last_touch_idx = max(last_touch_idx, p['idx'])
+    if touches >= 3:
+        zone_label = f"強力測試帶 (已測試 {touches} 次)"
+    elif touches == 2:
+        zone_label = f"測試帶 (已測試 {touches} 次)"
+    elif touches == 1:
+        zone_label = f"單次觸及 (測試 {touches} 次)"
+    else:
+        zone_label = ""
+    return touches, zone_label, last_touch_idx
+
 def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, atr, h1_trend=None):
     """Generate trade setups following user's methodology."""
     setups = []
@@ -3635,13 +4419,14 @@ def _entry_mode_report_label(mode):
 
 
 def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend=None,
-                    candle_m30=None, candle_day=None, m15_result=None, report_date=None):
+                    candle_m30=None, candle_day=None, m15_result=None, m5_result=None,
+                    rebound=None, report_date=None):
     """Generate comprehensive Markdown report."""
     candle_m30 = candle_m30 or []
     candle_day = candle_day or []
 
     current = float(df_m30['Close'].iloc[-1])
-    today = report_date or datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    today = report_date or datetime.now(HKT_LOCAL).strftime('%Y-%m-%d')
     
     # Indicators
     atr_m30 = _last_valid_float(df_m30['ATR'], 'M30 ATR')
@@ -3714,12 +4499,19 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     if setups:
         for i, s in enumerate(setups, 1):
             note = s.get('note', '')
+            # 2026-09-02 zone-rejection: surface the swing-cluster score so the
+            # human report matches what paper_trade/cron see in the JSON.
+            zone_row = ""
+            if s.get('zone_label'):
+                zone_row = f"\n| 🧲 位測試 | {s['zone_label']} |"
+            tp2_lab, tp3_lab = setup_share_labels(s)
             setup_text += f"""
 ### Signal {i}: {s['direction']} ({s['pattern']})
 
 | 參數 | 詳情 |
 |------|------|
 | 信號確定性 | {s['confidence']} |
+| 優先級 | P{s.get('priority', '?')} (排序 P{s.get('rank_priority', s.get('priority', '?'))}) |
 | 入場模式 | {_entry_mode_report_label(s.get('entry_mode', 'breakout'))} |
 | 質素 | {_quality_report_label(s.get('quality', '?'))} |
 | 日線配合 | {s['daily_alignment']} |
@@ -3730,16 +4522,69 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 🛑 止損 | {s['stop_loss']} |
 | 止損理由 | {s['stop_rationale']} |
 | 🎯 TP1 (1/3) | {s['tp1']} |
-| 🎯 TP2 (1/3) | {s['tp2']} |
-| 🎯 TP3 (1/3) | {s['tp3']} |
+| {tp2_lab} | {s['tp2']} |
+| {tp3_lab} | {s['tp3']} |
 | 風險金額 | ${s['risk_amount']:.0f} |
 | R:R TP1 | {s['rr_tp1']}:1 |
-| R:R TP2 | {s['rr_tp2']}:1 |
+| R:R TP2 | {rr_tp2_cell(s)} |
+{zone_row}
 {note}
 """
     else:
         setup_text = "\n⚠️ 無有效交易信號 — 等待形態形成\n"
     
+    # --- M5 quick structure section (informational — never gates pushes) ---
+    m5_text = ""
+    if m5_result and m5_result.get('m5_trend', 'N/A') != 'N/A (數據不足)':
+        m5_rsi_str = f"{m5_result['m5_rsi']:.1f}" if m5_result.get('m5_rsi') is not None else '-'
+        m5_swings = m5_result.get('m5_swings') or {}
+        m5_nh = f"${m5_swings.get('nearest_high'):.0f}" if m5_swings.get('nearest_high') else '-'
+        m5_nl = f"${m5_swings.get('nearest_low'):.0f}" if m5_swings.get('nearest_low') else '-'
+
+        m5_text = f"""
+## 🕒 五-A、M5 快速結構
+
+| 指標 | M5 |
+|------|-----|
+| 短線趨勢 | {m5_result['m5_trend']} |
+| RSI(14) | {m5_rsi_str} |
+| 最近阻力 (swing high) | {m5_nh} |
+| 最近支持 (swing low) | {m5_nl} |
+
+"""
+        m5_suggestions = m5_result.get('entry_suggestions', [])
+        if m5_suggestions:
+            m5_text += "### M5 微調建議\n\n"
+            m5_text += "| 信號 | 方向 | M5 入場區間 | M5 止損 | M5 ATR |\n"
+            m5_text += "|------|------|-------------|---------|--------|\n"
+            for i, sug in enumerate(m5_suggestions, 1):
+                m5_text += f"| Signal {i} ({sug['pattern_type']}) | {sug['direction']} | {sug['m5_entry_zone']} | {sug['m5_sl']} | ${sug['m5_atr']:.2f} |\n"
+            m5_text += "\n> ℹ️ M5 只反映即時微結構 — 極敏感，僅作觸發時機參考，**不影響推送 gate**。\n"
+        else:
+            m5_text += "\n⚠️ 無 M5 微調建議\n"
+    else:
+        m5_text = "\n## 🕒 五-A、M5 快速結構\n\n⚠️ M5 數據不足或不可用 — 無法提供快速結構\n"
+
+    # --- Rebound confirmation section (S3 martingale precondition, informational) ---
+    rebound_text = ""
+    if rebound and rebound.get('signal'):
+        rebound_text = f"""
+## 🎯 五-C、反彈確認 (S3 馬丁前置信號)
+
+| 項目 | 數值 |
+|------|------|
+| 信號 | ✅ {rebound['reason']} |
+| 參考入場 | ${rebound['entry']} |
+| SMA10 (M15) | ${rebound['sma10']} |
+| 前3bar高 | ${rebound['prev_high3']} |
+
+> ⚠️ 歷史回測曾現 look-ahead bias（entry 早於信號確認）— 修正後勝率 ~47% ≈ baseline，
+> 歷史上無 edge。呢個信號而家處於 **live paper sim 驗證階段**（paper_martingale.json
+> 收集真實勝率，幾星期後覆核）。配合 3 級馬丁 0.01→0.04 模擬。**唔影響推送 gate。**
+"""
+    else:
+        rebound_text = "\n## 🎯 五-C、反彈確認 (S3 馬丁前置信號)\n\n⏳ 未確認 — 等陽燭 + 站上 SMA10 + 突破前 3 bar 高\n"
+
     # --- M15 entry timing section ---
     m15_text = ""
     if m15_result and m15_result.get('m15_trend', 'N/A') != 'N/A (數據不足)':
@@ -3794,7 +4639,12 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     # Risk summary
     avg_risk = np.mean([s['risk_amount'] for s in setups]) if setups else atr_m30 * 2
     
-    trail_rule = trail_stop_text(atr_m30)
+    _exit_copy = static_exit_copy(atr_m30)
+    trail_rule = _exit_copy["trail_rule"]
+    rule_tp2 = _exit_copy["rule_tp2"]
+    rule_tp3 = _exit_copy["rule_tp3"]
+    journal_tp2 = _exit_copy["journal_tp2"]
+    journal_tp3 = _exit_copy["journal_tp3"]
 
     # Candlestick text builders
     def _candle_list_text(candles):
@@ -3903,7 +4753,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 
     report = f"""# 🔥 XAUUSD 圖表形態深度分析 v3
 
-**日期:** {today} (UTC)  
+**日期:** {today} (HKT)  
 **框架:** M30 (主要) / H1 / 日線  
 **當前價格:** **${current:.2f}**  
 **數據源:** {_data_source_label()}  
@@ -3958,8 +4808,8 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 🛑 止損 | 前頂之上 / 前底之下 + 1 ATR (必設!) |
 | 🎯 TP1 (1/3) | 1:1 RR 或 0.618 Fib ext (取較近) |
 | 🔄 0.786 深度回調 | 實驗性（港股 playbook，**未經 XAUUSD 138-sample 驗證**）; SL=回調浪極端, TP1=0.618, TP2=浪頂/底 |
-| 🎯 TP2 (1/3) | 2:1 RR 或 1.0 Fib ext (取較遠，比 TP1 更遠) |
-| 🎯 TP3 (1/3) | 放飛 + 追蹤止損 |
+| 🎯 TP2 | {rule_tp2} |
+| 🎯 TP3 | {rule_tp3} |
 | ⏰ 最佳時段 | 17:00 (broker time) — 138-sample 64.3% 勝, +$340 (n=14) |
 | 🚫 危險時段 | 07:00 + 18:00 broker — 138-sample hard-block (25% / 21.4% 勝) |
 | ⚠️ 謹慎時段 | 04-06/08 broker — 138-sample 23.8% 勝, -$558 (advisory) |
@@ -3969,6 +4819,8 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 🔥 快速連發 | {RAPID_FIRE_WINDOW_MIN}min 內 ≤ {RAPID_FIRE_MAX_TRADES} 筆 (<5min 持倉勝率 26.3%) |
 
 {setup_text}
+{m5_text}
+{rebound_text}
 {m15_text}
 ## 📊 六、關鍵價位
 
@@ -4023,8 +4875,8 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 📍 入場價: ___
 🛑 止損價: ___
 🎯 TP1 (1/3): ___
-🎯 TP2 (1/3): ___
-🎯 TP3 (1/3): 放飛 (追蹤止損)
+{journal_tp2}
+{journal_tp3}
 💰 風險: $___
 📊 R:R: ___:1
 📝 結果:
@@ -4054,15 +4906,11 @@ def main():
                         help='Trailing stop distance in ATR multiples (default: 1.5, env: TRAIL_STOP_ATR)')
     args = parser.parse_args()
 
-    # Override trail params if specified via CLI
-    global TRAIL_PROFIT_ATR, TRAIL_STOP_ATR
-    if args.trail_profit is not None:
-        TRAIL_PROFIT_ATR = args.trail_profit
-    if args.trail_stop is not None:
-        TRAIL_STOP_ATR = args.trail_stop
+    # CLI overrides stay aliased: MOM_HOLD_TRAIL_ATR tracks TRAIL_STOP_ATR.
+    apply_trail_overrides(args.trail_profit, args.trail_stop)
     
     # 1. Fetch data
-    df_m30, df_h1, df_m15, df_day = fetch_data()
+    df_m30, df_h1, df_m15, df_m5, df_day = fetch_data()
     
     # 2. Add indicators
     df_m30 = add_indicators(df_m30)
@@ -4070,6 +4918,8 @@ def main():
     df_day = add_indicators(df_day)
     if df_m15 is not None and not df_m15.empty:
         df_m15 = add_indicators(df_m15)
+    if df_m5 is not None and not df_m5.empty:
+        df_m5 = add_indicators(df_m5)
     
     # 3. Find swing points
     points = find_swings_ordered(df_m30['High'].values, df_m30['Low'].values,
@@ -4102,9 +4952,13 @@ def main():
     for cp in all_candle:
         _log(f"   {cp['name']} ({cp['direction']}, {cp['strength']}) @ {cp['price']}")
 
-    # 5c. M15 entry timing analysis
+    # 5c. M15/M5 entry-timing analysis (informational — never feeds push gate)
     m15_result = analyze_m15_entry_timing(df_m15, patterns, points, current, atr)
     _log(f"[*] M15 trend: {m15_result['m15_trend']} | RSI: {m15_result['m15_rsi']} | Suggestions: {len(m15_result['entry_suggestions'])}")
+    m5_result = analyze_m5_entry_timing(df_m5, patterns, points, current, atr)
+    _log(f"[*] M5 trend: {m5_result['m5_trend']} | RSI: {m5_result['m5_rsi']} | Suggestions: {len(m5_result['entry_suggestions'])}")
+    rebound = detect_rebound_signal(df_m15)
+    _log(f"[*] 反彈確認 (S3): {rebound['signal']} @ {rebound['entry']} ({rebound['reason']})")
 
     # 6. Multi-timeframe analysis (Daily + H1)
     daily_trend = analyze_daily_trend(df_day)
@@ -4120,17 +4974,27 @@ def main():
 
     # 7b. Inject K-line confirmation scores into setups (used by paper_trade + cron filtering)
     _inject_kline_scores(setups, candle_m30, candle_day, len(df_m30) - 1, len(df_day) - 1)
-    _inject_push_metadata(setups, daily_trend, h1_trend, current_price=current)
+    spike_state = _inject_push_metadata(setups, daily_trend, h1_trend, current_price=current,
+                                        points=points, atr=atr, closes=df_m30['Close'].values)
+    if spike_state:
+        _log(f"[*] Post-spike gate ACTIVE: {spike_state['direction']} {spike_state['move']:+.1f} "
+             f"(> {SPIKE_ATR_MULT}×ATR) — blocking {'SELL' if spike_state['direction']=='down' else 'BUY'} pushes")
     
     utc_now = datetime.now(timezone.utc)
-    today = utc_now.strftime('%Y-%m-%d')
+    # 2026-09-11: trade day = HKT, matching the cron --output filename
+    # (`xauusd_v3_$(date +%Y-%m-%d).json`) and the 07:00-23:59 HKT schedule.
+    # While this was UTC, the JSON 'date' disagreed with its own filename
+    # between 00:00-07:59 HKT, so paper_trade's same-day dedupe treated a new
+    # 07:00 setup as a duplicate of the previous evening's entry.
+    today = datetime.now(HKT_LOCAL).strftime('%Y-%m-%d')
     broker_dt = utc_now + timedelta(hours=BROKER_UTC_OFFSET_HOURS)
     broker_date = broker_dt.strftime('%Y-%m-%d')
 
     # 8. Generate report
     report = generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend,
                              candle_m30=candle_m30, candle_day=candle_day,
-                             m15_result=m15_result, report_date=today)
+                             m15_result=m15_result, m5_result=m5_result,
+                             rebound=rebound, report_date=today)
     
     # 9. Save — date is UTC to match generated_at (avoids local-midnight filename drift)
     if args.output:
@@ -4150,11 +5014,36 @@ def main():
             'date': today,
             'broker_date': broker_date,
             'generated_at': utc_now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            # Report layer reads this. It must not re-read MOMENTUM_HOLD_EXIT.
+            'exit_model': 'momentum-hold' if MOMENTUM_HOLD_EXIT else 'fixed-tp2',
             'price': current,
             'data_source': _data_source_label(),
             'intraday_source': DATA_SOURCE,
             'daily_source': DAILY_DATA_SOURCE,
             'm15_source': M15_DATA_SOURCE,
+            'm15_analysis': m15_result or None,
+            'm5_source': M5_DATA_SOURCE,
+            'm5_analysis': m5_result or None,
+            'rebound_martingale': {
+                'signal': rebound['signal'],
+                'reason': rebound['reason'],
+                'bar_time': rebound['bar_time'],
+                'entry': rebound['entry'],
+                'sma10': rebound['sma10'],
+                'prev_high3': rebound['prev_high3'],
+                'note': 'S3 反彈確認 + 3級馬丁 (0.01→0.04) — live paper sim 驗證中（歷史 backtest 有 look-ahead bias，修正後勝率 ~47% ≈ baseline，無歷史 edge）',
+            },
+            'post_spike': {
+                'active': spike_state is not None,
+                'direction': spike_state['direction'] if spike_state else None,
+                'move': spike_state['move'] if spike_state else None,
+                'window_bars': SPIKE_WINDOW_BARS,
+                'atr_mult': SPIKE_ATR_MULT,
+                'blocked_setups': sum(1 for s in setups if s.get('post_spike_blocked')),
+                'indeterminate': next(
+                    (s.get('post_spike_indeterminate') for s in setups
+                     if s.get('post_spike_indeterminate')), None),
+            },
             'spot_futures_basis': SPOT_FUTURES_BASIS,
             'basis_cron_blocked': BASIS_CRON_BLOCKED,
             'basis_note': BASIS_NOTE or None,
@@ -4170,6 +5059,12 @@ def main():
             'candlestick_m30': candle_m30,
             'candlestick_daily': candle_day,
             'setups': setups,
+            # 2026-09-08 (Cursor round-2 follow-up): code-level push list so the
+            # cron prompt doesn't have to re-derive push eligibility by reading
+            # flags via natural language. Prompt reads ONLY this list.
+            # 2026-09-24: 改為 call `push_eligible()` 單一真相 —— 呢兩條條件
+            # 曾經喺 backtest.py 被抄漏一半（見 push_eligible docstring）。
+            'push_candidates': [s for s in setups if push_eligible(s)],
         }
         json_path = output_path.replace('.md', '.json')
         with open(json_path, 'w', encoding='utf-8') as f:
