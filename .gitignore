@@ -2,5 +2,6 @@ __pycache__/
 *.pyc
 btc_last_analysis.json
 btc_backtest_results.json
+btc_backtest_provenance.json
 .DS_Store
 .cron_python

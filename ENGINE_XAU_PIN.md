@@ -7,7 +7,9 @@ BTC 唔自己寫形態引擎 — `analyze_v3.py` 係 XAUUSD repo 嘅 vendor snap
 ## 現行 pin
 
 - XAU commit: `70c362031987bb1cca6ced49a3b7abf544dfc6c9` (main, 2026-10-11)
-- XAU analyze_v3 sha256: `6158206d6253bc3a…c9170316` (全值見下)
+- XAU analyze_v3 sha256: `6158206d6253bc3a…c9170316`
+- analyze_v3.py sha256: 6158206d6253bc3a3e331d7cf644330f9762314751caffc1dc9cf10335170816
+  (機器讀行 —— backtest 交叉檢查用，唔好改格式)
 - Sync 日期: 2026-10-24 (branch `feat/xau-engine-sync-c`)
 - 內容: XAU `main:analyze_v3.py` 原樣 copy，零 BTC 改動
 
@@ -25,6 +27,7 @@ BTC 唔自己寫形態引擎 — `analyze_v3.py` 係 XAUUSD repo 嘅 vendor snap
 
 1. `git show <xau_commit>:analyze_v3.py | shasum -a 256` 對來源
 2. copy 過嚟，`git diff --stat` 睇下多幾多函數
-3. 跑 `test_limit_entry.py` + 全倉（引擎簽名一變即爆，最敏感係 btc_engine 嗰幾個）
+3. 跑 `test_xau_sync.py` + `test_limit_entry.py` + 全倉
+   (引擎簽名一變即爆，最敏感係 btc_engine 嗰幾個；GLM R1: 新測試要入列)
 4. 更新本檔 pin + 跑 Kimi review + PR（base main）
 5. 唔部署（研究 code，主系統停用中，production cron 唔掂）
