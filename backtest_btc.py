@@ -26,7 +26,6 @@ pt = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(pt)
 
 import btc_engine as be
 
-SL_FLOOR_ATR = 0.8
 MAX_HOLD_BARS = 96          # 96 × 30min = 48h 最多持倉
 STEP_BARS = 48              # 每 24h 抽一個樣本
 WARMUP = 500                # 分析窗口最少 bars
@@ -72,6 +71,7 @@ def run():
     n_analyzed = 0
     all_gate_skips = {}   # 跨 windows 累加: 被 live gate 擋走嘅原因 → 數
     n_raw_setups = 0
+    n_no_live_entry = 0   # 過 gate 但缺 live 口徑 entry (Kimi R1: 唔靜默 fallback)
     while i < len(bars) - MAX_HOLD_BARS - 5:
         window = bars.iloc[max(0, i - WARMUP):i + 1].reset_index(drop=True)
         # 日線 proxy: 用 window 內嘅日線趨勢 (resample)
@@ -118,7 +118,6 @@ def run():
         live_ok = be.btc_filter_setups(
             setups, atr, px, {"status": "OK", "diff_pct": 0.0}, ma50=ma50_w)
         n_raw_setups += len(setups)
-        n_gate_skipped = len(setups) - len(live_ok)
         for _s in setups:
             _r = _s.get("_gate_skip")
             if _r:
@@ -128,18 +127,27 @@ def run():
             # 用 filter 寫好嘅 live 口徑 (btc_entry/limit/stop/tp)，唔自己重計 ——
             # 之前用 zone 下緣 entry + 自家 SL floor，同 live (limit_px) 兩套數字
             # (09-14 實證差 0.10-0.17%，RR 系統性樂觀)。filter 已保證非 None。
-            entry = s.get("btc_limit_px") or s.get("btc_entry") or px
+            # Kimi R1 (2026-10-24): 移除 `or px` 靜默 fallback —— 缺 live entry
+            # 就 skip + 計數，唔扮有數。
+            entry = s.get("btc_limit_px") or s.get("btc_entry")
             stop = s.get("btc_stop")
             tp1 = s.get("btc_tp1")
             tp2 = s.get("btc_tp2")
             if stop is None or entry is None:
+                n_no_live_entry += 1
                 continue
             risk = abs(entry - stop)
             if risk <= 0:
                 continue
             # 模擬: 由 ts 之後嘅 bars 行
             fwd = bars.iloc[i + 1: i + 1 + MAX_HOLD_BARS]
-            entry_fill = px  # 市價進場簡化
+            # Kimi R1: fill 模型限制 —— entry_fill 用 signal 當時市價 (market_at_signal)，
+            # risk 用 live limit 口徑計 → R 雙向失真 (例: BUY limit 100/stop 99/fill 100.5
+            # → stop 損係 -1.5R 唔係 -1R)。而且 limit 單假設必成交 (冇等觸價)。
+            # 所以 r_live_comparable=false —— 呢個 backtest 嘅勝率/meanR 唔可以直接
+            # 同 live 比。完整 limit-fill simulator 另開 PR (XAU PR#52 同批嗰套)。
+            entry_fill = px  # fill_model="market_at_signal" (簡化, 見上)
+            fill_model = "market_at_signal"  # r_live_comparable=false
             # 滑點/費用
             if side == "BUY":
                 entry_fill *= (1 + COST_PCT / 2)
@@ -175,12 +183,33 @@ def run():
 
     df_r = pd.DataFrame(results)
     print(f"\nanalyzed windows: {n_analyzed}, raw setups: {n_raw_setups}, "
-          f"simulated (過 live gate): {len(df_r)}")
+          f"simulated (過 live gate): {len(df_r)}, 缺 live entry skip: {n_no_live_entry}")
     # gate 擋咗幾多 (fidelity 證據: 回測 trade 緊 live 會 trade 嘅子集)
     if all_gate_skips:
         print(f"\n=== live gate 擋走 (唔入回測) ===")
         for _r, _n in sorted(all_gate_skips.items(), key=lambda x: -x[1])[:8]:
             print(f"  {_r}: {_n}")
+    # provenance 先寫 (Kimi R4): 「全部畀 gate 擋走」正正係最值得留 provenance
+    # 嘅 run —— 唔可以早退唔寫。r 勝率/meanR 唔可以直接同 live 比
+    # (fill_model=market_at_signal, r_live_comparable=false)。
+    import hashlib
+    prov = {
+        "engine_pin": ENGINE_PIN,
+        "engine_sha256": hashlib.sha256(
+            open(os.path.join(REPO, "analyze_v3.py"), "rb").read()).hexdigest(),
+        "bars": f"{bars['datetime'].iloc[0]} -> {bars['datetime'].iloc[-1]}",
+        "analyzed_windows": n_analyzed,
+        "raw_setups": n_raw_setups,
+        "simulated": len(df_r),
+        "gate_skips": all_gate_skips,
+        "no_live_entry_skipped": n_no_live_entry,
+        "fill_model": "market_at_signal",
+        "r_live_comparable": False,
+        "run_at": pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    json.dump(prov, open(os.path.join(REPO, "btc_backtest_provenance.json"), "w"),
+              ensure_ascii=False, indent=1)
+    print("saved btc_backtest_provenance.json")
     if df_r.empty:
         print("冇樣本 — 放鬆條件再跑")
         return
@@ -204,22 +233,6 @@ def run():
             print(f"{pat[:36]:36} n={len(grp):3}  勝率 {(grp['pnl_r']>0).mean()*100:5.1f}%  meanR {grp['pnl_r'].mean():+.3f}")
     df_r.to_json(os.path.join(REPO, "btc_backtest_results.json"), orient="records")
     print(f"\nsaved btc_backtest_results.json")
-    # provenance (XAU 同名機制嘅 BTC 版): 邊個引擎版本跑出嚟，免得舊數字被當新用
-    import hashlib
-    prov = {
-        "engine_pin": ENGINE_PIN,
-        "engine_sha256": hashlib.sha256(
-            open(os.path.join(REPO, "analyze_v3.py"), "rb").read()).hexdigest(),
-        "bars": f"{bars['datetime'].iloc[0]} -> {bars['datetime'].iloc[-1]}",
-        "analyzed_windows": n_analyzed,
-        "raw_setups": n_raw_setups,
-        "simulated": len(df_r),
-        "gate_skips": all_gate_skips,
-        "run_at": pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    json.dump(prov, open(os.path.join(REPO, "btc_backtest_provenance.json"), "w"),
-              ensure_ascii=False, indent=1)
-    print("saved btc_backtest_provenance.json")
 
 
 if __name__ == "__main__":

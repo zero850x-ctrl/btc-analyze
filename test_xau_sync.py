@@ -99,6 +99,7 @@ else:
     _windows = [df]
 _tot_raw, _tot_ok, _tot_noreason, _tot_entry_bad = 0, 0, 0, 0
 _w_with_setups = 0
+_w_errors = []   # Kimi R2: window exception 唔可以 print+continue 就算
 for _df in _windows:
     df = _df
     day_df = pd.DataFrame({"Open": df["Close"], "High": df["High"],
@@ -116,7 +117,7 @@ for _df in _windows:
         setups = av3.generate_trade_setups(df_a, patterns, pts, dt, px, atr,
                                            h1_trend=ht)
     except Exception as e:
-        print(f"window 跑唔起: {e!r} — 跳過")
+        _w_errors.append(repr(e)[:150])
         continue
     if not setups:
         continue
@@ -140,9 +141,59 @@ if _tot_raw:
     result("過 gate 嘅 setup 全部有 live 口徑 entry",
            _tot_entry_bad == 0, f"(live_ok={_tot_ok}, 缺口徑={_tot_entry_bad})")
 else:
-    result("回測子集 (5 windows 全部 0 setups — 唔算 FAIL, 只係冇嘢驗)",
-           True, "(raw=0)")
-# push_eligible 在位 (XAU PR#52 嘅函數，BTC 引擎要有)
+    # Kimi R2: raw==0 唔可以當有效 PASS —— 冇嘢驗就係冇嘢驗
+    result("回測子集有真 setups (raw>0, 否則空轉)",
+           False, f"(raw=0, errors={len(_w_errors)})")
+# Kimi R2: window exception 要 FAIL, 唔可以靜默跳過
+result("windows 全部跑得起 (無 engine exception)",
+       not _w_errors, f"({'; '.join(_w_errors[:2])})" if _w_errors else "(5/5)")
+# ── hermetic fixture (Kimi R2): 唔依賴真 bars, 直接釘住 backtest 讀 filter 口徑 ──
+# 引擎原生欄位 (filter 讀 entry_zone/entry_trigger/stop_loss/tp1/tp2;
+# btc_limit_px/btc_stop 係 filter 寫出嚟嘅, 唔係輸入 —— Kimi R2 跟進實測)。
+# atr=100 → SL floor 80; ma50=79500 → BUY ext=(79950/79500-1)*100=0.57% 過,
+# SELL ext=(80050/79500-1)*100=0.69% 唔會觸發 SELL 側 (< -2%)。
+_fx_atr, _fx_px, _fx_ma50 = 100.0, 80000.0, 79500.0
+_fx_setups = [
+    {"direction": "BUY", "pattern": "Bull Flag",
+     "entry_zone": "$79900 - $80000",            # 中點 79950 = limit
+     "entry_trigger": "限價買入 @ $79950（形態邊界入場）",
+     "stop_loss": "$79850", "tp1": "$80100", "tp2": "$80200"},
+    {"direction": "SELL", "pattern": "Bear Flag",
+     "entry_zone": "$80000 - $80100",            # 中點 80050 = limit
+     "entry_trigger": "限價賣出 @ $80050（形態邊界入場）",
+     "stop_loss": "$80150", "tp1": "$79900", "tp2": "$79800"},
+    {"direction": "BUY", "pattern": "Bull Flag",  # rr=|80030-79950|/100=0.8 唔夠
+     "entry_zone": "$79900 - $80000",
+     "entry_trigger": "限價買入 @ $79950（形態邊界入場）",
+     "stop_loss": "$79850", "tp1": "$80030", "tp2": "$80100"},
+]
+# 經同一個 filter (同 backtest 傳一樣嘅參數形狀)
+_fx_ok = be.btc_filter_setups(
+    [dict(s) for s in _fx_setups], _fx_atr, _fx_px,
+    {"status": "OK", "diff_pct": 0.0}, ma50=_fx_ma50)
+# backtest 選單路徑: entry 讀取 (同 backtest_btc.py 一字不差)
+_fx_entries = []
+_fx_noskip_noentry = 0
+for _s in _fx_ok:
+    _e = _s.get("btc_limit_px") or _s.get("btc_entry")
+    if _e is None:
+        _fx_noskip_noentry += 1
+        continue
+    _fx_entries.append((_s.get("direction"), _e))
+result("fixture: filter 擋走 rr 唔夠嗰個",
+       len(_fx_ok) == 2 and all(s.get("_gate_skip") is None for s in _fx_ok),
+       f"(in=3 out={len(_fx_ok)})")
+result("fixture: backtest 讀到 btc_limit_px (唔係 zone/市價)",
+       sorted(_e for _, _e in _fx_entries) == [79950.0, 80050.0]
+       and _fx_noskip_noentry == 0,
+       f"(entries={sorted(_e for _, _e in _fx_entries)})")
+result("fixture: 被擋嗰個有 _gate_skip 原因",
+       # _fx_setups 係原件 (filter 改嘅係 dict(s) copy):
+       # 被擋嗰個 (第3個, rr 0.8) 一定冇入 _fx_ok，且 _fx_ok 兩個都冇 skip。
+       # 用 pattern+tp1 認 (唔用 identity，filter 入面 mutate 過 copy)。
+       len(_fx_ok) == 2
+       and {s.get("tp1") for s in _fx_ok} == {"$80100", "$79900"},
+       "(rr_0.8 嗰個出局)")
 result("引擎有 push_eligible (XAU PR#52)",
        callable(getattr(av3, "push_eligible", None)))
 result("引擎有 rr_tp2_cell (XAU PR#53)",
